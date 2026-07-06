@@ -37,7 +37,7 @@
 | P1 | 员工 Token 监控 | 按日期/员工统计 input/cached-input/output/reasoning-output/total token；不算钱、不做绩效；session 优先、job 兜底；主 agent 通过自然语言触发 | 代码完成-待 reload 验证 | 已修复 Codex 记 0 并补 cached/reasoning；2026-07-06 发现 `last_token_usage` 只是 Codex 任务内最后一次模型调用，光彦当天 job 口径低估约 35x；已改主链路为 `total_token_usage` 累计 delta，并新增 rollout 回算/修复脚本 | reload 后验证新 Codex job；历史可用 `codex-rollout-token-report.mjs --apply-jobs` 恢复/核对；已审计所有 Codex done job，当前可匹配已修复 281/284，剩余 3 个无独立 rollout 段不猜 | `token-report.mjs`, `token-report-cli.mjs`, `codex-backend.mjs`, `codex-rollout-token-report.mjs`, `factory_token_report` | 2026-07-06 |
 | P1 | Codex 员工运行配置 | 能显式修正 Codex 员工 sandbox / approval；运行态 thread 更新不能覆盖人工授权配置；旧 thread sandbox 粘住时可 reset thread 并带 handoff | 代码完成-待 reload 验证 | 已新增 `factory_worker_config`；`updateWorkerConfig` 改为只追加显式 patch；补 `resetCodexThread` 清空 `codexThreadId` 并生成最近 job handoff，下一次任务新建 full-access thread；`name`/`workerId` 均可指定员工；Codex 招募默认 `danger-full-access`，只有显式指定时才收紧 sandbox | 需要 reload 一次加载新工具；reload 后重新招募 Codex 员工默认就是 full access；对旧员工/旧 thread 可执行 `factory_worker_config(name=步美, codexSandbox=danger-full-access, codexApprovalPolicy=never, resetCodexThread=true)` 后再只测 touch | `index.ts`, `registry.ts`, `codex-backend.mjs`, `types.ts`, `ox-factory.test.mjs`, OF-006/OF-023 | 2026-07-05 |
 | P1 | reload/job 恢复 | 不再粗暴 stale；补 ownerPid/ownerInstanceId/heartbeat；能识别 fresh orphan-running；stale 后 late event 不再污染正常事件流 | 代码完成-待 reload 验证 | 已落地 heartbeat、startup recovery、late-event guard 和单测 | reload 后人工验证 running job 不被误标 stale，过期 job 仍 stale | `jobs.mjs`, `spawner.ts`, `index.ts`, `ox-factory.test.mjs` | 2026-06-30 |
-| P1 | Web 展示功能文档 | Web agent 基于稳定数据接口做 dashboard，不直接乱扫散文件 | 已派活给八村 | 已整理本地 Web 驾驶舱规划并新增八村交接单 | 八村实现只读本地 server；派派后续 review | `docs/ox-factory-web-visualization-plan.md`, `docs/ox-factory-web-frontend-handoff-hachimura.md`, OF-022 | 2026-07-02 |
+| P1 | Web 展示与启动入口 | Web agent 基于稳定数据接口做 dashboard；用户可用 `/ox-web` 启动/打开本地页面 | 代码完成-待 reload 验证 | 已补 `/ox-web`：健康检查、未启动自动后台启动、打开浏览器、状态查询、日志路径 | reload 后执行 `/ox-web --status` 与 `/ox-web` 人工验证 | `web-server.mjs`, `index.ts`, `README.md`, `INSTALL.md`, OF-022 | 2026-07-06 |
 | P1 | Web 项目视角 / 定时任务视图 | Overview 使用 Project Entity 作为项目态势主视角；Schedules 页面只读展示 runner/cron/factory_queue 流水；Project 文档入口支持外链打开和本地 Markdown 渲染 | 已派活给包包 | 已补 `/api/project-doc` 只读接口和安全路径校验，并将前端渲染任务派给包包 | 包包实现 Project 详情页文档点击：外链新开，本地 md 用 `mdNode()` 渲染 | `docs/ox-factory-web-project-schedule-handoff-baobao.md`, `docs/ox-factory-web-project-doc-handoff-baobao.md`, OF-025, `web-server.mjs` | 2026-07-05 |
 | P1 | Pi display-only 输出探针 | 评估 `ctx.ui.setWidget` 作为 live 输出展示通道，避免 `custom_message` 污染主上下文 | 已验证-待接入 | 临时 Pi 已验证 widget display-only 可展示且未落 `custom_message`；临时 Minimax worker 证明旧 `/talk` 功能链路可跑但仍污染 session；Pi 上游交接文档已整理 | 实现 `talkLiveSink`，再做一轮 “widget live + 无 ox-talk-live custom_message” 回归 | `docs/pi-display-only-output-plan.md`, `docs/pi-custom-message-context-handoff.md`, OF-024 | 2026-07-04 |
 | P1 | 内网 Codebase 分享 / 安装体验 | 朋友 clone 后知道放到哪里、怎么检查、怎么启动 Web、哪些运行数据不提交；不携带用户 token | 已确认 | 文档完成-已验证 | 跑 `install-check` + `verify`；后续开 remote 前人工看 staged diff | `README.md`, `INSTALL.md`, `.env.example`, `install-check.mjs`, OF-029 | 2026-07-06 |
@@ -479,7 +479,7 @@ node .pi/extensions/ox-factory/compaction-report.mjs --workers-dir .pi/workers -
 
 ## OF-022 本地 Web 可视化工厂驾驶舱
 
-模块整体状态：对齐度 `已确认方向`；完成度 `已派活给八村-待实现`；用例覆盖 `待补`；文档覆盖 `已有专项文档 + 任务交接单`；检查时间 `2026-07-02`。
+模块整体状态：对齐度 `已确认方向`；完成度 `代码完成-待 reload 验证`；用例覆盖 `静态单测 + Web API 单测`；文档覆盖 `已有专项文档 + 安装/启动文档`；检查时间 `2026-07-06`。
 
 ### 已确认需求
 
@@ -498,11 +498,12 @@ node .pi/extensions/ox-factory/compaction-report.mjs --workers-dir .pi/workers -
 | 数据契约 | 复用模块 | API 复用 `report-context.mjs`、`token-report.mjs`、`jobs.mjs`、`comm.mjs`、`compaction.mjs` | 已确认方向 | 设计完成 | 待补 | `docs/ox-factory-web-visualization-plan.md` | 2026-07-02 |
 | 安全边界 | 只读优先 | 第一版不直接派活、不改权限、不 apply 主 agent 压缩；高风险动作回到主 agent 确认 | 已确认方向 | 设计完成 | 待补 | `docs/ox-factory-web-visualization-plan.md` | 2026-07-02 |
 | 主 agent | 可视化主会话 | Web 压缩页能按 `target=main` 展示 Pi vs Codex shadow 对比 | 已确认方向 | 依赖 OF-021 已完成数据层 | 已有单测覆盖数据层 | `factory_compaction_report`, `compaction-report.mjs --target main` | 2026-07-02 |
+| 启动入口 | `/ox-web` | Pi 内一条指令检查/启动/打开 `127.0.0.1` 本地 dashboard；已运行则复用；支持 status/no-open/自定义端口 | 已确认 | 代码完成 | 静态单测 | `registerCommand("ox-web")`, `ensureOxWebDashboard` | 2026-07-06 |
 
 ### 下一步
 
-1. 八村按专项文档和交接单实现 `web-server.mjs` 和静态页面。
-2. 先做只读 API smoke 和页面加载 smoke。
+1. reload 后执行 `/ox-web --status`，确认未启动状态展示正常。
+2. 执行 `/ox-web`，确认能启动本地 server 并打开浏览器。
 3. 再讨论轻操作入口：复制派活 prompt、跳回主 agent 确认授权。
 
 ---

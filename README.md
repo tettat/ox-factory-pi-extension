@@ -83,6 +83,25 @@ loading still requires a real Pi restart/reload smoke.
 
 ## Local Web Dashboard
 
+Inside Pi, use the extension command:
+
+```text
+/ox-web
+```
+
+It checks whether the local dashboard is already running, starts
+`web-server.mjs` when needed, and opens `http://127.0.0.1:8787`.
+
+Useful variants:
+
+```text
+/ox-web --status
+/ox-web --no-open
+/ox-web 8799
+```
+
+Manual fallback:
+
 ```bash
 cd <host-project>
 node .pi/extensions/ox-factory/web-server.mjs --workers-dir .pi/workers --port 8787

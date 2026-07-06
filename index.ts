@@ -30,7 +30,10 @@
  *   factory_watch     - 实时查看后台 job 输出
  */
 
+import * as fs from "node:fs";
 import * as path from "node:path";
+import { spawn, type ChildProcess } from "node:child_process";
+import { request as httpRequest } from "node:http";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -239,6 +242,111 @@ function buildCodexThreadHandoff(worker: Worker, previousThreadId?: string | nul
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+let oxWebServerProcess: ChildProcess | null = null;
+
+function parseOxWebArgs(raw: string = "") {
+  const parts = raw.trim().split(/\s+/).filter(Boolean);
+  const options = { port: 8787, open: true, statusOnly: false };
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    if (/^\d+$/.test(part)) {
+      options.port = Number(part);
+    } else if (part === "--port" || part === "-p") {
+      const value = Number(parts[++i]);
+      if (Number.isFinite(value)) options.port = value;
+    } else if (part === "--no-open") {
+      options.open = false;
+    } else if (part === "--status") {
+      options.statusOnly = true;
+    }
+  }
+  if (!Number.isFinite(options.port) || options.port <= 0 || options.port > 65535) options.port = 8787;
+  return options;
+}
+
+async function isOxWebDashboardHealthy(url: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value: boolean) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    const req = httpRequest(`${url}/api/health`, { timeout: 800 }, (res) => {
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => { body += chunk; });
+      res.on("end", () => {
+        finish(res.statusCode === 200 && body.includes("ox-factory-web-dashboard"));
+      });
+    });
+    req.on("error", () => finish(false));
+    req.on("timeout", () => {
+      req.destroy();
+      finish(false);
+    });
+    req.end();
+  });
+}
+
+async function waitForOxWebDashboard(url: string, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await isOxWebDashboardHealthy(url)) return true;
+    await sleep(250);
+  }
+  return false;
+}
+
+function openExternalUrl(url: string) {
+  const platform = process.platform;
+  const command = platform === "darwin" ? "open" : platform === "win32" ? "cmd" : "xdg-open";
+  const args = platform === "win32" ? ["/c", "start", "", url] : [url];
+  const child = spawn(command, args, { stdio: "ignore", detached: true });
+  child.on("error", () => {
+    /* best-effort open; command response still includes URL */
+  });
+  child.unref();
+}
+
+async function ensureOxWebDashboard(port: number) {
+  const url = `http://127.0.0.1:${port}`;
+  const logPath = path.join(getWorkersDir(), `web-server-${port}.log`);
+  if (await isOxWebDashboardHealthy(url)) {
+    return { url, status: "running", logPath };
+  }
+
+  const webServerPath = path.resolve(getWorkersDir(), "..", "extensions", "ox-factory", "web-server.mjs");
+  if (!fs.existsSync(webServerPath)) {
+    throw new Error(`web-server.mjs 不存在：${webServerPath}`);
+  }
+
+  try { fs.mkdirSync(getWorkersDir(), { recursive: true }); } catch {}
+  const out = fs.openSync(logPath, "a");
+  const nodeCmd = process.env.OX_FACTORY_NODE_CMD || "node";
+  try {
+    oxWebServerProcess = spawn(
+      nodeCmd,
+      [webServerPath, "--workers-dir", getWorkersDir(), "--port", String(port), "--host", "127.0.0.1"],
+      {
+        cwd: path.resolve(getWorkersDir(), "..", ".."),
+        detached: true,
+        stdio: ["ignore", out, out],
+        env: { ...process.env },
+      },
+    );
+  } finally {
+    try { fs.closeSync(out); } catch {}
+  }
+  oxWebServerProcess.on("error", () => {
+    /* health check below will surface startup failure to the user */
+  });
+  oxWebServerProcess.unref();
+
+  const healthy = await waitForOxWebDashboard(url);
+  return { url, status: healthy ? "started" : "starting", logPath };
 }
 
 function clampNumber(value: unknown, fallback: number, min: number, max: number): number {
@@ -1334,6 +1442,63 @@ export default function (pi: ExtensionAPI) {
         ],
         details: { from: from.id, to: to.id, historyLength: historyContent.length },
       };
+    },
+  });
+
+  pi.registerCommand("ox-web", {
+    description: "启动/打开牛马工厂本地 Web 大盘。用法: /ox-web [端口] [--no-open] [--status]",
+    handler: async (args, ctx) => {
+      const options = parseOxWebArgs(args || "");
+      const url = `http://127.0.0.1:${options.port}`;
+      try {
+        if (options.statusOnly) {
+          const healthy = await isOxWebDashboardHealthy(url);
+          const content = [
+            "## 牛马工厂 Web 大盘",
+            "",
+            `- URL: ${url}`,
+            `- 状态: ${healthy ? "running" : "stopped / not ox-factory"}`,
+            `- 端口: ${options.port}`,
+          ].join("\n");
+          pi.sendMessage({ customType: "ox-web", content, display: true }, { deliverAs: "nextTurn", triggerTurn: false });
+          return;
+        }
+
+        ctx?.ui?.notify?.(`正在准备牛马工厂 Web 大盘：${url}`, "info");
+        const result = await ensureOxWebDashboard(options.port);
+        let openStatus = "未打开浏览器（--no-open）";
+        if (options.open) {
+          openExternalUrl(result.url);
+          openStatus = "已请求系统浏览器打开";
+        }
+        const content = [
+          "## 牛马工厂 Web 大盘",
+          "",
+          `- URL: ${result.url}`,
+          `- 服务状态: ${result.status === "running" ? "已在运行，直接复用" : result.status === "started" ? "刚刚启动并通过 health check" : "已尝试启动，仍在等待健康检查"}`,
+          `- 浏览器: ${openStatus}`,
+          `- 日志: \`${result.logPath}\``,
+          "",
+          result.status === "starting"
+            ? "如果页面没有马上打开，请稍等几秒刷新；若仍失败，查看日志文件。"
+            : "如果页面数据没更新，可以在页面内刷新或重新执行 `/ox-web`。",
+        ].join("\n");
+        pi.sendMessage({ customType: "ox-web", content, display: true }, { deliverAs: "nextTurn", triggerTurn: false });
+      } catch (e: any) {
+        const content = [
+          "## 牛马工厂 Web 大盘启动失败",
+          "",
+          `- URL: ${url}`,
+          `- 错误: ${e?.message || String(e)}`,
+          "",
+          "可以手动执行：",
+          "",
+          "```bash",
+          `node .pi/extensions/ox-factory/web-server.mjs --workers-dir .pi/workers --port ${options.port}`,
+          "```",
+        ].join("\n");
+        pi.sendMessage({ customType: "ox-web-error", content, display: true }, { deliverAs: "nextTurn", triggerTurn: false });
+      }
     },
   });
 

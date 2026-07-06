@@ -1141,7 +1141,7 @@ node .pi/extensions/ox-factory/compaction-report.mjs --workers-dir .pi/workers -
 ## OF-022：缺少本地 Web 可视化工厂驾驶舱
 
 - 优先级：P1
-- 状态：in-progress（factory_command + message wake 已落地）
+- 状态：in-progress（本地 Web + `/ox-web` 启动入口已落地，待 reload 验证）
 - 兼容性：高
 - 专项文档：`docs/ox-factory-web-visualization-plan.md`
 - 任务交接：`docs/ox-factory-web-frontend-handoff-hachimura.md`
@@ -1201,10 +1201,17 @@ MVP 页面：
 - 明确第一版 Web 不替代主 agent，不直接执行高风险写操作。
 - 明确 Web 接口要复用现有模块，不重复散扫 JSONL。
 - 明确主 agent 压缩评估是 Web 压缩页的重点场景之一。
+- 已新增 `/ox-web` 命令作为本地 dashboard 服务管理入口：
+  - 默认检查 `http://127.0.0.1:8787/api/health`；
+  - 已启动时复用已有服务；
+  - 未启动时后台启动 `web-server.mjs --workers-dir .pi/workers --port 8787 --host 127.0.0.1`；
+  - 通过系统浏览器打开页面；
+  - 日志写入 `.pi/workers/web-server-8787.log`；
+  - 支持 `/ox-web --status`、`/ox-web --no-open`、`/ox-web 8799`。
 
 ### 需要继续讨论
 
-- Web server 是否作为 Pi 插件内置工具启动，还是先独立 CLI。
+- `/ox-web` reload 后真实 smoke：未启动启动、已启动复用、端口被其它服务占用时的错误提示。
 - 第一版是否用原生 HTML/JS，还是直接 Vue/Vite。
 - 哪些操作允许在 Web 里直接做，哪些必须回到主 agent 确认。
 - 东子对外宣讲页和本地 Web 页面是否共用同一套视觉组件。
@@ -1657,3 +1664,4 @@ Project Entity MVP 已经存在，`GET /api/projects` 也返回了 `catalog`。�
 | 2026-07-06 | OF-018 复查光彦 Codex token：确认 `last_token_usage` 低估整次任务约 33x；新增只读 `codex-rollout-token-report.mjs` 按 rollout `total_token_usage` delta 回算并对比现有 job 口径。 |
 | 2026-07-06 | OF-018 修复 Codex token 主链路：新增累计 usage tracker，后续 job 写入 `total_token_usage` delta；`codex-rollout-token-report.mjs` 增加 `--repair-preview/--apply-jobs`，并已审计所有 Codex done job，可匹配项修复 281/284。 |
 | 2026-07-06 | 新增 OF-029：内网 Codebase 分享安装层补齐 README Quick Install、INSTALL.md、`.env.example` 和 `npm run install-check`，明确不提交本地 token / `.pi/workers` 运行数据。 |
+| 2026-07-06 | OF-022 补 `/ox-web`：Pi 内一条指令即可检查/启动/打开本地 Web dashboard，日志写入 `.pi/workers/web-server-PORT.log`，手动 node 启动降级为兜底。 |

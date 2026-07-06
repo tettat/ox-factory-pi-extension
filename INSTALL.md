@@ -56,7 +56,30 @@ npm run verify
 
 ## 启动 Web dashboard
 
-Web dashboard 是本地只读页面，默认读取宿主项目的 `.pi/workers` 运行数据：
+Web dashboard 是本地只读页面，默认读取宿主项目的 `.pi/workers` 运行数据。
+
+推荐在 Pi 里直接执行：
+
+```text
+/ox-web
+```
+
+它会：
+
+1. 检查 `http://127.0.0.1:8787/api/health` 是否已经是 ox-factory dashboard；
+2. 如果没启动，后台启动 `web-server.mjs`；
+3. 通过系统浏览器打开 `http://127.0.0.1:8787`；
+4. 日志写到 `.pi/workers/web-server-8787.log`。
+
+常用变体：
+
+```text
+/ox-web --status      # 只检查状态，不启动
+/ox-web --no-open     # 启动/复用服务，但不打开浏览器
+/ox-web 8799          # 使用其它端口
+```
+
+手动兜底方式：
 
 ```bash
 cd <host-project>

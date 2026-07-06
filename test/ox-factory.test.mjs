@@ -1366,6 +1366,19 @@ test("worker vacation status and job cancellation are exposed", () => {
   assert.match(webServerSource, /regInfo\.status === "vacation"/);
 });
 
+test("ox web command starts and opens the local dashboard", () => {
+  const indexSource = readFileSync(join(testDir, "../index.ts"), "utf8");
+
+  assert.match(indexSource, /registerCommand\("ox-web"/);
+  assert.match(indexSource, /ensureOxWebDashboard/);
+  assert.match(indexSource, /isOxWebDashboardHealthy/);
+  assert.match(indexSource, /web-server\.mjs/);
+  assert.match(indexSource, /openExternalUrl/);
+  assert.match(indexSource, /127\.0\.0\.1/);
+  assert.match(indexSource, /--status/);
+  assert.match(indexSource, /--no-open/);
+});
+
 test("worker config exposes codex sandbox updates without full-config churn", () => {
   const indexSource = readFileSync(join(testDir, "../index.ts"), "utf8");
   const registrySource = readFileSync(join(testDir, "../registry.ts"), "utf8");
