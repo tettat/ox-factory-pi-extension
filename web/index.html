@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="warroom">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <meta name="referrer" content="no-referrer" />
+    <title>牛马工厂 · 驾驶舱</title>
+    <link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🐂</text></svg>" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <!-- 顶部状态条 -->
+    <header class="topbar" role="banner">
+      <div class="topbar__left">
+        <div class="brand">
+          <span class="brand__logo" aria-hidden="true">🐂</span>
+          <div class="brand__text">
+            <strong>牛马工厂</strong>
+            <span class="brand__sub">本地驾驶舱 · Phase 1 · 只读</span>
+          </div>
+        </div>
+        <div class="health" id="topbarHealth" aria-live="polite">
+          <span class="health__dot" data-level="healthy"></span>
+          <span class="health__label">加载中…</span>
+        </div>
+      </div>
+      <div class="topbar__right">
+        <div class="metrics" id="topbarMetrics">
+          <div class="metric" data-key="workers">
+            <span class="metric__value" id="metricWorkers">—</span>
+            <span class="metric__label">员工</span>
+          </div>
+          <div class="metric" data-key="jobs">
+            <span class="metric__value" id="metricJobs">—</span>
+            <span class="metric__label">Jobs</span>
+          </div>
+          <div class="metric metric--alert" data-key="stale">
+            <span class="metric__value" id="metricStale">—</span>
+            <span class="metric__label">Stale</span>
+          </div>
+          <div class="metric" data-key="tokens">
+            <span class="metric__value" id="metricTokens">—</span>
+            <span class="metric__label">今日 Token</span>
+          </div>
+        </div>
+        <button class="btn btn--ghost" id="refreshBtn" type="button" title="刷新（手动）">
+          <span class="btn__icon" aria-hidden="true">↻</span>
+          <span class="btn__text">刷新</span>
+        </button>
+        <span class="timestamp" id="lastUpdated">—</span>
+      </div>
+    </header>
+
+    <div class="shell">
+      <!-- 左侧导航 -->
+      <nav class="sidenav" aria-label="主导航">
+        <ul class="sidenav__list" id="sidenavList">
+          <li><a href="#/overview" data-route="overview"><span class="sidenav__icon">▣</span><span>Overview</span><span class="sidenav__pill">P0</span></a></li>
+          <li><a href="#/projects" data-route="projects"><span class="sidenav__icon">▦</span><span>Projects</span><span class="sidenav__pill sidenav__pill--soon">P1</span></a></li>
+          <li><a href="#/workers" data-route="workers"><span class="sidenav__icon">◐</span><span>Workers</span><span class="sidenav__pill">P0</span></a></li>
+          <li><a href="#/jobs" data-route="jobs"><span class="sidenav__icon">▤</span><span>Jobs</span><span class="sidenav__pill">P0</span></a></li>
+          <li><a href="#/schedules" data-route="schedules"><span class="sidenav__icon">⏱</span><span>Schedules</span><span class="sidenav__pill sidenav__pill--soon">P1</span></a></li>
+          <li class="sidenav__sep" aria-hidden="true"></li>
+          <li><a href="#/tokens" data-route="tokens"><span class="sidenav__icon">∑</span><span>Tokens</span><span class="sidenav__pill sidenav__pill--soon">P1</span></a></li>
+          <li><a href="#/compactions" data-route="compactions"><span class="sidenav__icon">⇋</span><span>Compactions</span><span class="sidenav__pill sidenav__pill--soon">P1</span></a></li>
+          <li><a href="#/messages" data-route="messages"><span class="sidenav__icon">✉</span><span>Messages</span><span class="sidenav__pill sidenav__pill--soon">P1</span></a></li>
+          <li><a href="#/report" data-route="report"><span class="sidenav__icon">📋</span><span>Report</span><span class="sidenav__pill sidenav__pill--soon">P1</span></a></li>
+          <li><a href="#/permissions" data-route="permissions"><span class="sidenav__icon">🔐</span><span>Permissions</span><span class="sidenav__pill sidenav__pill--soon">P2</span></a></li>
+        </ul>
+        <div class="sidenav__foot">
+          <div class="sidenav__hint">Phase 1 · read-first</div>
+          <div class="sidenav__hint sidenav__hint--muted">不写权限 / 不派活 / 不 apply 压缩</div>
+        </div>
+      </nav>
+
+      <!-- 主内容区 -->
+      <main class="main" id="main" role="main" aria-live="polite">
+        <div class="page-loading" id="pageLoading">
+          <div class="skeleton skeleton--title"></div>
+          <div class="skeleton skeleton--row"></div>
+          <div class="skeleton skeleton--row"></div>
+          <div class="skeleton skeleton--row"></div>
+        </div>
+      </main>
+    </div>
+
+    <!-- 抽屉 -->
+    <aside class="drawer" id="drawer" aria-hidden="true" aria-label="详情面板">
+      <div class="drawer__panel" role="dialog" aria-modal="false">
+        <header class="drawer__head">
+          <div>
+            <div class="drawer__eyebrow" id="drawerEyebrow">JOB</div>
+            <h3 class="drawer__title" id="drawerTitle">详情</h3>
+          </div>
+          <button class="drawer__close" id="drawerClose" type="button" aria-label="关闭">×</button>
+        </header>
+        <div class="drawer__body" id="drawerBody">
+          <div class="skeleton skeleton--title"></div>
+          <div class="skeleton skeleton--row"></div>
+          <div class="skeleton skeleton--row"></div>
+        </div>
+      </div>
+      <div class="drawer__backdrop" id="drawerBackdrop" tabindex="-1"></div>
+    </aside>
+
+    <!-- 全局错误提示 -->
+    <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+    <script src="app.js" defer></script>
+  </body>
+</html>

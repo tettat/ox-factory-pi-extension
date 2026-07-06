@@ -1,0 +1,13 @@
+{
+  "name": "ox-factory-pi-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "牛马工厂 Pi extension: worker orchestration, reporting, project tracking, and local dashboard.",
+  "scripts": {
+    "install-check": "node install-check.mjs",
+    "check": "node --check projects.mjs && node --check web-server.mjs && node --check install-check.mjs && node validate-tools.mjs",
+    "test": "node --test test/ox-factory.test.mjs",
+    "verify": "npm run check && npm test"
+  }
+}

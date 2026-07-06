@@ -1,0 +1,26 @@
+# Dependencies / package managers
+node_modules/
+.pnpm-store/
+
+# Local env / secrets
+.env
+.env.*
+!.env.example
+
+# Logs / test output
+*.log
+coverage/
+.nyc_output/
+.tap/
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# Local runtime spillover if this repo is copied into a larger Pi workspace
+workers/
+.pi/workers/
+.last-output-*.json
+*.bak
+*.tmp
