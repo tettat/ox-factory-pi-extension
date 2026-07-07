@@ -1158,11 +1158,33 @@
   async function renderTokens() {
     const wrap = el("div", { class: "page page--tokens" });
 
-    // 从 URL hash 读出当前 date / days，保证 refreshCurrent 能保留 filter
+    // 从 URL hash 读出当前 date / days。route()/refreshCurrent() 都会重新进入
+    // renderTokens，所以这里要始终尊重 hash，而不是只在 STATE 为空时读取。
     const hash = location.hash || "#/tokens";
     const query = new URLSearchParams(hash.split("?")[1] || "");
-    if (!STATE.tokensDate) STATE.tokensDate = query.get("date") || todayLocal();
-    if (!STATE.tokensTrendDays) STATE.tokensTrendDays = Number(query.get("trend")) || 7;
+    const hashTrendDays = Number(query.get("trend"));
+    STATE.tokensDate = query.get("date") || STATE.tokensDate || todayLocal();
+    STATE.tokensTrendDays = Number.isFinite(hashTrendDays) && hashTrendDays > 0
+      ? hashTrendDays
+      : (STATE.tokensTrendDays || 7);
+
+    function applyTokenFilters(patch = {}) {
+      const nextDate = patch.date || STATE.tokensDate || todayLocal();
+      const nextTrendDays = Number(patch.trend || STATE.tokensTrendDays || 7);
+      const safeTrendDays = Number.isFinite(nextTrendDays) && nextTrendDays > 0 ? nextTrendDays : 7;
+      const newHash = `#/tokens?date=${encodeURIComponent(nextDate)}&trend=${safeTrendDays}`;
+      const unchanged = STATE.tokensDate === nextDate
+        && STATE.tokensTrendDays === safeTrendDays
+        && location.hash === newHash;
+      if (unchanged) return;
+
+      STATE.tokensDate = nextDate;
+      STATE.tokensTrendDays = safeTrendDays;
+      if (location.hash !== newHash) history.replaceState(null, "", newHash);
+      // 直接调用 renderTokens() 只会返回新 DOM 节点，不会挂载到 #main。
+      // 走 route() 才能触发 loading、竞态保护和主区域替换。
+      void route();
+    }
 
     // 顶部 filter
     const filterBar = el("section", { class: "filters" }, [
@@ -1174,7 +1196,8 @@
           id: "filterTokenDate",
           value: STATE.tokensDate,
           max: todayLocal(),
-          onchange: (e) => { STATE.tokensDate = e.target.value; renderTokens(); },
+          oninput: (e) => applyTokenFilters({ date: e.target.value }),
+          onchange: (e) => applyTokenFilters({ date: e.target.value }),
         }),
       ]),
       el("div", { class: "filters__group" }, [
@@ -1182,7 +1205,7 @@
         el("select", {
           class: "input",
           id: "filterTokenTrend",
-          onchange: (e) => { STATE.tokensTrendDays = Number(e.target.value); renderTokens(); },
+          onchange: (e) => applyTokenFilters({ trend: Number(e.target.value) }),
         }, [3, 7, 14, 30].map((d) => el("option", { value: String(d), text: `近 ${d} 天`, ...(d === STATE.tokensTrendDays ? { selected: "selected" } : {}) }))),
       ]),
       el("div", { class: "filters__group filters__group--grow" }, [

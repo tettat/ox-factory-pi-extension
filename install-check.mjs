@@ -79,6 +79,7 @@ requireFile(join(here, "package.json"), "package.json");
 requireFile(join(here, "README.md"), "README.md");
 requireFile(join(here, "INSTALL.md"), "INSTALL.md");
 requireFile(join(here, "index.ts"), "index.ts");
+requireFile(join(here, "scripts", "install.sh"), "scripts/install.sh");
 requireFile(join(here, "web-server.mjs"), "web-server.mjs");
 requireFile(join(here, "validate-tools.mjs"), "validate-tools.mjs");
 

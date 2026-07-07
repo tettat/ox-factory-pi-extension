@@ -10,22 +10,31 @@ docs should be managed from this folder.
 
 ## Quick Install
 
-For internal Codebase sharing, install this repository as source under a host
-Pi project:
+Recommended one-command setup from the host project where you run Pi:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/tettat/ox-factory-pi-extension/main/scripts/install.sh)"
+```
+
+The script will:
+
+1. check whether the `pi` CLI is installed;
+2. ask whether to install the extension for the current project or globally;
+3. optionally configure the main Pi agent to use the official DeepSeek API
+   (`deepseek-v4-pro` by default) if you paste an API key.
+
+Manual source install is still supported:
 
 ```bash
 cd <host-project>
-mkdir -p .pi/extensions
-git clone <codebase-repo-url> .pi/extensions/ox-factory
-cd .pi/extensions/ox-factory
-npm run install-check
-npm run verify
+pi install https://github.com/tettat/ox-factory-pi-extension.git --local --approve
 ```
 
 Then restart or reload Pi from the host project so it loads
-`.pi/extensions/ox-factory/index.ts`.
+the extension.
 
-Full installation, update, Web dashboard, Codex backend, and sharing notes:
+Full installation, update, Web dashboard, DeepSeek, Codex backend, and sharing
+notes:
 
 - [`INSTALL.md`](./INSTALL.md)
 
@@ -62,6 +71,8 @@ Full installation, update, Web dashboard, Codex backend, and sharing notes:
 
 ## Verification
 
+If you are developing the extension locally:
+
 ```bash
 npm run install-check
 npm run verify
@@ -73,6 +84,8 @@ Equivalent explicit commands:
 node install-check.mjs
 node --check projects.mjs
 node --check web-server.mjs
+node --check web/app.js
+bash -n scripts/install.sh
 node validate-tools.mjs
 node --test test/ox-factory.test.mjs
 ```
@@ -113,6 +126,14 @@ Open:
 http://127.0.0.1:8787
 ```
 
+## Model Backends
+
+- **Pi backend / DeepSeek**: the one-click installer can write
+  `~/.pi/agent/auth.json` and `~/.pi/agent/settings.json` so the main Pi agent
+  uses the official DeepSeek API. It preserves existing provider settings.
+- **Codex app-server backend**: optional worker backend for Codex-powered
+  employees. See [`INSTALL.md`](./INSTALL.md#codex-app-server-后端可选配置).
+
 ## Runtime Data
 
 Runtime files are intentionally outside this standalone repository, usually in
@@ -133,7 +154,7 @@ Examples:
 
 Do not commit those runtime files into this repo unless explicitly requested.
 
-## Security / Internal Sharing Notes
+## Security / Sharing Notes
 
 - Do not commit `.env`, session files, rollout files, `.pi/workers`, or local
   credential caches.
@@ -141,9 +162,8 @@ Do not commit those runtime files into this repo unless explicitly requested.
   stay in local shell configuration or an ignored `.env`.
 - `package.json` remains `"private": true` because this is currently a source
   Pi extension, not an npm package.
-- Internal Codebase sharing is the supported path today. Public open source
-  would need a separate license decision and a stronger docs scrub for internal
-  paths, domains, and incident notes.
+- The installer never prints your API key. It stores DeepSeek credentials in
+  Pi's normal local agent config (`~/.pi/agent/auth.json`).
 
 ## Project Entity MVP
 

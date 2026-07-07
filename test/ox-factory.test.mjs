@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1377,6 +1377,35 @@ test("ox web command starts and opens the local dashboard", () => {
   assert.match(indexSource, /127\.0\.0\.1/);
   assert.match(indexSource, /--status/);
   assert.match(indexSource, /--no-open/);
+});
+
+test("tokens page route-refreshes when date or trend filters change", () => {
+  const webAppSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
+
+  assert.match(webAppSource, /function applyTokenFilters/);
+  assert.match(webAppSource, /oninput:\s*\(e\)\s*=>\s*applyTokenFilters\(\{\s*date:/);
+  assert.match(webAppSource, /onchange:\s*\(e\)\s*=>\s*applyTokenFilters\(\{\s*date:/);
+  assert.match(webAppSource, /onchange:\s*\(e\)\s*=>\s*applyTokenFilters\(\{\s*trend:/);
+  assert.match(webAppSource, /history\.replaceState\(null,\s*""\s*,\s*newHash\)/);
+  assert.match(webAppSource, /void route\(\)/);
+  assert.doesNotMatch(webAppSource, /STATE\.tokensDate\s*=\s*e\.target\.value;\s*renderTokens\(\);/);
+  assert.doesNotMatch(webAppSource, /STATE\.tokensTrendDays\s*=\s*Number\(e\.target\.value\);\s*renderTokens\(\);/);
+});
+
+test("one-click installer installs the Pi extension and configures DeepSeek defaults", () => {
+  const installerPath = join(testDir, "../scripts/install.sh");
+  assert.equal(existsSync(installerPath), true);
+  const installerSource = readFileSync(installerPath, "utf8");
+
+  assert.match(installerSource, /command -v pi/);
+  assert.match(installerSource, /pi install "\$REPO_URL" --local --approve/);
+  assert.match(installerSource, /pi install "\$REPO_URL" --approve/);
+  assert.match(installerSource, /DEEPSEEK_API_KEY/);
+  assert.match(installerSource, /auth\.json/);
+  assert.match(installerSource, /defaultProvider.*deepseek/s);
+  assert.match(installerSource, /deepseek-v4-pro/);
+  assert.doesNotMatch(installerSource, /plat_[A-Za-z0-9]/);
+  assert.doesNotMatch(installerSource, /sk-[A-Za-z0-9]/);
 });
 
 test("worker config exposes codex sandbox updates without full-config churn", () => {
