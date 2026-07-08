@@ -8,6 +8,65 @@
   // ---- 配置 ----
   const REFRESH_DEBOUNCE_MS = 200;
   const DRAWER_OPEN_CLASS = "drawer--open";
+  const LANG_STORAGE_KEY = "oxFactoryLang";
+  const I18N = {
+    zh: {
+      "app.title": "牛马工厂 · 驾驶舱",
+      "brand.title": "牛马工厂",
+      "brand.subtitle": "本地驾驶舱 · Phase 1 · 只读",
+      "health.loading": "加载中…",
+      "metrics.workers": "员工",
+      "metrics.jobs": "Jobs",
+      "metrics.stale": "Stale",
+      "metrics.tokensToday": "今日 Token",
+      "actions.refresh": "刷新",
+      "actions.refreshTitle": "刷新（手动）",
+      "actions.switchLanguage": "切换语言",
+      "nav.aria": "主导航",
+      "nav.overview": "概览",
+      "nav.projects": "项目",
+      "nav.workers": "员工",
+      "nav.jobs": "任务",
+      "nav.schedules": "定时任务",
+      "nav.tokens": "Token",
+      "nav.compactions": "压缩",
+      "nav.messages": "消息",
+      "nav.report": "日报",
+      "nav.permissions": "权限",
+      "nav.phase": "Phase 1 · read-first",
+      "nav.readonly": "不写权限 / 不派活 / 不 apply 压缩",
+      "topbar.updatedAt": "更新于",
+      "toast.refreshed": "已刷新",
+    },
+    en: {
+      "app.title": "Ox Factory · Dashboard",
+      "brand.title": "Ox Factory",
+      "brand.subtitle": "Local Dashboard · Phase 1 · Read-only",
+      "health.loading": "Loading…",
+      "metrics.workers": "Workers",
+      "metrics.jobs": "Jobs",
+      "metrics.stale": "Stale",
+      "metrics.tokensToday": "Tokens Today",
+      "actions.refresh": "Refresh",
+      "actions.refreshTitle": "Refresh manually",
+      "actions.switchLanguage": "Switch language",
+      "nav.aria": "Primary navigation",
+      "nav.overview": "Overview",
+      "nav.projects": "Projects",
+      "nav.workers": "Workers",
+      "nav.jobs": "Jobs",
+      "nav.schedules": "Schedules",
+      "nav.tokens": "Tokens",
+      "nav.compactions": "Compactions",
+      "nav.messages": "Messages",
+      "nav.report": "Report",
+      "nav.permissions": "Permissions",
+      "nav.phase": "Phase 1 · read-first",
+      "nav.readonly": "No writes / no dispatch / no compaction apply",
+      "topbar.updatedAt": "Updated",
+      "toast.refreshed": "Refreshed",
+    },
+  };
   const STATE = {
     lastOverview: null,
     workers: [],
@@ -16,11 +75,59 @@
     drawerJob: null,
     tokensDate: null,
     tokensTrendDays: null,
+    qualityDateMode: "all",
+    qualityDate: null,
+    lang: readInitialLang(),
   };
 
   // ---- 工具 ----
   const $ = (sel, root = document) => root.querySelector(sel);
   const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+
+  function readInitialLang() {
+    try {
+      const saved = localStorage.getItem(LANG_STORAGE_KEY);
+      if (saved === "zh" || saved === "en") return saved;
+    } catch {}
+    return "zh";
+  }
+
+  function t(key) {
+    return I18N[STATE.lang]?.[key] || I18N.zh[key] || key;
+  }
+
+  function updateLangSwitchUI() {
+    const btn = $("#langSwitch");
+    const text = $("#langSwitchText");
+    if (!btn || !text) return;
+    const label = t("actions.switchLanguage");
+    btn.title = label;
+    btn.setAttribute("aria-label", label);
+    btn.setAttribute("aria-pressed", STATE.lang === "en" ? "true" : "false");
+    text.textContent = STATE.lang === "zh" ? "中 / EN" : "ZH / EN";
+  }
+
+  function applyStaticI18n() {
+    document.documentElement.lang = STATE.lang === "en" ? "en" : "zh-CN";
+    document.title = t("app.title");
+    $$("[data-i18n]").forEach((node) => {
+      node.textContent = t(node.dataset.i18n);
+    });
+    $$("[data-i18n-title]").forEach((node) => {
+      node.title = t(node.dataset.i18nTitle);
+    });
+    $$("[data-i18n-aria-label]").forEach((node) => {
+      node.setAttribute("aria-label", t(node.dataset.i18nAriaLabel));
+    });
+    updateLangSwitchUI();
+  }
+
+  function setLanguage(lang) {
+    STATE.lang = lang === "en" ? "en" : "zh";
+    try { localStorage.setItem(LANG_STORAGE_KEY, STATE.lang); } catch {}
+    applyStaticI18n();
+    if (STATE.lastOverview) setTopbar(STATE.lastOverview);
+  }
 
   function el(tag, attrs = {}, children = []) {
     const node = document.createElement(tag);
@@ -278,6 +385,14 @@
     return String(Math.round(v));
   }
 
+  function fmtDurationMs(ms) {
+    const v = Number(ms || 0);
+    if (!Number.isFinite(v) || v <= 0) return "—";
+    if (v < 1000) return `${Math.round(v)}ms`;
+    if (v < 10_000) return `${(v / 1000).toFixed(1)}s`;
+    return `${Math.round(v / 1000)}s`;
+  }
+
   function debounce(fn, ms) {
     let t;
     return (...args) => {
@@ -300,6 +415,8 @@
   }
 
   // ---- API ----
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
   async function api(path, opts = {}) {
     const url = path.startsWith("http") ? path : path;
     try {
@@ -339,6 +456,7 @@
     stale: "Stale",
     failed: "失败",
     aborted: "中止",
+    vacation: "休假",
   };
 
   function statusPill(status) {
@@ -352,16 +470,16 @@
 
   // ---- Topbar ----
   function setTopbar(overview) {
-    const t = overview?.totals || {};
-    $("#metricWorkers").textContent = t.workers ?? "—";
-    $("#metricJobs").textContent = t.jobsAll ?? "—";
-    $("#metricStale").textContent = (t.stale || 0) + (t["orphan-running"] || 0);
-    $("#metricTokens").textContent = fmtNumber(t.tokens?.totalWithCached || 0);
+    const totals = overview?.totals || {};
+    $("#metricWorkers").textContent = totals.workers ?? "—";
+    $("#metricJobs").textContent = totals.jobsAll ?? "—";
+    $("#metricStale").textContent = (totals.stale || 0) + (totals["orphan-running"] || 0);
+    $("#metricTokens").textContent = fmtNumber(totals.tokens?.totalWithCached || 0);
     const h = overview?.health || { level: "healthy", label: "—" };
     const health = $("#topbarHealth");
     health.querySelector(".health__dot").dataset.level = h.level;
     health.querySelector(".health__label").textContent = h.label + (h.signals?.length ? ` · ${h.signals[0]}` : "");
-    $("#lastUpdated").textContent = `更新于 ${fmtTime(overview?.generatedAt)}`;
+    $("#lastUpdated").textContent = `${t("topbar.updatedAt")} ${fmtTime(overview?.generatedAt)}`;
   }
 
   // ---- Overview 页面 ----
@@ -745,14 +863,15 @@
     return el("ul", { class: "worker-preview" },
       workers.slice(0, 8).map((w) => el("li", { class: "worker-preview__item" }, [
         el("a", { class: "worker-preview__link", href: `#/workers/${encodeURIComponent(w.name)}` }, [
-          el("div", { class: `avatar avatar--${w.status || "idle"}` }, [el("span", { class: "avatar__char", text: (w.name || "?").slice(0, 1) })]),
+          el("div", { class: `avatar avatar--${w.status || "idle"}${w.status === "vacation" ? " avatar--vacation" : ""}` }, [el("span", { class: "avatar__char", text: (w.name || "?").slice(0, 1) })]),
           el("div", { class: "worker-preview__body" }, [
             el("div", { class: "worker-preview__name" }, [
               workerStatusDot(w.status),
               el("span", { text: w.name }),
+              w.status === "vacation" ? el("span", { class: "worker-card__vacation-badge", text: "🏖 休假" }) : null,
             ]),
             el("div", { class: "worker-preview__meta" }, [
-              el("span", { text: w.status || "idle" }),
+              el("span", { text: STATUS_LABELS[w.status] || w.status || "idle" }),
               el("span", { text: `· tok ${fmtNumber(w.tokenToday?.totalWithCached || 0)}` }),
             ]),
             w.responsibility ? el("div", { class: "worker-preview__meta", text: w.responsibility.split("\n")[0] }) : null,
@@ -814,7 +933,7 @@
     const split = el("section", { class: "workers" }, [
       el("aside", { class: "workers__list" },
         workers.map((w) => el("a", {
-          class: `worker-card${w.name === initialWorker ? " worker-card--active" : ""}`,
+          class: `worker-card${w.status === "vacation" ? " worker-card--vacation" : ""}${w.name === initialWorker ? " worker-card--active" : ""}`,
           href: `#/workers/${encodeURIComponent(w.name)}`,
           data: { name: w.name },
           onclick: (e) => {
@@ -823,14 +942,16 @@
             navigateToWorker(w.name);
           },
         }, [
-          el("div", { class: `avatar avatar--${w.status || "idle"}` }, [el("span", { class: "avatar__char", text: (w.name || "?").slice(0, 1) })]),
+          el("div", { class: `avatar avatar--${w.status || "idle"}${w.status === "vacation" ? " avatar--vacation" : ""}` }, [el("span", { class: "avatar__char", text: (w.name || "?").slice(0, 1) })]),
           el("div", { class: "worker-card__body" }, [
             el("div", { class: "worker-card__name" }, [
               workerStatusDot(w.status),
               el("span", { text: w.name }),
+              w.status === "vacation" ? el("span", { class: "worker-card__vacation-badge", text: "🏖 休假" }) : null,
             ]),
             el("div", { class: "worker-card__meta" }, [
-              el("span", { text: w.role || "—" }),
+              el("span", { text: STATUS_LABELS[w.status] || w.status || "idle" }),
+              w.role ? el("span", { text: `· ${w.role}` }) : null,
             ]),
             w.responsibility ? el("div", { class: "worker-card__meta", text: w.responsibility.split("\n")[0] }) : null,
             el("div", { class: "worker-card__stats" }, [
@@ -846,6 +967,138 @@
     ]);
     wrap.appendChild(split);
     main.appendChild(wrap);
+  }
+
+// 和 TA 对话 · Web 版 /talk 员工名
+  // 限制：text 发送后，服务端调 jobs.mjs.createJob(kind:"talk") 创建 job。
+  // Pi 主进程内 workerJobQueues 不会主动拾取 web 创建的 job 文件；
+  // 依赖秘书/主 agent 读 messages.jsonl 后用 /talk 内核正式起活。
+  // 这里只要 UI：输入 → 看已发 → 默认一次拉、看响应 → 「刷新」重拉
+  function buildTalkPanel(worker, d) {
+    const card = el("div", { class: "card talk-panel" });
+    const head = el("div", { class: "card__head" });
+    head.appendChild(el("h3", { class: "card__title", text: `和 ${worker} 对话` }));
+    head.appendChild(el("p", { class: "card__sub", text: "Web 版 /talk · 提交到 Pi 主进程，由主进程走正常 talk 调度：空闲马上开始，忙碌自动排队。", }));
+    card.appendChild(head);
+
+    // 状态条：显示后台进程是否能拾起
+    const status = d.status || "idle";
+    card.appendChild(el("div", { class: "talk-panel__meta" }, [
+      el("span", { class: `tag tag--${status === "busy" ? "main" : "soft"}`, text: `状态：${status}` }),
+      d.backend ? el("span", { class: "tag tag--soft", text: `backend: ${d.backend}` }) : null,
+      d.model ? el("span", { class: "tag tag--soft", text: `model: ${d.model}` }) : null,
+      d.thinking ? el("span", { class: "tag tag--soft", text: `thinking: ${d.thinking}` }) : null,
+    ]));
+
+    // 输入区
+    const textarea = el("textarea", {
+      class: "input talk-panel__input",
+      id: `talkInput-${worker}`,
+      placeholder: `输入要发送给 ${worker} 的消息…（Ctrl+Enter 发送）`,
+      rows: 4,
+    });
+    const sendBtn = el("button", {
+      class: "btn btn--primary",
+      id: `talkSendBtn-${worker}`,
+      type: "button",
+      text: "发送",
+      disabled: false,
+    });
+    const hint = el("p", { class: "muted talk-panel__hint", html: md("发送后会生成 web-talk 请求；Pi 主进程接管后才会创建真实 talk job。若刚升级代码，请 reload Pi。", { compact: true, max: 200 }) });
+
+    // 提示：API 调用状态
+    const feedback = el("div", { class: "talk-panel__feedback", id: `talkFeedback-${worker}` });
+    const sendRow = el("div", { class: "talk-panel__row" }, [textarea, el("div", { class: "talk-panel__actions" }, [sendBtn, feedback])]);
+    card.appendChild(sendRow);
+    card.appendChild(hint);
+
+    // 历史 talk jobs（最近 20 条）
+    const historyBox = el("div", { class: "talk-panel__history", id: `talkHistory-${worker}` }, [el("p", { class: "muted", text: "加载中…" })]);
+    card.appendChild(historyBox);
+
+    // 点击发送
+    const send = async () => {
+      const msg = (textarea.value || "").trim();
+      if (!msg) { feedback.textContent = "消息不能为空"; feedback.className = "talk-panel__feedback talk-panel__feedback--error"; return; }
+      sendBtn.disabled = true;
+      sendBtn.textContent = "发送中…";
+      feedback.textContent = "";
+      feedback.className = "talk-panel__feedback";
+      const res = await api(`/api/talk/${encodeURIComponent(worker)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: msg }),
+      });
+      sendBtn.disabled = false;
+      sendBtn.textContent = "发送";
+      if (!res.ok) {
+        feedback.textContent = `❌ ${(res.detail && (res.detail.error?.message || res.detail)) || "发送失败"}`;
+        feedback.className = "talk-panel__feedback talk-panel__feedback--error";
+        return;
+      }
+      const requestId = res.data?.request?.id;
+      feedback.textContent = requestId
+        ? `✓ 已提交 · request ${requestId.slice(-6)}，等待 Pi 主进程接管…`
+        : "✓ 已提交，等待 Pi 主进程接管…";
+      feedback.className = "talk-panel__feedback talk-panel__feedback--ok";
+      textarea.value = "";
+      if (requestId) await waitTalkRequest(worker, requestId, feedback);
+      await reloadTalkHistory(worker);
+    };
+    sendBtn.addEventListener("click", send);
+    textarea.addEventListener("keydown", (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); send(); }
+    });
+
+    // 首次加载历史
+    queueMicrotask(() => reloadTalkHistory(worker));
+    return card;
+  }
+
+  async function waitTalkRequest(worker, requestId, feedback) {
+    for (let i = 0; i < 20; i++) {
+      await sleep(i === 0 ? 500 : 1500);
+      const res = await api(`/api/talk-requests/${encodeURIComponent(requestId)}`);
+      if (!res.ok) continue;
+      const request = res.data?.request || {};
+      if (request.status === "accepted") {
+        feedback.textContent = `✓ 已接入 talk · job ${request.jobId || "—"}${request.deliveryMode ? ` · ${request.deliveryMode}` : ""}`;
+        feedback.className = "talk-panel__feedback talk-panel__feedback--ok";
+        await reloadTalkHistory(worker);
+        return;
+      }
+      if (request.status === "failed") {
+        feedback.textContent = `❌ ${request.error || "Pi 主进程接管失败"}`;
+        feedback.className = "talk-panel__feedback talk-panel__feedback--error";
+        return;
+      }
+    }
+    feedback.textContent = `⌛ 已提交但仍未被 Pi 主进程接管；如果刚更新代码，请 reload Pi 后再看。`;
+    feedback.className = "talk-panel__feedback";
+  }
+
+  async function reloadTalkHistory(worker) {
+    const box = document.getElementById(`talkHistory-${worker}`);
+    if (!box) return;
+    const res = await api(`/api/jobs?worker=${encodeURIComponent(worker)}&limit=20`);
+    if (!res.ok) { box.innerHTML = ""; box.appendChild(errorBox("加载对话历史失败", res.detail)); return; }
+    const jobs = (res.data.jobs || []).filter((j) => j.project === "talk");
+    box.innerHTML = "";
+    if (!jobs.length) { box.appendChild(el("p", { class: "muted", text: "暂无对话记录。发第一条消息试试。", })); return; }
+    // 最新在上面
+    const list = el("ul", { class: "talk-list" }, jobs.map((j) => {
+      const li = el("li", { class: "talk-list__item" }, [
+        el("div", { class: "talk-list__head" }, [
+          statusPill(j.status),
+          el("span", { class: "talk-list__id", text: (j.id || "").slice(-6) }),
+          el("span", { class: "talk-list__time", text: fmtRelative(j.updatedAt || j.createdAt) }),
+          el("button", { class: "btn btn--ghost talk-list__btn", type: "button", text: "查看", onclick: () => openJobDrawer(j.id) }),
+        ]),
+        el("div", { class: "talk-list__task", text: j.task || "" }),
+      ]);
+      return li;
+    }));
+    box.appendChild(list);
   }
 
   async function renderWorkerDetail(name) {
@@ -864,10 +1117,14 @@
     const d = res.data;
     target.innerHTML = "";
     const head = el("header", { class: "worker-detail__head" }, [
-      el("div", { class: `avatar avatar--lg` }, [el("span", { class: "avatar__char", text: (d.name || "?").slice(0, 1) })]),
+      el("div", { class: `avatar avatar--lg${d.status === "vacation" ? " avatar--vacation" : ""}` }, [el("span", { class: "avatar__char", text: (d.name || "?").slice(0, 1) })]),
       el("div", { class: "worker-detail__title" }, [
-        el("h2", { text: d.name }),
+        el("h2", {}, [
+          d.status === "vacation" ? el("span", { class: "worker-card__vacation-badge", text: "🏖 休假" }) : null,
+          el("span", { text: ` ${d.name}` }),
+        ]),
         el("div", { class: "worker-detail__sub" }, [
+          statusPill(d.status),
           el("span", { class: "tag tag--soft", text: `Backend: ${d.backend || "—"}` }),
           el("span", { class: "tag tag--soft", text: `Model: ${d.model || "—"}` }),
           el("span", { class: "tag tag--soft", text: `Thinking: ${d.thinking || "—"}` }),
@@ -876,6 +1133,11 @@
       ]),
     ]);
     target.appendChild(head);
+
+        target.appendChild(head);
+
+    // 和 TA 对话 · Web 版 /talk 员工名
+    target.appendChild(buildTalkPanel(name, d));
 
     // 职责
     const responsibilities = d.responsibilities || [];
@@ -1105,10 +1367,17 @@
       el("h4", { text: "任务" }),
       d.task ? mdNode(d.task) : el("p", { class: "prose", text: "—" }),
     ]));
-    if (d.summary) {
+    const replyText = d.fullReply || d.latestReply || d.summary || "";
+    if (replyText) {
       body.appendChild(el("div", { class: "drawer__section" }, [
-        el("h4", { text: "摘要" }),
-        mdNode(d.summary),
+        el("h4", { text: "AI 响应" }),
+        d.fullReplyTruncated
+          ? el("p", {
+              class: "muted",
+              text: `响应过长，已展示前 ${fmtNumber(d.fullReplyLimit || 0)} 字符 / 共 ${fmtNumber(d.fullReplyChars || 0)} 字符。`,
+            })
+          : null,
+        mdNode(replyText),
       ]));
     }
     if (d.error) {
@@ -1277,12 +1546,13 @@
     const max = Math.max(1, ...days.map((d) => d.totalWithCachedTokens || 0));
     const total = days.reduce((a, b) => a + (b.totalWithCachedTokens || 0), 0);
     const avg = Math.round(total / days.length);
+    const peakDay = days.find((d) => d.totalWithCachedTokens === max);
     return el("div", { class: "trend-chart" }, [
       // 顶部汇总
       el("div", { class: "trend-chart__summary" }, [
         trendKpi("合计", fmtNumber(total), `${days.length} 天总消耗`),
         trendKpi("日均", fmtNumber(avg), "含缓存平均"),
-        trendKpi("峰值", fmtNumber(max), `${days.find((d) => d.totalWithCachedTokens === max)?.date || "—"}`),
+        trendKpi("峰值", fmtNumber(max), peakDay && peakDay.date ? String(peakDay.date) : "—"),
       ]),
       // bar chart
       el("div", { class: "trend-chart__bars" },
@@ -1773,10 +2043,29 @@
     wrap.appendChild(el("div", { class: "warn-banner" }, [
       el("strong", { text: "⚠ Codex shadow 压缩只用于评估，不会替换 Pi 真实压缩结果。" }),
     ]));
+    const qualityHost = el("div", { id: "qualityMetricsHost" }, [
+      el("section", { class: "section section--quality" }, [
+        sectionHead("上下文 / 回复质量观测", "正在异步加载；压缩对比记录会先展示，避免整页被历史回溯阻塞。"),
+        el("div", { class: "card" }, [el("p", { class: "muted", text: "加载质量观测中…" })]),
+      ]),
+    ]);
+    wrap.appendChild(qualityHost);
+    queueMicrotask(async () => {
+      try {
+        const node = await renderQualityMetrics();
+        if (!document.contains(qualityHost)) return;
+        qualityHost.innerHTML = "";
+        qualityHost.appendChild(node);
+      } catch (error) {
+        if (!document.contains(qualityHost)) return;
+        qualityHost.innerHTML = "";
+        qualityHost.appendChild(errorBox("加载质量观测失败", String(error?.message || error)));
+      }
+    });
     wrap.appendChild(el("section", { class: "section" }, [
-      sectionHead("主 agent 压缩对比", "Pi (真实) vs Codex (shadow，仅评估)"),
+      sectionHead("压缩对比记录", "主 agent / 员工 · Pi (真实) vs Codex (shadow，仅评估)"),
     ]));
-    const res = await api("/api/compactions?target=main&limit=20");
+    const res = await api("/api/compactions?target=all&limit=50");
     if (!res.ok) {
       wrap.appendChild(errorBox("加载压缩记录失败", res.detail));
     } else {
@@ -1801,11 +2090,596 @@
                   ]),
                 ]),
               ])))
-            : emptyState("暂无主 agent 压缩记录"),
+            : emptyState("暂无压缩记录"),
         ]),
       ]));
     }
     return wrap;
+  }
+
+  async function renderQualityMetrics() {
+    const hash = location.hash || "#/compactions";
+    const query = new URLSearchParams(hash.split("?")[1] || "");
+    STATE.qualityDateMode = query.get("qdate") === "day" ? "day" : "all";
+    STATE.qualityDate = query.get("date") || STATE.qualityDate || todayLocal();
+    const selectedDate = STATE.qualityDateMode === "all" ? "all" : STATE.qualityDate;
+    const displayDate = selectedDate === "all" ? "全部历史" : selectedDate;
+
+    function applyQualityFilters(patch = {}) {
+      const nextMode = patch.mode || STATE.qualityDateMode || "all";
+      const nextDate = patch.date || STATE.qualityDate || todayLocal();
+      STATE.qualityDateMode = nextMode === "day" ? "day" : "all";
+      STATE.qualityDate = nextDate;
+      const newHash = STATE.qualityDateMode === "all"
+        ? "#/compactions?qdate=all"
+        : `#/compactions?qdate=day&date=${encodeURIComponent(STATE.qualityDate)}`;
+      if (location.hash !== newHash) history.replaceState(null, "", newHash);
+      void route();
+    }
+
+    const section = el("section", { class: "section section--quality" }, [
+      sectionHead("上下文 / 回复质量观测", "回溯 jobs/events/session：会话轮次、上下文估算、压缩次数、输入/输出长度、耗时、工具调用、情绪评分"),
+    ]);
+    section.appendChild(el("div", { class: "filters quality-filters" }, [
+      el("div", { class: "filters__group" }, [
+        el("label", { class: "filters__label", text: "范围" }),
+        el("select", {
+          class: "input",
+          id: "qualityDateMode",
+          onchange: (e) => applyQualityFilters({ mode: e.target.value }),
+        }, [
+          el("option", { value: "all", text: "全部历史", ...(STATE.qualityDateMode === "all" ? { selected: "selected" } : {}) }),
+          el("option", { value: "day", text: "指定日期", ...(STATE.qualityDateMode === "day" ? { selected: "selected" } : {}) }),
+        ]),
+      ]),
+      el("div", { class: "filters__group" }, [
+        el("label", { class: "filters__label", text: "日期" }),
+        el("input", {
+          class: "input",
+          type: "date",
+          id: "qualityDate",
+          value: STATE.qualityDate,
+          max: todayLocal(),
+          disabled: STATE.qualityDateMode === "all" ? "disabled" : null,
+          oninput: (e) => applyQualityFilters({ mode: "day", date: e.target.value }),
+          onchange: (e) => applyQualityFilters({ mode: "day", date: e.target.value }),
+        }),
+      ]),
+      el("div", { class: "filters__group filters__group--grow" }, [
+        el("span", { class: "filters__hint", text: "全部历史会回溯可用 jobs/events/session；明显坏数据会丢弃，不补情绪分。" }),
+      ]),
+    ]));
+
+    const limitParam = selectedDate === "all" ? "all" : "120";
+    const res = await api(`/api/quality-metrics?date=${encodeURIComponent(selectedDate)}&limit=${encodeURIComponent(limitParam)}`);
+    if (!res.ok) {
+      section.appendChild(errorBox("加载质量观测失败", res.detail));
+      return section;
+    }
+    const d = res.data || {};
+    const totals = d.totals || {};
+    const config = d.config || {};
+    const workers = d.workers || [];
+    const turns = d.turns || [];
+    const dates = d.dates || [];
+    const history = d.history || {};
+    section.appendChild(el("div", { class: "quality-panel" }, [
+      el("div", { class: "kpi-row" }, [
+        trendKpi("样本 Turn", String(totals.turns || 0), displayDate),
+        trendKpi("压缩次数", String(totals.compactions || 0), "所有员工 session"),
+        trendKpi("平均耗时", fmtDurationMs(totals.avgResponseMs), "job elapsed"),
+        trendKpi("工具调用", String(totals.toolCalls || 0), "tool_start events"),
+        trendKpi("已评分", String(totals.scoredTurns || 0), config.enabled ? "情绪旁路已开启" : "情绪旁路关闭"),
+        trendKpi("丢弃", String(history.droppedJobs || 0), Object.entries(history.dropReasons || {}).map(([k, v]) => `${k}:${v}`).join(" · ") || "无明显坏数据"),
+      ]),
+      dates.length > 1 ? el("div", { class: "card" }, [
+        cardHead(`历史分布 (${dates.length} 天)`, "按天回溯可用 turn；点击日期切换到当天"),
+        el("div", { class: "quality-date-strip" }, dates.map((day) => el("button", {
+          class: "quality-date-strip__item",
+          onclick: () => applyQualityFilters({ mode: "day", date: day.date }),
+          title: `${day.date}\nturn ${day.turns}\n员工 ${day.workers}\n平均耗时 ${fmtDurationMs(day.avgResponseMs)}`,
+        }, [
+          el("span", { class: "quality-date-strip__date", text: day.date.slice(5) }),
+          el("span", { class: "quality-date-strip__bar", style: `height:${Math.max(8, Math.min(80, day.turns * 8))}px` }),
+          el("span", { class: "quality-date-strip__val", text: String(day.turns) }),
+        ]))),
+      ]) : null,
+      el("div", { class: "card" }, [
+        cardHead(`员工质量指标 (${workers.length})`, `评分: ${config.enabled ? "开启" : "关闭"} · ${config.provider || "—"}/${config.model || "—"} · ${history.exactContextPerTurn ? "精确上下文" : "历史回放估算"} · usable ${history.usableJobs ?? totals.turns ?? 0}/${history.candidateJobs ?? "—"}`),
+        workers.length
+          ? el("div", { class: "table-wrap" }, [
+              el("table", { class: "table quality-table" }, [
+                el("thead", {}, [el("tr", {}, [
+                  el("th", { text: "员工" }),
+                  el("th", { text: "会话轮次" }),
+                  el("th", { text: "上下文估算" }),
+                  el("th", { text: "压缩" }),
+                  el("th", { text: "样本" }),
+                  el("th", { text: "平均输入" }),
+                  el("th", { text: "平均输出" }),
+                  el("th", { text: "平均耗时" }),
+                  el("th", { text: "工具" }),
+                  el("th", { text: "情绪" }),
+                ])]),
+                el("tbody", {}, workers.map((w) => el("tr", {}, [
+                  el("td", { class: "td--mono", text: w.worker || "—" }),
+                  el("td", { class: "td--mono", text: String(w.session?.userTurns || 0) }),
+                  el("td", { class: "td--mono", text: fmtNumber(w.session?.estimatedContextTokens || 0) }),
+                  el("td", { class: "td--mono", text: String(w.session?.compactionCount || 0) }),
+                  el("td", { class: "td--mono", text: String(w.jobs?.count || 0) }),
+                  el("td", { class: "td--mono", text: fmtNumber(w.jobs?.avgInputChars || 0) }),
+                  el("td", { class: "td--mono", text: fmtNumber(w.jobs?.avgOutputChars || 0) }),
+                  el("td", { class: "td--mono", text: fmtDurationMs(w.jobs?.avgResponseMs || 0) }),
+                  el("td", { class: "td--mono", text: String(w.jobs?.toolCalls || 0) }),
+                  el("td", { class: "td--mono", text: w.jobs?.avgEmotionScore == null ? "—" : String(w.jobs.avgEmotionScore) }),
+                ]))),
+              ]),
+            ])
+          : emptyState("暂无质量指标样本", "产生员工 job 后会自动聚合。"),
+      ]),
+      el("div", { class: "card" }, [
+        cardHead(`最近 Turn (${turns.length})`, "情绪分绑定当前用户输入；低分通常意味着用户对上一轮表现不满"),
+        turns.length
+          ? el("div", { class: "table-wrap" }, [
+              el("table", { class: "table quality-turn-table" }, [
+                el("thead", {}, [el("tr", {}, [
+                  el("th", { text: "时间" }),
+                  el("th", { text: "员工" }),
+                  el("th", { text: "输入/输出" }),
+                  el("th", { text: "耗时" }),
+                  el("th", { text: "工具" }),
+                  el("th", { text: "上下文/压缩" }),
+                  el("th", { text: "情绪" }),
+                  el("th", { text: "任务" }),
+                ])]),
+                el("tbody", {}, turns.slice(0, 30).map((turn) => el("tr", { onclick: () => { location.hash = `#/jobs/${encodeURIComponent(turn.jobId)}`; } }, [
+                  el("td", { class: "td--time", text: fmtTime(turn.createdAt) }),
+                  el("td", { class: "td--mono", text: turn.worker || "—" }),
+                  el("td", { class: "td--mono", text: `${fmtNumber(turn.inputChars)} / ${fmtNumber(turn.outputChars)}` }),
+                  el("td", { class: "td--mono", text: fmtDurationMs(turn.responseMs) }),
+                  el("td", { class: "td--mono", text: String(turn.toolCalls || 0) }),
+                  el("td", { class: "td--mono", text: `${fmtNumber(turn.sessionContextTokens || 0)} / ${turn.sessionCompactions || 0}` }),
+                  el("td", { class: "td--mono", text: turn.emotionScore == null ? "—" : `${turn.emotionScore}${turn.emotionLabel ? ` · ${turn.emotionLabel}` : ""}` }),
+                  el("td", { class: "td--task", title: turn.taskPreview || "", text: turn.taskPreview || "—" }),
+                ]))),
+              ]),
+            ])
+          : emptyState(`${displayDate} 暂无可用 turn 样本`, "queued/running、坏时间、空输入/空输出等不一致数据会被丢弃。"),
+      ]),
+      // 趋势 / 散点图表：自变量 vs 因变量的关系胉示
+      buildQualityCharts(turns, workers, totals),
+    ]));
+    return section;
+  }
+
+  // ------------------------------------------------------------------
+  // QualityCharts · 单员工按轮次 / 输入 / 上下文看输出 / 工具调用 / 耗时 / 情绪
+  // 自制 SVG，不引第三方库
+  // ------------------------------------------------------------------
+  function buildQualityCharts(turns, workers, totals) {
+    STATE.qualityCharts = { turns, workers, totals };
+    if (!STATE.qualityChartWorker || !(workers || []).find((w) => w.worker === STATE.qualityChartWorker)) {
+      STATE.qualityChartWorker = "all";
+    }
+    const card = el("div", { class: "card quality-charts" });
+    card.appendChild(cardHead("趋势图谱 · 单员工分析", "默认全部员工；选择员工后只看该员工。点散点可跳到 Job Drawer。"));
+    const select = el("select", {
+      class: "input",
+      id: "qualityChartWorker",
+      onchange: (e) => { STATE.qualityChartWorker = e.target.value; refreshQualityCharts(); ensureModelIndexAndRender(); },
+    }, [
+      el("option", { value: "all", text: `全部员工 (${turns.length})` }),
+      ...workers.map((w) =>
+        el("option", { value: w.worker, text: `${w.worker} (${w.jobs?.count || 0} jobs)`,
+        ...(w.worker === STATE.qualityChartWorker ? { selected: "selected" } : {}) })),
+    ]);
+    card.appendChild(el("div", { class: "quality-charts__filter" }, [
+      el("span", { class: "tag tag--soft", text: "员工" }),
+      select,
+      el("span", { class: "muted", id: "qualityChartSummary" }),
+    ]));
+    card.appendChild(el("div", { class: "charts-grid", id: "qualityChartsGrid" }));
+
+    // 自定义散点图：任意选择 X / Y 字段的两两组合
+    card.appendChild(buildCustomChart(turns));
+
+    queueMicrotask(() => refreshQualityCharts());
+    return card;
+  }
+
+  // 默认任两两
+  const CUSTOM_FIELDS = [
+    { key: "inputChars",          label: "输入字符",       fmt: fmtNumber },
+    { key: "outputChars",         label: "输出字符",       fmt: fmtNumber },
+    { key: "inputTokens",         label: "输入 token",     fmt: fmtNumber },
+    { key: "outputTokens",        label: "输出 token",     fmt: fmtNumber },
+    { key: "totalTokens",         label: "总 token",       fmt: fmtNumber },
+    { key: "toolCalls",           label: "工具调用",       fmt: (n) => String(Math.round(n)) },
+    { key: "responseMs",          label: "耗时 (ms)",      fmt: fmtNumber },
+    { key: "elapsedMs",           label: "elapsedMs",      fmt: fmtNumber },
+    { key: "sessionContextTokens",label: "上下文估算 token",fmt: fmtNumber },
+    { key: "sessionUserTurns",    label: "会话轮次",       fmt: (n) => String(Math.round(n)) },
+    { key: "sessionCompactions",  label: "压缩次数",       fmt: (n) => String(Math.round(n)) },
+    { key: "turns",               label: "Turn 数",        fmt: (n) => String(Math.round(n)) },
+    { key: "taskChars",           label: "任务字符数",     fmt: fmtNumber },
+    { key: "summaryChars",        label: "摘要字符数",     fmt: fmtNumber },
+    { key: "elapsedSeconds",      label: "耗时 (s)",       fmt: (n) => String(Math.round(n)) },
+    { key: "cachedInputTokens",   label: "缓存 token",     fmt: fmtNumber },
+    { key: "emotionScore",        label: "情绪分 (1-5)",   fmt: (n) => String(Math.round(n * 10) / 10) },
+  ];
+
+  function buildCustomChart(turns) {
+    STATE.customChart = STATE.customChart || { xKey: "sessionContextTokens", yKey: "outputTokens" };
+    STATE.customModel = STATE.customModel || "all";
+    const card = el("div", { class: "card quality-custom" });
+    card.appendChild(cardHead("自定义散点 · 任两两组合", "选择 X 轴与 Y 轴字段 + 员工筛选 + 模型筛选。点击点跳转到 Job Drawer。"));
+    const selX = el("select", { class: "input", id: "customChartX", onchange: (e) => { STATE.customChart.xKey = e.target.value; renderCustomChart(); } },
+      CUSTOM_FIELDS.map((f) => el("option", { value: f.key, text: f.label, ...(f.key === STATE.customChart.xKey ? { selected: "selected" } : {}) })));
+    const selY = el("select", { class: "input", id: "customChartY", onchange: (e) => { STATE.customChart.yKey = e.target.value; renderCustomChart(); } },
+      CUSTOM_FIELDS.map((f) => el("option", { value: f.key, text: f.label, ...(f.key === STATE.customChart.yKey ? { selected: "selected" } : {}) })));
+    const selModel = el("select", { class: "input", id: "customChartModel", onchange: (e) => { STATE.customModel = e.target.value; renderCustomChart(); } });
+    // 模型下拉选项优先从 quality turn 自带的 model 字段计算；/api/jobs 只做旧数据兜底。
+    card.appendChild(el("div", { class: "quality-custom__filter" }, [
+      el("span", { class: "tag tag--soft", text: "X 轴" }),
+      selX,
+      el("span", { class: "tag tag--soft", text: "Y 轴" }),
+      selY,
+      el("span", { class: "tag tag--soft", text: "按模型筛" }),
+      selModel,
+      el("span", { class: "muted", id: "customChartSummary" }),
+    ]));
+    card.appendChild(el("div", { class: "chart-card" }, [el("div", { class: "chart-card__body", id: "customChartBody" })]));
+    queueMicrotask(() => ensureModelIndexAndRender());
+    return card;
+  }
+
+  function modelForTurn(turn) {
+    return String(turn?.model || STATE.modelByJobId?.get(turn?.jobId) || "").trim();
+  }
+
+  function rememberQualityTurnModels(turns) {
+    STATE.modelByJobId = STATE.modelByJobId || new Map();
+    for (const turn of turns || []) {
+      const model = String(turn?.model || "").trim();
+      if (turn?.jobId && model) STATE.modelByJobId.set(turn.jobId, model);
+    }
+  }
+
+  function customChartScope() {
+    let scope = STATE.qualityCharts?.turns || [];
+    if (STATE.qualityChartWorker && STATE.qualityChartWorker !== "all") {
+      scope = scope.filter((t) => t.worker === STATE.qualityChartWorker);
+    }
+    return scope;
+  }
+
+  // 确保 modelByJobId 索引加载，然后渲染
+  async function ensureModelIndexAndRender() {
+    rememberQualityTurnModels(STATE.qualityCharts?.turns || []);
+    if (!STATE.modelIndexLoaded) {
+      const r = await api("/api/jobs?limit=5000");
+      if (r.ok) {
+        for (const j of r.data.jobs || []) {
+          if (j.id && j.model) STATE.modelByJobId.set(j.id, j.model);
+        }
+        STATE.modelIndexLoaded = true;
+      }
+    }
+    // 填充 model 下拉
+    const sel = document.getElementById("customChartModel");
+    if (sel) {
+      const turns = customChartScope();
+      const modelSet = new Set();
+      turns.forEach((t) => {
+        const m = modelForTurn(t);
+        if (m) modelSet.add(m);
+      });
+      const models = Array.from(modelSet).sort();
+      sel.innerHTML = "";
+      sel.appendChild(el("option", { value: "all", text: `全部 (${models.length})` }));
+      for (const m of models) {
+        const opt = el("option", { value: m, text: m, ...(m === STATE.customModel ? { selected: "selected" } : {}) });
+        sel.appendChild(opt);
+      }
+      if (![...sel.options].some((o) => o.value === STATE.customModel)) {
+        STATE.customModel = "all";
+      }
+    }
+    renderCustomChart();
+  }
+
+  function renderCustomChart() {
+    const body = document.getElementById("customChartBody");
+    if (!body) return;
+    body.innerHTML = "";
+    const xKey = STATE.customChart.xKey;
+    const yKey = STATE.customChart.yKey;
+    if (!xKey || !yKey) {
+      body.appendChild(emptyState("请选择 X 轴和 Y 轴"));
+      return;
+    }
+    if (xKey === yKey) {
+      body.appendChild(emptyState("X 与 Y 不能是同一字段"));
+      return;
+    }
+    const xField = CUSTOM_FIELDS.find((f) => f.key === xKey);
+    const yField = CUSTOM_FIELDS.find((f) => f.key === yKey);
+    if (!xField || !yField) {
+      body.appendChild(emptyState("字段不存在"));
+      return;
+    }
+    rememberQualityTurnModels(STATE.qualityCharts?.turns || []);
+    let scope = customChartScope();
+    if (STATE.customModel && STATE.customModel !== "all") {
+      scope = scope.filter((t) => modelForTurn(t) === STATE.customModel);
+    }
+    if (!scope.length) {
+      body.appendChild(emptyState("无 turn 样本"));
+      return;
+    }
+    // 使用与 chartScatter 同样的 SVG 但带自定义 fmt + 颜色
+    const title = `${xField.label} → ${yField.label}`;
+    const head = el("div", { class: "chart-card__head" }, [
+      el("h4", { class: "chart-card__title", text: title }),
+      el("span", { class: "chart-card__hint", text: `${scope.length} 点 · ${xField.label} · ${yField.label}${STATE.customModel && STATE.customModel !== "all" ? ` · 仅 ${STATE.customModel}` : ""}` }),
+    ]);
+    body.appendChild(head);
+    const tip = el("div", { class: "chart-tip" });
+    const svg = renderScatterSvg(scope, xKey, yKey, xField.label, yField.label, xField.fmt, yField.fmt);
+    svg.querySelectorAll("circle").forEach((c, i) => {
+      c.addEventListener("mouseenter", (e) => showChartTip(tip, scope[i], scope[i], e));
+      c.addEventListener("mouseleave", () => tip.classList.remove("chart-tip--show"));
+      c.addEventListener("click", () => { location.hash = `#/jobs/${encodeURIComponent(scope[i].jobId)}`; });
+    });
+    body.appendChild(svg);
+    body.appendChild(tip);
+    const sum = document.getElementById("customChartSummary");
+    if (sum) {
+      const xs = scope.map((d) => Number(d[xKey] || 0));
+      const ys = scope.map((d) => Number(d[yKey] || 0));
+      const avgX = xs.length ? Math.round(xs.reduce((a, b) => a + b, 0) / xs.length) : 0;
+      const avgY = ys.length ? Math.round(ys.reduce((a, b) => a + b, 0) / ys.length) : 0;
+      sum.textContent = `${scope.length} 点 · 均 ${xField.label} ${xField.fmt(avgX)} · 均 ${yField.label} ${yField.fmt(avgY)}`;
+    }
+  }
+
+  function refreshQualityCharts() {
+    const grid = document.getElementById("qualityChartsGrid");
+    if (!grid) return;
+    const data = STATE.qualityCharts;
+    if (!data) return;
+    let turns = data.turns || [];
+    if (STATE.qualityChartWorker && STATE.qualityChartWorker !== "all") {
+      turns = turns.filter((t) => t.worker === STATE.qualityChartWorker);
+    }
+    grid.innerHTML = "";
+    if (!turns.length) {
+      grid.appendChild(emptyState("该员工暂无 turn 样本"));
+      const sum = document.getElementById("qualityChartSummary");
+      if (sum) sum.textContent = "";
+      return;
+    }
+    const avg = (arr) => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
+    const sum = document.getElementById("qualityChartSummary");
+    if (sum) sum.textContent = `样本 ${turns.length} 个 turn · 员工: ${STATE.qualityChartWorker === "all" ? "全部" : STATE.qualityChartWorker}`;
+    // KPI mini
+    grid.appendChild(el("div", { class: "kpi-row quality-kpi-row" }, [
+      trendKpi("样本 turn", String(turns.length), "本次过滤后"),
+      trendKpi("输入字符(均)", fmtNumber(Math.round(avg(turns.map((t) => t.inputChars || 0)))), "inputChars"),
+      trendKpi("输出字符(均)", fmtNumber(Math.round(avg(turns.map((t) => t.outputChars || 0)))), "outputChars"),
+      trendKpi("耗时(均)", fmtDurationMs(Math.round(avg(turns.map((t) => t.responseMs || 0)))), "responseMs"),
+      trendKpi("工具/turn", (avg(turns.map((t) => t.toolCalls || 0))).toFixed(1), "tool_start 计数"),
+    ]));
+    // 6 charts · 输入、上下文、时间趋势、情绪
+    grid.appendChild(chartScatter("输入字符 → 输出字符", turns, "inputChars", "outputChars", "输入字符", "输出字符"));
+    grid.appendChild(chartScatter("工具调用 → 输出字符", turns, "toolCalls", "outputChars", "工具调用数", "输出字符"));
+    grid.appendChild(chartScatter("输入 token → 输出 token", turns, "inputTokens", "outputTokens", "输入 token", "输出 token"));
+    grid.appendChild(chartScatter("耗时 ms → 输出字符", turns, "responseMs", "outputChars", "耗时 (ms)", "输出字符"));
+    grid.appendChild(chartScatter("上下文估算 → 输出 token", turns, "sessionContextTokens", "outputTokens", "sessionContextTokens", "输出 token"));
+    grid.appendChild(chartScatter("会话轮次 → 输出字符", turns, "sessionUserTurns", "outputChars", "sessionUserTurns", "输出字符"));
+    grid.appendChild(chartLine("时间序列：输入/输出 token", turns, "createdAt", [
+      { key: "inputTokens", label: "输入", color: "var(--seg-input)" },
+      { key: "outputTokens", label: "输出", color: "var(--seg-output)" },
+    ]));
+    grid.appendChild(chartLine("时间序列：工具调用 / 耗时", turns, "createdAt", [
+      { key: "toolCalls", label: "工具调用", color: "var(--seg-cache)" },
+      { key: "responseMs", label: "耗时(ms)", color: "var(--seg-reasoning)" },
+    ]));
+    if (turns.some((t) => t.emotionScore != null)) {
+      grid.appendChild(chartLine("情绪评分（情绪旁路开启时）", turns, "createdAt", [
+        { key: "emotionScore", label: "情绪 1-5", color: "var(--accent)" },
+      ]));
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // SVG 图表 helpers · 零依赖
+  // ------------------------------------------------------------------
+  function svgEl(name, attrs = {}) {
+    const n = document.createElementNS("http://www.w3.org/2000/svg", name);
+    for (const [k, v] of Object.entries(attrs || {})) {
+      if (v == null || v === false) continue;
+      n.setAttribute(k, String(v));
+    }
+    return n;
+  }
+
+  function renderScatterSvg(data, xKey, yKey, xLabel, yLabel, xFmt, yFmt) {
+    const W = 520, H = 220, pad = { l: 56, r: 12, t: 12, b: 28 };
+    const innerW = W - pad.l - pad.r, innerH = H - pad.t - pad.b;
+    const svg = svgEl("svg", { class: "chart-svg", viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": `${xLabel || xKey} → ${yLabel || yKey}` });
+    // 软背景参考线
+    for (let i = 0; i < 4; i++) {
+      const y = pad.t + (innerH * i) / 4;
+      svg.appendChild(svgEl("line", { x1: pad.l, y1: y, x2: W - pad.r, y2: y, stroke: "var(--grid-line)", "stroke-width": 1 }));
+    }
+    // 计算范围
+    const xs = data.map((d) => Number(d[xKey] || 0));
+    const ys = data.map((d) => Number(d[yKey] || 0));
+    const xMin = Math.min(...xs), xMax = Math.max(...xs, xMin + 1);
+    const yMin = Math.min(...ys), yMax = Math.max(...ys, yMin + 1);
+    const fmtX = xFmt || ((n) => fmtNumber(Math.round(n)));
+    const fmtY = yFmt || ((n) => fmtNumber(Math.round(n)));
+    // y 轴标签
+    const labelY = svgEl("text", { x: pad.l - 8, y: pad.t + innerH / 2, "text-anchor": "end", "font-size": 10, fill: "var(--text-muted)", "dominant-baseline": "middle" });
+    labelY.textContent = yLabel || yKey;
+    svg.appendChild(labelY);
+    // x 轴标签
+    const labelX = svgEl("text", { x: pad.l + innerW / 2, y: H - 6, "text-anchor": "middle", "font-size": 10, fill: "var(--text-muted)" });
+    labelX.textContent = xLabel || xKey;
+    svg.appendChild(labelX);
+    // x 轴范围
+    [xMin, xMax].forEach((val, i) => {
+      const x = pad.l + (innerW * i);
+      const t = svgEl("text", { x, y: pad.t + innerH + 14, "text-anchor": i === 0 ? "start" : "end", "font-size": 9, fill: "var(--text-muted)" });
+      t.textContent = fmtX(val);
+      svg.appendChild(t);
+    });
+    // y 轴范围
+    [yMin, yMax].forEach((val, i) => {
+      const y = pad.t + innerH - (innerH * i);
+      const t = svgEl("text", { x: pad.l - 4, y, "text-anchor": "end", "font-size": 9, fill: "var(--text-muted)", "dominant-baseline": i === 0 ? "auto" : "hanging" });
+      t.textContent = fmtY(val);
+      svg.appendChild(t);
+    });
+    // 点
+    data.forEach((d) => {
+      const x = pad.l + ((Number(d[xKey] || 0) - xMin) / (xMax - xMin || 1)) * innerW;
+      const y = pad.t + innerH - ((Number(d[yKey] || 0) - yMin) / (yMax - yMin || 1)) * innerH;
+      if (Number.isNaN(x) || Number.isNaN(y)) return;
+      const point = svgEl("circle", { cx: x, cy: y, r: 4, fill: "var(--accent)", "fill-opacity": 0.55, stroke: "var(--accent-strong)", "stroke-width": 1 });
+      svg.appendChild(point);
+    });
+    return svg;
+  }
+
+  function chartScatter(title, data, xKey, yKey, xLabel, yLabel) {
+    const card = el("div", { class: "chart-card" }, [
+      el("div", { class: "chart-card__head" }, [
+        el("h4", { class: "chart-card__title", text: title }),
+        el("span", { class: "chart-card__hint", text: `${data.length} 点 · ${xLabel || xKey} · ${yLabel || yKey}` }),
+      ]),
+    ]);
+    const W = 520, H = 220, pad = { l: 56, r: 12, t: 12, b: 28 };
+    const innerW = W - pad.l - pad.r, innerH = H - pad.t - pad.b;
+    const tip = el("div", { class: "chart-tip" });
+    const svg = renderScatterSvg(data, xKey, yKey, xLabel, yLabel);
+    svg.querySelectorAll("circle").forEach((c, i) => {
+      c.addEventListener("mouseenter", (e) => showChartTip(tip, data[i], data[i], e));
+      c.addEventListener("mouseleave", () => tip.classList.remove("chart-tip--show"));
+      c.addEventListener("click", () => { location.hash = `#/jobs/${encodeURIComponent(data[i].jobId)}`; });
+    });
+    card.appendChild(svg);
+    card.appendChild(tip);
+    if (!data.length) card.appendChild(emptyState("该轴无数点"));
+    return card;
+  }
+
+  function chartLine(title, data, xKey, series) {
+    // series: [{key, label, color}]
+    const card = el("div", { class: "chart-card" }, [
+      el("div", { class: "chart-card__head" }, [
+        el("h4", { class: "chart-card__title", text: title }),
+        el("div", { class: "chart-card__legend" }, series.map((s) => el("span", { class: "chart-card__legend-item" }, [
+          el("span", { class: "chart-card__swatch", style: `background:${s.color}` }),
+          el("span", { text: s.label }),
+        ]))),
+      ]),
+    ]);
+    const W = 520, H = 220, pad = { l: 56, r: 12, t: 12, b: 28 };
+    const innerW = W - pad.l - pad.r, innerH = H - pad.t - pad.b;
+    const svg = svgEl("svg", { class: "chart-svg", viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": title });
+    for (let i = 0; i < 4; i++) {
+      const y = pad.t + (innerH * i) / 4;
+      svg.appendChild(svgEl("line", { x1: pad.l, y1: y, x2: W - pad.r, y2: y, stroke: "var(--grid-line)", "stroke-width": 1 }));
+    }
+    // 按 x 排序
+    const sorted = [...data].sort((a, b) => new Date(a[xKey] || 0).getTime() - new Date(b[xKey] || 0).getTime());
+    const tsArr = sorted.map((d) => new Date(d[xKey] || 0).getTime());
+    const xMin = Math.min(...tsArr), xMax = Math.max(...tsArr, xMin + 1);
+    const yMin = 0;
+    let yMax = 1;
+    series.forEach((s) => {
+      sorted.forEach((d) => {
+        const v = Number(d[s.key] || 0);
+        if (v > yMax) yMax = v;
+      });
+    });
+    yMax = Math.max(yMax, 1);
+    // 轴
+    const labelX = svgEl("text", { x: pad.l + innerW / 2, y: H - 6, "text-anchor": "middle", "font-size": 10, fill: "var(--text-muted)" });
+    labelX.textContent = "时间";
+    svg.appendChild(labelX);
+    const fmtNum = (n) => fmtNumber(Math.round(n));
+    [yMin, yMax].forEach((val, i) => {
+      const y = pad.t + innerH - (innerH * i);
+      const t = svgEl("text", { x: pad.l - 4, y, "text-anchor": "end", "font-size": 9, fill: "var(--text-muted)" });
+      t.textContent = fmtNum(val);
+      svg.appendChild(t);
+    });
+    // x 轴最小最大时间
+    const fmtTs = (t) => {
+      const d = new Date(t);
+      const pad2 = (n) => String(n).padStart(2, "0");
+      return `${pad2(d.getMonth() + 1)}/${pad2(d.getDate())}`;
+    };
+    [xMin, xMax].forEach((val, i) => {
+      const x = pad.l + (innerW * i);
+      const t = svgEl("text", { x, y: pad.t + innerH + 14, "text-anchor": i === 0 ? "start" : "end", "font-size": 9, fill: "var(--text-muted)" });
+      t.textContent = fmtTs(val);
+      svg.appendChild(t);
+    });
+    // 折线
+    series.forEach((s) => {
+      const points = sorted
+        .filter((d) => Number(d[s.key] || 0) > 0 || s.key === "emotionScore")
+        .map((d, i, arr) => {
+          const t = new Date(d[xKey] || 0).getTime();
+          const x = pad.l + ((t - xMin) / (xMax - xMin || 1)) * innerW;
+          const y = pad.t + innerH - ((Number(d[s.key] || 0) - yMin) / (yMax - yMin || 1)) * innerH;
+          return `${x},${y}`;
+        });
+      if (points.length > 1) {
+        const path = svgEl("polyline", { points: points.join(" "), fill: "none", stroke: s.color, "stroke-width": 1.6, "stroke-opacity": 0.85 });
+        svg.appendChild(path);
+      } else if (points.length === 1) {
+        const [x, y] = points[0].split(",");
+        svg.appendChild(svgEl("circle", { cx: x, cy: y, r: 4, fill: s.color }));
+      }
+      // 点
+      sorted.forEach((d) => {
+        const t = new Date(d[xKey] || 0).getTime();
+        const x = pad.l + ((t - xMin) / (xMax - xMin || 1)) * innerW;
+        const y = pad.t + innerH - ((Number(d[s.key] || 0) - yMin) / (yMax - yMin || 1)) * innerH;
+        if (Number.isNaN(x) || Number.isNaN(y)) return;
+        const pt = svgEl("circle", { cx: x, cy: y, r: 3, fill: s.color, "fill-opacity": 0.9 });
+        pt.addEventListener("click", () => { location.hash = `#/jobs/${encodeURIComponent(d.jobId)}`; });
+        svg.appendChild(pt);
+      });
+    });
+    card.appendChild(svg);
+    return card;
+  }
+
+  function showChartTip(layer, d, fallback, e) {
+    if (!layer) return;
+    const lines = [
+      `<strong>${esc(d.worker || "—")}</strong> · ${esc(fmtTime(d.createdAt))}`,
+      `job <code>${esc((d.jobId || "").slice(-6))}</code>`,
+      `输入 ${esc(fmtNumber(d.inputChars || 0))} / 输出 ${esc(fmtNumber(d.outputChars || 0))} 字符`,
+      `耗时 ${esc(fmtDurationMs(d.responseMs || 0))} · 工具 ${esc(String(d.toolCalls || 0))}`,
+      `上下文 ${esc(fmtNumber(d.sessionContextTokens || 0))} · 压缩 ${esc(String(d.sessionCompactions || 0))}`,
+      d.emotionScore != null ? `情绪 ${esc(String(d.emotionScore))}${d.emotionLabel ? ` · ${esc(d.emotionLabel)}` : ""}` : "",
+      `任务：${esc((d.taskPreview || "—").slice(0, 80))}`,
+    ].filter(Boolean);
+    layer.innerHTML = lines.join("<br>");
+    layer.classList.add("chart-tip--show");
+    const svgRect = layer.parentElement?.querySelector("svg")?.getBoundingClientRect?.();
+    if (svgRect && e?.target) {
+      const targetRect = e.target.getBoundingClientRect();
+      layer.style.left = `${targetRect.left - svgRect.left + 8}px`;
+      layer.style.top = `${targetRect.top - svgRect.top - 8}px`;
+    }
   }
 
   async function renderMessages() {
@@ -2134,11 +3008,15 @@ async function route() {
       const m = $("#main"); m.innerHTML = ""; m.appendChild(node);
     }
 
-    toast("已刷新", "success");
+    toast(t("toast.refreshed"), "success");
   }
 
   // ---- 初始化 ----
   function bind() {
+    $("#langSwitch")?.addEventListener("click", () => {
+      setLanguage(STATE.lang === "zh" ? "en" : "zh");
+      route();
+    });
     $("#refreshBtn").addEventListener("click", () => refreshCurrent());
     $("#drawerClose").addEventListener("click", closeDrawer);
     $("#drawerBackdrop").addEventListener("click", closeDrawer);
@@ -2152,6 +3030,7 @@ async function route() {
 
   document.addEventListener("DOMContentLoaded", () => {
     bind();
+    applyStaticI18n();
     route();
   });
 })();

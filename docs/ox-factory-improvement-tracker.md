@@ -45,7 +45,7 @@
 | OF-018 | 缺少员工 token 监控 | P1 | in-progress | 高 |
 | OF-019 | 员工间通信、请求接活与派活权限体系缺失 | P1 | in-progress | 中 |
 | OF-020 | 日报数据源只读 queue.jsonl，导致全员产出遗漏 | P0 | in-progress | 高 |
-| OF-021 | 员工上下文压缩质量不稳定，缺少 Codex 代压缩后端 | P1 | in-progress（shadow 已落地） | 高 |
+| OF-021 | 员工上下文压缩质量不稳定，缺少 Codex 代压缩后端 | P1 | in-progress（主 agent + worker 默认 shadow 已落地） | 高 |
 | OF-022 | 缺少本地 Web 可视化工厂驾驶舱 | P1 | assigned（八村） | 高 |
 | OF-023 | Pi 后端多模型来源接入与工厂 profile 管理 | P1 | in-progress（super-relay 试点已接入） | 高 |
 | OF-024 | Pi custom_message 进入上下文且 compaction 估算忽略，导致主 agent 上下文爆炸 | P0 | planned（先工厂止血，后给 Pi 提 issue/MR） | 中 |
@@ -54,6 +54,149 @@
 | OF-027 | 员工后台成果缺少未读 pick 入口，完成结果容易漏看 | P0 | in-progress（factory_pick + /pick 已落地） | 高 |
 | OF-028 | 缺少任务取消、steer 后端语义说明和员工休假状态 | P0 | in-progress（内核已落地，待 reload 验证） | 中 |
 | OF-029 | 内网 Codebase 分享缺少安装说明和自检路径 | P1 | done（README/INSTALL/install-check 已补） | 高 |
+| OF-030 | Pi 后端 worker 启动参数兼容性需降级观察 | P2 | deferred（用户侧已恢复，暂不改主链路） | 高 |
+| OF-031 | 实验模型 worker 的工具执行能力需要健康检查与分级 | P1 | identified（包包误报 i18n 修复暴露） | 中 |
+| OF-032 | Pi 后端长 session 冷缓存空回复缺少检测与修复工具 | P0 | mitigated（小智 session 已备份并截断修复） | 中 |
+| OF-033 | 员工 Pi 原生 compaction 缺少工厂侧可观测性 | P1 | in-progress（worker 默认 shadow 已打开，待 reload 实测） | 高 |
+
+---
+
+## OF-030：Pi 后端 worker 启动参数兼容性需降级观察
+
+- 优先级：P2
+- 状态：deferred（用户侧已恢复，暂不改主链路）
+- 兼容性：高
+- 相关文件：
+  - `.pi/extensions/ox-factory/spawner.ts`
+  - `.pi/extensions/ox-factory/index.ts`
+
+### 现象
+
+外部用户新招募员工后，`/talk` 显示“已收到”，随后出现 `Unknown option: --name`。后续用户侧又能跑起来，当前不可稳定复现。
+
+### 初步分析
+
+- “已收到”是 ox-factory 在创建 talk job 后主动发出的 UI 确认，不代表 worker 模型已实际开始执行。
+- Pi 后端 worker 当前会通过 `spawner.ts` 启动子进程，并附带 `--name <role-workerId>`。
+- 本机当前 `pi 0.80.2` 支持 `--name`，因此该问题更像是某些运行入口 / 打包入口 / 旧进程未刷新时的兼容性问题，而不是模型或员工数据问题。
+- `--name` 只影响 session 显示名，员工记忆主要由 `--session worker.sessionFile` 保证。
+
+### 暂定处理
+
+暂不立即改动主链路。若后续再次出现，优先考虑：
+
+1. 让用户对比 shell `pi --mode json -p --session /tmp/ox-probe.jsonl --name test 'ping'` 与 ox-factory 子进程行为，确认是否存在入口不一致。
+2. 将 worker spawn 中的 `--name` 降级为可选能力，或直接移除，避免依赖非必要 CLI 参数。
+3. 为 `spawner.ts` 增加回归测试，确保 `--session` 保留且 `--name` 不再成为启动硬依赖。
+
+---
+
+## OF-031：实验模型 worker 的工具执行能力需要健康检查与分级
+
+- 优先级：P1
+- 状态：identified（包包误报 i18n 修复暴露）
+- 兼容性：中
+- 相关文件：
+  - `.pi/extensions/ox-factory/spawner.ts`
+  - `.pi/extensions/ox-factory/web/app.js`
+  - `.pi/workers/sessions/包包.jsonl`
+
+### 现象
+
+包包连续报告“已修复 i18n 切换按钮 / 已截图验证 / 已通知派派”，但实际页面和源码中都没有对应按钮。
+
+### 观察
+
+- 近期相关 job 中没有真实 `tool_start/tool_end/tool_output` 执行记录。
+- 输出里出现了 fenced shell 命令和“验证完成”的文字，但没有实际文件修改或浏览器验证。
+- 当前包包使用 `super-relay/model_api/experimental_0630`，历史上能做简单工具调用，但对前端编码任务的稳定性和自检可信度不足。
+
+### 暂定处理
+
+1. 把包包定位为“解析/调研/辅助写方案”更合适；复杂编码任务优先派给 Codex 后端或已验证工具链的员工。
+2. 后续为员工增加“能力健康检查”记录：是否能 read/grep/edit/bash、是否能真实改文件、是否能通过 smoke test。
+3. Web/前端类任务必须以“文件 diff + 测试/浏览器证据”为完成条件，不能只接受口头报告。
+
+### 跟进记录
+
+- 2026-07-07：已由派派给包包发送指导消息 `msg_mrad8k00_tnmmsp`，明确：
+  - 不能把命令写在正文里冒充执行；
+  - 完成报告必须包含真实文件 diff、真实验证命令和结果；
+  - Web/i18n 任务必须完整覆盖可见静态文案，左侧导航未 i18n 这类遗漏要主动列为风险。
+
+---
+
+## OF-032：Pi 后端长 session 冷缓存空回复缺少检测与修复工具
+
+- 优先级：P0
+- 状态：mitigated（小智 session 已备份并截断修复）
+- 兼容性：中
+- 相关文件：
+  - `.pi/extensions/ox-factory/spawner.ts`
+  - `.pi/extensions/ox-factory/jobs.mjs`
+  - `.pi/workers/sessions/小智.jsonl`
+
+### 现象
+
+小智最近多次 `/talk` 在 UI 上显示 job `done`，但用户收不到任何回复：
+
+- `20260707070053-_-wo4tbf`：`outputTokens=0`，`text=""`
+- `20260707071118-_-bo2e3a`：`outputTokens=0`，`text=""`
+- 直接用全新 session 探测 `super-relay/opensource/glm5.2` 后确认小 prompt 可正常返回 `pong`。
+- 用小智原 session 的拷贝探测时稳定复现 `stopReason=stop` 且 `content=[]` / `outputTokens=0`。
+
+### 初步分析
+
+这不是 ox-factory 展示层吞输出，也不是小智 job 队列卡死；Pi 子进程实际收到了空 assistant message。
+
+更细的复盘：
+
+- GLM fresh session 正常；包包同 provider 正常，因此不应简单归因于“模型完全坏了”。
+- 小智 session 在 BESProNext / Tron 探索中累积了大量工具输出，尤其包括 tool list / tab list 等长 JSON。
+- 当长 session 能命中服务端 cache 时，GLM 仍可能正常输出；当冷缓存 / cache miss 时，请求约 56K~100K input tokens 后容易返回 200 + 空 content。
+- 一条空 assistant message 写入 session 后，后续 turn 会继续沿着这个空回复分支增长，使问题持续复现。
+- 当前 spawner 对 `stopReason=stop` 且 exit code 为 0 的空输出没有判异，导致“模型空回复”被当作“任务完成”，用户只能看到没有内容的 done job。
+
+### 本次止血
+
+- 已备份原 session：
+  - `.pi/workers/sessions/小智.jsonl.bak-20260707-160302-empty-output`
+- 已将 `.pi/workers/sessions/小智.jsonl` 截断回凭证清单建立完成后的健康点（保留 GitHub / capital-pie 凭证清单记忆）。
+- 用修复后 session 的拷贝验证：`super-relay/opensource/glm5.2` + `thinking=xhigh` 可返回 `小智恢复正常`。
+
+### 暂定处理
+
+1. 增加 session repair/compact 工具：检测并清理 `content=[] + stopReason=stop` 的 terminal assistant，以及超长工具输出。
+2. Pi 后端 worker 若出现 `stopReason=stop + outputTokens=0 + text=""`，应标记为 unhealthy/empty-output，而不是正常 done。
+3. 对长工具输出做更强截断，尤其是 HTTP API 返回的大 JSON / 页面 dump / tool list。
+4. 后续优先接入 Codex shadow/compaction 给 Pi worker 做 session 压缩，而不是靠无限增长的原始 JSONL。
+
+---
+
+## OF-033：员工 Pi 原生 compaction 缺少工厂侧可观测性
+
+- 优先级：P1
+- 状态：in-progress（worker 默认 shadow 已打开，待 reload 实测；历史 native indexer 暂未做）
+- 兼容性：高
+- 相关文件：
+  - `.pi/extensions/ox-factory/compaction.mjs`
+  - `.pi/extensions/ox-factory/compaction-report.mjs`
+  - `.pi/extensions/ox-factory/web-server.mjs`
+  - `.pi/workers/sessions/*.jsonl`
+  - `.pi/workers/compaction-shadow.jsonl`
+  - `docs/worker-compaction-monitoring-report.md`
+
+### 现象
+
+包包 session 中已有 6 条 `type=compaction`，但 `factory_compaction_report` / Web 压缩页只展示 2 条主 agent shadow 记录，没有任何包包记录。
+
+### 根因
+
+当前 ox-factory 的 compaction 记录语义是“Codex shadow / apply 对比记录”，不是“所有 Pi compaction 事件审计”。主 agent 默认 shadow-only，所以会写 `.pi/workers/compaction-shadow.jsonl`；员工此前默认 off，Pi 原生 compaction 只写回员工自己的 session JSONL；2026-07-07 已改为 worker 默认 shadow-only。
+
+### 建议方向
+
+已打开 future worker shadow 对比：默认无环境变量时，worker 和主 agent 都会 shadow-only。历史 Pi 原生 compaction 仍不会自动补 Codex 对比；如需让历史记录也可见，后续再做只读 worker compaction indexer。
 
 ---
 
@@ -1075,7 +1218,7 @@ Pi 默认 compaction 会在上下文接近窗口时用当前员工自己的模�
 4. 返回 `{ compaction }` 给 Pi 保存。
 5. Codex 失败时返回 `undefined`，自动回退 Pi 默认压缩。
 
-第一阶段员工 session 仍 opt-in；主 agent 默认支持 `shadow` 评估，强制只评估、不采纳，避免影响用户主要上下文。员工灰度建议通过 `OX_FACTORY_CODEX_COMPACTION_WORKERS=测试员,东子` 指定名单。
+主 agent 和员工 session 默认都进入 `shadow` 评估，强制只评估、不采纳真实 Pi compaction，确保后续所有触发 ox-factory hook 的压缩都会落入对比记录。若需要降低成本或临时排障，可用 `OX_FACTORY_CODEX_COMPACTION_MODE=off` 关闭；若需要只监控部分员工，可用 `OX_FACTORY_CODEX_COMPACTION_WORKERS=测试员,东子` 指定名单。
 
 ### 当前落地
 
@@ -1093,7 +1236,7 @@ Pi 默认 compaction 会在上下文接近窗口时用当前员工自己的模�
   - 主 agent 默认拒绝 `apply`，除非显式设置危险开关 `OX_FACTORY_CODEX_COMPACTION_ALLOW_MAIN_APPLY=1`。
 - 新增 `compaction-smoke.mjs`：只读员工 session，构造压缩样本，调用 Codex 产出 smoke 摘要。
 - 新增 `compaction-report.mjs`：CLI 查看 `.pi/workers/compaction-shadow.jsonl` 对比记录。
-- 已把 hook 接到 `index.ts`：主 agent 默认 shadow-only；员工默认关闭，避免 reload 后误影响员工任务。
+- 已把 hook 接到 `index.ts`：主 agent 和 worker 默认 shadow-only；不替换 Pi 真实摘要，只记录对比。
 - 已新增 `factory_compaction_report` 工具，用户可以直接问“看看最近压缩对比 / Codex 压缩效果怎么样”。
 - shadow 记录写入：
   - `.pi/workers/compaction-shadow.jsonl`：结构化审计记录，包含 worker、session、Pi/Codex 摘要长度估算、结构命中、耗时、错误等。
@@ -1105,13 +1248,12 @@ Pi 默认 compaction 会在上下文接近窗口时用当前员工自己的模�
 ### 配置方式
 
 ```bash
-# 默认：主 agent shadow-only；员工 off。主 agent 不需要额外环境变量。
+# 默认：主 agent + 所有 worker shadow-only；不需要额外环境变量。
 
 # 如需显式关闭所有 Codex 压缩 / shadow
 OX_FACTORY_CODEX_COMPACTION_MODE=off
 
-# 员工灰度：Pi 原生压缩仍然生效，Codex 只双跑记录对比
-OX_FACTORY_CODEX_COMPACTION_MODE=shadow
+# 可选：只监控部分员工（不设置则所有员工都 shadow）
 OX_FACTORY_CODEX_COMPACTION_WORKERS=测试员,东子
 
 # 后续确认质量后再启用：Codex 摘要进入真实 Pi compaction
@@ -1131,7 +1273,7 @@ node .pi/extensions/ox-factory/compaction-report.mjs --workers-dir .pi/workers -
 
 ### 需要继续讨论
 
-- 是否默认开启员工 Codex 压缩，还是先只给指定员工灰度。
+- 员工默认 shadow 已开启；后续观察成本、延迟和失败率，必要时再收窄 `OX_FACTORY_CODEX_COMPACTION_WORKERS`。
 - 主 agent shadow 样本积累后如何人工评分：是否保留长期偏好、已确认需求、项目路线图、员工调度和待办边界。
 - shadow 对比积累多少样本后进入 `apply`；建议先看 5~10 次真实员工压缩对比。
 - 压缩结果是否要进入日报数据源，展示“本日发生了几次上下文压缩、压缩前后 token 估算”。
@@ -1487,7 +1629,7 @@ Project Entity MVP 已经存在，`GET /api/projects` 也返回了 `catalog`。�
 ## OF-027：员工后台成果缺少未读 pick 入口，完成结果容易漏看
 
 - 优先级：P0
-- 状态：in-progress（`factory_pick` + `/pick` 已落地，待 reload 后人工验证）
+- 状态：in-progress（`factory_pick` + `/pick` 已落地；`/pick` 默认接入 talk 已补，待 reload 后人工验证）
 - 兼容性：高
 - 相关文件：
   - `job-pick.mjs`
@@ -1515,6 +1657,7 @@ Project Entity MVP 已经存在，`GET /api/projects` 也返回了 `catalog`。�
 - 默认展示后写入 `job_read` event，不修改原 job metadata / events。
 - `/pick --peek` 只预览，不写 `job_read`，适合“先看一眼、晚点再处理”。
 - 输出短摘要 + 最近结果，完整内容继续引导 `/attach <jobId>`。
+- `/pick` 默认展示后切换到被 pick 员工的 talk；`--peek` 维持只看不切换。
 
 ### 当前落地
 
@@ -1529,13 +1672,14 @@ Project Entity MVP 已经存在，`GET /api/projects` 也返回了 `catalog`。�
   - 支持 `worker` / `project` / `status` / `mode` / `markRead` / `limit`。
   - 适配主 agent 自然语言：“pick 一个结果看看”。
 - 新增 `/pick [员工名]`：
-  - 默认随机未读并标记已读。
+  - 默认随机未读并标记已读，同时接入被 pick 员工的 talk。
   - 支持 `/pick --peek` / `/pick 员工名 --peek`，预览但不标记已读。
   - 支持 `/pick --latest`，查看最近未读。
-  - 不触发额外 LLM turn。
+  - pick 到不可接入员工时只展示结果并给出原因，不强行切换。
 - 已补单测：
   - 未读终态筛选。
   - 已读落盘。
+  - `/pick` 默认接入 talk、`--peek` 不接入。
   - 工具 / slash command 暴露。
 
 ### 暂不做
@@ -1606,6 +1750,63 @@ Project Entity MVP 已经存在，`GET /api/projects` 也返回了 `catalog`。�
 
 ---
 
+
+## OF-034 回复质量 / 上下文观测
+
+- 优先级：P1
+- 状态：代码完成（待 reload / Web 重启后人工验证）
+- 兼容性：高；默认只读回溯，情绪评分默认关闭
+- 相关文件：
+  - `quality-metrics.mjs`
+  - `spawner.ts`
+  - `index.ts`
+  - `web-server.mjs`
+  - `web/app.js`
+  - `test/ox-factory.test.mjs`
+
+### 背景
+
+用户观察到部分员工上下文变长后，平均回复长度和质量可能下降。需要把每次用户输入、员工输出、响应时间、工具调用、上下文估算、压缩次数和可选情绪评分关联起来，后续用于判断“上下文变长 / 压缩次数 / 会话轮次”是否影响回复质量。
+
+### 当前落地
+
+2026-07-07 已落地最小可用版：
+
+- 新增质量聚合模块：从 `jobs/*.json`、`events/*.jsonl`、`sessions/*.jsonl` 回溯构造 turn 样本。
+- 每个 turn 记录：输入字符、输出字符、响应耗时、工具调用次数、token 字段、员工 session 用户轮次、压缩次数、上下文 token 估算。
+- 历史上下文使用 session 时间戳回放到 `job.createdAt`；旧记录缺时间戳时退化为估算。
+- 新增 `quality-emotion.jsonl`：可选情绪评分 append-only 存储，评分范围 1~5。
+- 新增 `factory_quality_report` 和 `factory_quality_monitor_config`；主 agent 可自然语言查看报告/开启评分。
+- `spawner.ts` 在 job 完成后异步评分，不阻塞员工结果；缺 API key 或 HTTP 失败只写 job event 状态。
+- Web 新增 `/api/quality-metrics`，压缩页展示“上下文 / 回复质量观测”KPI、员工表和最近 turn 表。
+
+
+### 2026-07-07 全历史回溯补充
+
+用户明确不需要回溯情绪分，只要能算的结构化指标先算出来，并在 Web 上能看到。已调整：
+
+- `date=all` 表示全部历史；`limit=all` 表示不按展示样本截断。
+- 明显不一致 job 直接丢弃：非终态、坏时间、空输入、空输出、异常巨大输入/输出、异常超长耗时。
+- 报告新增 `dates[]`：按天汇总 turn、员工数、平均输入/输出、平均耗时、工具调用、最大压缩数。
+- 报告新增 `history.dropReasons`：展示丢弃原因。
+- Web 压缩页新增范围选择：全部历史 / 指定日期；默认展示全部历史，并可点击按天条切到某天。
+
+本机 smoke 结果：扫描 770 个 job，保留 762 个可用 turn，丢弃 8 个（`empty_output=6`, `non_terminal=2`），覆盖 2026-06-26 到 2026-07-07 共 9 天。
+
+### 待验证
+
+1. reload 后让主 agent 调 `factory_quality_report` 查看当天质量报告。
+2. 配置 `DEEPSEEK_API_KEY` 后用 `factory_quality_monitor_config(enabled=true)` 开启评分，跑一个新 `/talk`/`factory_command`，确认 `quality-emotion.jsonl` 和 Web 面板出现分数。
+3. 重启/刷新 Web server 后访问 `#/compactions`，确认质量面板和压缩对比同时展示。
+
+### 暂不做
+
+- 不把情绪分当绩效结论；它只是用户情绪代理指标。
+- 不为旧历史补情绪分；旧 turn 只能回溯结构化指标，情绪从开启后新 turn 开始。
+- 不保证旧 session 的历史上下文精确 token；没有当时请求体/tokenizer，只做稳定估算。
+
+---
+
 ## 初始推进建议
 
 建议按以下顺序逐条讨论：
@@ -1659,9 +1860,15 @@ Project Entity MVP 已经存在，`GET /api/projects` 也返回了 `catalog`。�
 | 2026-07-05 | OF-019 补管理层权限：派派加入内置 admin，新增 `worker:fire` 权限动作，`factory_fire` 默认秘书兼容旧调用并支持显式 actor 权限校验。 |
 | 2026-07-05 | 新增 OF-027：落地 `/pick` / `factory_pick` 未读成果入口，用 append-only `job-read.jsonl` 记录已读 job，避免后台成果漏看。 |
 | 2026-07-05 | OF-027 补 `/pick --peek`：只预览未读成果、不写 `job_read`，适合“先看一眼，晚点再看”。 |
+| 2026-07-07 | OF-027 修复 `/pick` 只提示不跳转：默认 pick 后接入对应员工 talk 并立即展示结果；`--peek` 保持只预览、不标记、不切换。 |
 | 2026-07-06 | 新增 OF-028：落地 `factory_worker_status` 休假/返岗、`factory_cancel_job`/`/cancel` 取消任务，并明确 Codex/Pi steer 后端语义；Web 只读展示需求已交给包包。 |
 | 2026-07-06 | OF-028 补充步美 Pi RPC steer 调研：`pi --mode rpc` 可通过 JSONL IPC 支持运行中 steer；当前 one-shot `--mode json -p` 链路不改，后续如要做需新增 `pi-rpc` worker backend。 |
 | 2026-07-06 | OF-018 复查光彦 Codex token：确认 `last_token_usage` 低估整次任务约 33x；新增只读 `codex-rollout-token-report.mjs` 按 rollout `total_token_usage` delta 回算并对比现有 job 口径。 |
 | 2026-07-06 | OF-018 修复 Codex token 主链路：新增累计 usage tracker，后续 job 写入 `total_token_usage` delta；`codex-rollout-token-report.mjs` 增加 `--repair-preview/--apply-jobs`，并已审计所有 Codex done job，可匹配项修复 281/284。 |
 | 2026-07-06 | 新增 OF-029：内网 Codebase 分享安装层补齐 README Quick Install、INSTALL.md、`.env.example` 和 `npm run install-check`，明确不提交本地 token / `.pi/workers` 运行数据。 |
 | 2026-07-06 | OF-022 补 `/ox-web`：Pi 内一条指令即可检查/启动/打开本地 Web dashboard，日志写入 `.pi/workers/web-server-PORT.log`，手动 node 启动降级为兜底。 |
+| 2026-07-07 | 新增 OF-030：记录 Pi 后端 worker `--name` 启动参数兼容性观察项；因用户侧已恢复，暂不改主链路，复现后再做参数降级。 |
+| 2026-07-07 | OF-033 按用户要求打开 worker 默认 shadow-only：下次 reload 后主 agent 和所有 worker 的新 compaction 都会进入 Pi vs Codex 对比；显式 `OX_FACTORY_CODEX_COMPACTION_MODE=off` 仍可关闭。 |
+| 2026-07-07 | 新增 OF-034：回复质量/上下文观测 MVP，回溯 jobs/events/session 计算输入输出长度、耗时、工具调用、上下文估算和压缩次数；新增可选 DeepSeek/OpenAI-compatible 情绪评分旁路及 Web 压缩页质量面板。 |
+| 2026-07-07 | OF-034 补全历史回溯：`date=all&limit=all` 扫描 770 个 job，保留 762 个可用 turn，丢弃 8 个明显不一致样本；Web 压缩页支持“全部历史/指定日期”和按天分布展示。 |
+| 2026-07-07 | OF-022/OF-026 修复 Web 员工对话：`/api/talk/:worker` 不再直接 `createJob` 伪造悬空 queued job，改为写 `web-talk-requests.jsonl` intent；Pi 主进程 reload 后轮询并调用正常 `startTalkMessage`，复用 `/talk` 的空闲/忙碌排队/事件/记忆机制。 |

@@ -22,6 +22,8 @@
  *   factory_report_context - 聚合日报数据源
  *   factory_token_report - 统计员工 token 用量
  *   factory_compaction_report - 查看 Pi vs Codex shadow 压缩对比
+ *   factory_quality_report - 统计上下文/压缩/回复质量观测指标
+ *   factory_quality_monitor_config - 开关情绪评分旁路
  *   factory_project_* - 管理轻量项目实体 / Todo / Worktree / 进展 / 人员
  *   factory_responsibility_* - 管理员工当前职责 / 负责项目
  *   factory_permission_* - 授权式员工通信权限
@@ -92,6 +94,12 @@ import { shouldRunInProcess } from "./queue-utils.mjs";
 import { buildFactoryReportContext, formatFactoryReportContext } from "./report-context.mjs";
 import { buildFactoryTokenReport, formatFactoryTokenReport } from "./token-report.mjs";
 import {
+  buildFactoryQualityReport,
+  formatFactoryQualityReport,
+  readQualityMonitorConfig,
+  writeQualityMonitorConfig,
+} from "./quality-metrics.mjs";
+import {
   buildFactoryCompactionReport,
   formatFactoryCompactionReport,
   handleFactoryCompactionCompleted,
@@ -120,6 +128,11 @@ import {
   setProjectWorktree,
   upsertProject,
 } from "./projects.mjs";
+import {
+  acceptWebTalkRequest,
+  failWebTalkRequest,
+  listPendingWebTalkRequests,
+} from "./web-talk.mjs";
 
 // ─── Role Schema ────────────────────────────────────────
 
@@ -563,7 +576,73 @@ export default function (pi: ExtensionAPI) {
   // 从主 session 恢复工厂状态（首次启动时初始化目录）
   let initialized = false;
   let mainSessionEntries: any[] = [];
+  let lastSessionCtx: any = null;
+  let webTalkPoller: ReturnType<typeof setInterval> | null = null;
+  let webTalkDraining = false;
+
+  function ensureWebTalkPoller(ctx?: any) {
+    if (ctx) lastSessionCtx = ctx;
+    if (webTalkPoller) return;
+    webTalkPoller = setInterval(() => {
+      void drainWebTalkRequests(lastSessionCtx);
+    }, 1000);
+    (webTalkPoller as any).unref?.();
+  }
+
+  async function drainWebTalkRequests(ctx?: any) {
+    if (!initialized || webTalkDraining) return;
+    webTalkDraining = true;
+    try {
+      const pending = listPendingWebTalkRequests(getWorkersDir(), { limit: 20 });
+      for (const request of pending) {
+        try {
+          const workerId = String(request.worker || "").trim();
+          const message = String(request.message || "").trim();
+          const w = workers.get(workerId);
+          const availability = workerCanAcceptWork(w, workerId);
+          if (!availability.ok) {
+            failWebTalkRequest(getWorkersDir(), {
+              requestId: request.id,
+              error: availability.reason || `员工 ${workerId} 当前不可接活`,
+            });
+            continue;
+          }
+          if (!message) {
+            failWebTalkRequest(getWorkersDir(), {
+              requestId: request.id,
+              error: "web talk 消息为空",
+            });
+            continue;
+          }
+
+          const job = startTalkMessage(w!, message, ctx, undefined, { attach: false, notify: false });
+          if (!job) {
+            failWebTalkRequest(getWorkersDir(), {
+              requestId: request.id,
+              error: "Pi 主进程未能创建 talk job",
+            });
+            continue;
+          }
+          acceptWebTalkRequest(getWorkersDir(), {
+            requestId: request.id,
+            jobId: job.id,
+            deliveryMode: job.deliveryMode || "message",
+            placement: job.deliveryMode === "queue" ? "已排队" : "已接入正常 talk 调度",
+          });
+        } catch (error: any) {
+          failWebTalkRequest(getWorkersDir(), {
+            requestId: request.id,
+            error: error?.message || String(error),
+          });
+        }
+      }
+    } finally {
+      webTalkDraining = false;
+    }
+  }
+
   pi.on("session_start", async (_event, ctx) => {
+    lastSessionCtx = ctx;
     if (!initialized) {
       init(ctx.cwd);
       initialized = true;
@@ -577,6 +656,7 @@ export default function (pi: ExtensionAPI) {
       if (recovery.recovered > 0) {
         ctx.ui?.notify?.(`保留 ${recovery.recovered} 个仍有新鲜 heartbeat 的员工 job 为 orphan-running`, "info");
       }
+      ensureWebTalkPoller(ctx);
     }
     const entries = ctx.sessionManager.getEntries();
     mainSessionEntries = entries;
@@ -584,8 +664,9 @@ export default function (pi: ExtensionAPI) {
   });
 
   // Codex 代压缩后端。
-  // 主 agent 默认 shadow-only：Codex 旁路双跑并记录对比，不替换 Pi 真实摘要。
-  // 员工默认关闭；员工灰度：OX_FACTORY_CODEX_COMPACTION_MODE=shadow + OX_FACTORY_CODEX_COMPACTION_WORKERS。
+  // 主 agent 和员工默认 shadow-only：Codex 旁路双跑并记录对比，不替换 Pi 真实摘要。
+  // 如需临时关闭可设置 OX_FACTORY_CODEX_COMPACTION_MODE=off；
+  // 如需收窄员工范围可设置 OX_FACTORY_CODEX_COMPACTION_WORKERS。
   // legacy OX_FACTORY_CODEX_COMPACTION=1 仍等价于 apply；主 agent 默认拒绝 apply，只做评估不采纳。
   pi.on("session_before_compact", async (event, ctx) => {
     return handleFactoryCompactionEvent(event, ctx, {
@@ -1522,6 +1603,14 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  function shouldPersistTalkLiveMessages(): boolean {
+    return process.env.OX_FACTORY_TALK_LIVE_MESSAGES === "1";
+  }
+
+  function compactTalkPanelContent(content: string, maxChars = 3500): string {
+    return truncateText(content, maxChars);
+  }
+
   function sendTalkMessage(workerId: string, message: any, ctx?: any) {
     if (talkTarget !== workerId) return;
     if (mainAgentActive) {
@@ -1599,9 +1688,10 @@ export default function (pi: ExtensionAPI) {
     if (!isTerminalJob(job)) activeTalkJobId = job.id;
     const statusText = isTerminalJob(job) ? "最近记录" : "正在执行，已自动接回";
     const queueText = formatWorkerQueue(workerId, job.id);
+    const details = compactTalkPanelContent(formatJobDetails(job, tailJobEvents(job, 20)), 3500);
     sendTalkMessage(workerId, {
       customType: "ox-talk-attached",
-      content: `💬 已接入 **${workerId}**（${statusText}）。\n\n${formatJobDetails(job, tailJobEvents(job, 60))}${queueText}`,
+      content: `💬 已接入 **${workerId}**（${statusText}）。\n\n${details}${queueText}`,
       display: true,
       details: { worker: workerId, jobId: job.id },
     });
@@ -1627,6 +1717,7 @@ export default function (pi: ExtensionAPI) {
     const text = state.lines.join("");
     state.lines = [];
     if (!text.trim() || talkTarget !== state.workerId) return;
+    if (!shouldPersistTalkLiveMessages()) return;
 
     sendTalkMessage(state.workerId, {
       customType: "ox-talk-live",
@@ -1756,7 +1847,13 @@ export default function (pi: ExtensionAPI) {
     return { job, deliveryMode, placement };
   }
 
-  function startTalkMessage(w: Worker, msg: string, ctx?: any, requestedMode?: TalkDeliveryMode) {
+  function startTalkMessage(
+    w: Worker,
+    msg: string,
+    ctx?: any,
+    requestedMode?: TalkDeliveryMode,
+    options: { attach?: boolean; notify?: boolean } = {},
+  ) {
     const availability = workerCanAcceptWork(w, w.id);
     if (!availability.ok) {
       ctx?.ui?.notify?.(availability.reason!, "error");
@@ -1789,7 +1886,9 @@ export default function (pi: ExtensionAPI) {
       appendJobEvent(runningJob, { type: "steer", text: msg, queuedJobId: job.id });
     }
 
-    activeTalkJobId = runningJob?.status === "running" ? runningJob.id : job.id;
+    const attachToCurrentTalk = options.attach !== false;
+    const notifyConsole = options.notify !== false;
+    if (attachToCurrentTalk) activeTalkJobId = runningJob?.status === "running" ? runningJob.id : job.id;
     w.status = "working";
     const placement = !busy
       ? "马上开始"
@@ -1798,7 +1897,7 @@ export default function (pi: ExtensionAPI) {
       : deliveryMode === "steer"
         ? `steer 已记录，会排在当前运行 job 后面`
         : `已排队，前面还有 ${openBefore.length} 个未完成 job`;
-    ctx?.ui?.notify?.(`${w.id}: ${placement}，job ${job.id}`, "info");
+    if (notifyConsole) ctx?.ui?.notify?.(`${w.id}: ${placement}，job ${job.id}`, "info");
 
     sendTalkMessage(w.id, {
       customType: "ox-talk-started",
@@ -1809,8 +1908,8 @@ export default function (pi: ExtensionAPI) {
         `mode: ${deliveryMode}`,
         busy ? `placement: ${placement}` : `placement: 马上开始`,
         ``,
-        `当前 talk 面板会跟随输出；用 \`/talk off\` 切回秘书，job 在当前 Pi 进程内继续执行。`,
-        formatWorkerQueue(w.id, activeTalkJobId || undefined),
+        `实时输出会写入 job events；用 \`/attach ${job.id}\`、\`/watch ${job.id}\` 或 Web 查看。用 \`/talk off\` 切回秘书，job 在当前 Pi 进程内继续执行。`,
+        formatWorkerQueue(w.id, attachToCurrentTalk ? activeTalkJobId || undefined : job.id),
       ].filter(Boolean).join("\n"),
       display: true,
       details: { worker: w.id, jobId: job.id, deliveryMode },
@@ -1822,6 +1921,9 @@ export default function (pi: ExtensionAPI) {
         job,
         (ev) => {
           queueTalkLive(w.id, job, ev);
+          if (!notifyConsole) {
+            return;
+          }
           if (ev.type === "tool_start") {
             ctx?.ui?.notify?.(`${w.id}: ${ev.name}`, "info");
           } else if (ev.type === "error") {
@@ -1836,13 +1938,14 @@ export default function (pi: ExtensionAPI) {
         if (activeTalkJobId === job.id && isTerminalJob(finished)) activeTalkJobId = null;
         if (talkTarget === w.id) {
           const queueText = formatWorkerQueue(w.id, finished.id);
+          const details = compactTalkPanelContent(formatJobDetails(finished, tailJobEvents(finished, 20)), 3500);
           sendTalkMessage(w.id, {
             customType: "ox-talk-finished",
-            content: `${formatJobDetails(finished, tailJobEvents(finished, 60))}${queueText}`,
+            content: `${details}${queueText}`,
             display: true,
             details: { worker: w.id, jobId: job.id },
           }, ctx);
-        } else if (isTerminalJob(finished)) {
+        } else if (notifyConsole && isTerminalJob(finished)) {
           ctx?.ui?.notify?.(`${w.id} 后台 job ${job.id} 已${finished.status === "done" ? "完成" : "结束"}`, finished.status === "done" ? "info" : "error");
         }
       });
@@ -1855,6 +1958,51 @@ export default function (pi: ExtensionAPI) {
     }
 
     return job;
+  }
+
+  function attachPickedJobToTalk(picked: any, content: string, ctx?: any): boolean {
+    const workerId = String(picked?.job?.worker || "").trim();
+    if (!workerId) {
+      pi.sendMessage({
+        customType: "ox-pick",
+        content: `${content}\n\n⚠️ 这个 job 没有 worker 字段，已展示结果但无法切换 talk。`,
+        display: true,
+      });
+      return false;
+    }
+
+    const w = workers.get(workerId);
+    const availability = workerCanAcceptWork(w, workerId);
+    if (!availability.ok) {
+      const reason = availability.reason || "员工当前不可接入";
+      ctx?.ui?.notify?.(`pick 到 ${workerId}，但不能切换 talk：${reason}`, "error");
+      pi.sendMessage({
+        customType: "ox-pick",
+        content: `${content}\n\n⚠️ 已展示结果，但没有切换 talk：${reason}`,
+        display: true,
+        details: { worker: workerId, jobId: picked?.job?.id },
+      });
+      return false;
+    }
+
+    talkTarget = workerId;
+    activeTalkJobId = isTerminalJob(picked.job) ? null : picked.job.id;
+    ctx?.ui?.notify?.(`🎯 已 pick ${workerId}，并切换到 ${workerId} 的 talk。`, "info");
+    const message = {
+      customType: "ox-talk-attached",
+      content: [
+        `🎯 已 pick 并接入 **${workerId}**。`,
+        "",
+        content,
+        "",
+        `现在直接输入内容即可继续和 ${workerId} 对话；用 \`/talk off\` 切回秘书。`,
+      ].join("\n"),
+      display: true,
+      details: { worker: workerId, jobId: picked.job.id, source: "pick" },
+    };
+    if (mainAgentActive) pi.sendMessage(message);
+    else sendTalkMessage(workerId, message, ctx);
+    return true;
   }
 
   pi.registerCommand("talk", {
@@ -1971,7 +2119,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("pick", {
     description: "随机查看一个未读员工成果。用法: /pick [员工名] [--peek] [--latest]",
-    handler: async (args) => {
+    handler: async (args, ctx) => {
       const pickArgs = parsePickCommandArgs(args);
       const picked = pickUnreadJob(getWorkersDir(), {
         worker: pickArgs.worker,
@@ -1985,7 +2133,11 @@ export default function (pi: ExtensionAPI) {
         : pickArgs.worker
           ? `暂无 ${pickArgs.worker} 的未读 job。`
           : "暂无未读 job。";
-      pi.sendMessage({ customType: "ox-pick", content, display: true }, { deliverAs: "nextTurn", triggerTurn: false });
+      if (picked && !pickArgs.peek) {
+        attachPickedJobToTalk(picked, content, ctx);
+        return;
+      }
+      pi.sendMessage({ customType: "ox-pick", content, display: true });
     },
   });
 
@@ -2947,6 +3099,116 @@ export default function (pi: ExtensionAPI) {
       } catch (e: any) {
         return {
           content: [{ type: "text", text: `❌ Token 报告生成失败: ${e.message}` }],
+          isError: true,
+          details: {},
+        };
+      }
+    },
+  });
+
+  // ═══════════════════════════════════════════════════════
+  // factory_quality_report — 上下文 / 回复质量观测
+  // ═══════════════════════════════════════════════════════
+  pi.registerTool({
+    name: "factory_quality_report",
+    label: "查看回复质量观测",
+    description: [
+      "统计员工上下文长度、压缩次数、会话轮次、用户输入长度、输出长度、响应耗时、工具调用次数和情绪评分。",
+      "当用户询问“上下文变长是否影响质量”“看看回复质量数据”“压缩后员工表现怎么样”时调用。",
+      "会回溯现有 jobs/events/session，可按日期和员工过滤；情绪评分只在开启旁路后产生。",
+    ].join(" "),
+    parameters: Type.Object({
+      date: Type.Optional(Type.String({ description: "统计日期，格式 YYYY-MM-DD；填 all/不填表示全部历史" })),
+      worker: Type.Optional(Type.String({ description: "只看某个员工" })),
+      limit: Type.Optional(Type.Number({ description: "最多展示多少个 turn 样本，默认 100；全部历史可传较大数字" })),
+      format: Type.Optional(
+        StringEnum(["markdown", "json"] as const, {
+          description: "返回格式，默认 markdown",
+          default: "markdown",
+        }),
+      ),
+    }),
+    async execute(_tcid, params) {
+      try {
+        const report = buildFactoryQualityReport({
+          workersDir: getWorkersDir(),
+          date: params.date,
+          worker: params.worker,
+          limit: params.limit ?? 100,
+        });
+        const text = params.format === "json"
+          ? JSON.stringify(report, null, 2)
+          : formatFactoryQualityReport(report);
+        return {
+          content: [{ type: "text", text }],
+          details: { report },
+        };
+      } catch (e: any) {
+        return {
+          content: [{ type: "text", text: `❌ 回复质量观测生成失败: ${e.message}` }],
+          isError: true,
+          details: {},
+        };
+      }
+    },
+  });
+
+  // ═══════════════════════════════════════════════════════
+  // factory_quality_monitor_config — 情绪评分旁路开关
+  // ═══════════════════════════════════════════════════════
+  pi.registerTool({
+    name: "factory_quality_monitor_config",
+    label: "配置质量监控",
+    description: [
+      "配置用户情绪评分旁路。主 agent 可以用它开启/关闭评分。",
+      "开启后，新的后台 job/talk/command 完成时会用指定 OpenAI-compatible Chat Completions endpoint 对用户输入打 1~5 分。",
+      "1=强烈不满，3=中性，5=非常满意；只保存分数、标签和简短原因，不保存 API key。",
+    ].join(" "),
+    parameters: Type.Object({
+      enabled: Type.Optional(Type.Boolean({ description: "是否开启情绪评分旁路" })),
+      provider: Type.Optional(
+        StringEnum(["deepseek", "minimax", "custom"] as const, {
+          description: "评分提供方标记。默认 deepseek；custom 表示自定义 OpenAI-compatible endpoint",
+        }),
+      ),
+      endpoint: Type.Optional(Type.String({ description: "OpenAI-compatible Chat Completions endpoint" })),
+      model: Type.Optional(Type.String({ description: "评分模型，例如 deepseek-chat" })),
+      apiKeyEnv: Type.Optional(Type.String({ description: "读取 API key 的环境变量名，例如 DEEPSEEK_API_KEY" })),
+      updatedBy: Type.Optional(Type.String({ description: "配置人，默认 主agent" })),
+    }),
+    async execute(_tcid, params) {
+      try {
+        const patch: Record<string, unknown> = {};
+        for (const key of ["enabled", "provider", "endpoint", "model", "apiKeyEnv", "updatedBy"] as const) {
+          if (params[key] !== undefined) patch[key] = params[key];
+        }
+        if (patch.updatedBy == null) patch.updatedBy = "主agent";
+        const config = Object.keys(patch).length > 1 || params.enabled !== undefined
+          ? writeQualityMonitorConfig(getWorkersDir(), patch)
+          : readQualityMonitorConfig(getWorkersDir());
+        const status = config.enabled ? "开启" : "关闭";
+        const envHint = process.env[config.apiKeyEnv] ? "已检测到环境变量" : `未检测到环境变量 ${config.apiKeyEnv}`;
+        return {
+          content: [{
+            type: "text",
+            text: [
+              `✅ 回复质量情绪评分旁路：${status}`,
+              "",
+              `- provider: ${config.provider}`,
+              `- model: ${config.model}`,
+              `- endpoint: ${config.endpoint}`,
+              `- apiKeyEnv: ${config.apiKeyEnv}（${envHint}）`,
+              `- scale: ${config.scoreScale}`,
+              `- updatedAt: ${config.updatedAt || "—"}`,
+              "",
+              "说明：JSON/API key 不会写入仓库；历史 job 可回溯基础指标，情绪分只对开启后的新 turn 自动记录。",
+            ].join("\n"),
+          }],
+          details: { config },
+        };
+      } catch (e: any) {
+        return {
+          content: [{ type: "text", text: `❌ 质量监控配置失败: ${e.message}` }],
           isError: true,
           details: {},
         };

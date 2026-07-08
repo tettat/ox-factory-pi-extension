@@ -22,6 +22,11 @@ import {
   messagesFile,
   permissionEventsFile,
 } from "./comm.mjs";
+import {
+  createWebTalkRequest,
+  getWebTalkRequest,
+  listWebTalkRequests,
+} from "./web-talk.mjs";
 import { buildFactoryTokenReport, buildFactoryTokenTrend, formatFactoryTokenReport, localDateString } from "./token-report.mjs";
 import { buildFactoryReportContext, formatFactoryReportContext } from "./report-context.mjs";
 import {
@@ -29,6 +34,7 @@ import {
   buildFactoryCompactionReport,
   formatFactoryCompactionReport,
 } from "./compaction.mjs";
+import { buildFactoryQualityReport } from "./quality-metrics.mjs";
 import {
   listWorkerResponsibilities,
   summarizeResponsibilities,
@@ -40,6 +46,9 @@ const __dirname = dirname(__filename);
 const WEB_DIR = join(__dirname, "web");
 const VERSION = "phase-1-0.1.0";
 const REPO_ROOT = resolve(__dirname, "..", "..", "..");
+const QUALITY_CACHE_TTL_MS = 30_000;
+const JOB_DETAIL_REPLY_MAX_CHARS = 200_000;
+const qualityMetricsCache = new Map();
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -156,6 +165,7 @@ function summarizeJobForOverview(job) {
     status: job.status,
     worker: job.worker,
     project: job.project || "",
+    model: job.model || null,
     task: compactText(job.task || "", 80),
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
@@ -169,6 +179,16 @@ function compactText(value, max = 160) {
   const text = String(value ?? "").replace(/\s+/g, " ").trim();
   if (text.length <= max) return text;
   return text.slice(0, max) + "…";
+}
+
+function detailText(value, max = JOB_DETAIL_REPLY_MAX_CHARS) {
+  const text = String(value ?? "");
+  return {
+    text: text.length > max ? text.slice(0, max) : text,
+    chars: text.length,
+    truncated: text.length > max,
+    limit: max,
+  };
 }
 
 function readWorkersRelativeText(workersDir, relativePath, maxBytes = 200_000) {
@@ -533,15 +553,24 @@ function buildRouter({ workersDir }) {
     if (method === "OPTIONS") {
       res.writeHead(204, {
         "access-control-allow-origin": "*",
-        "access-control-allow-methods": "GET,OPTIONS",
+        "access-control-allow-methods": "GET,OPTIONS,POST",
         "access-control-allow-headers": "content-type",
       });
       res.end();
       return;
     }
+    // /api/talk/:worker 接受 POST；其余仍只 GET
+    if (method === "POST" && pathname.startsWith("/api/talk/")) {
+      try {
+        const body = await readJsonBody(req);
+        return await handleTalkMessage(workersDir, res, pathname, body);
+      } catch (err) {
+        return errorResponse(res, 400, `读取请求体失败: ${err.message}`);
+      }
+    }
     if (method !== "GET") {
       res.writeHead(405, {
-        "allow": "GET, OPTIONS",
+        "allow": "GET, OPTIONS, POST /api/talk/*",
         "content-type": "application/json; charset=utf-8",
         "cache-control": "no-store",
       });
@@ -566,8 +595,12 @@ function buildRouter({ workersDir }) {
       if (pathname === "/api/tokens") return await handleTokens(workersDir, res, url);
       if (pathname === "/api/tokens/trend") return await handleTokensTrend(workersDir, res, url);
       if (pathname === "/api/compactions") return await handleCompactions(workersDir, res, url);
+      if (pathname === "/api/quality-metrics") return await handleQualityMetrics(workersDir, res, url);
       if (pathname === "/api/permissions") return await handlePermissions(workersDir, res);
       if (pathname === "/api/messages") return await handleMessages(workersDir, res, url);
+      if (pathname === "/api/talk-requests" || pathname.startsWith("/api/talk-requests/")) {
+        return await handleTalkRequestStatus(workersDir, res, pathname, url);
+      }
       if (pathname === "/api/projects") return await handleProjects(workersDir, res);
       if (pathname === "/api/project-doc") return await handleProjectDoc(workersDir, res, url);
       if (pathname.startsWith("/api/projects/")) {
@@ -591,6 +624,32 @@ function buildRouter({ workersDir }) {
       return errorResponse(res, 500, "Internal Server Error", String(err?.message || err));
     }
   };
+}
+
+async function readJsonBody(req, maxBytes = 64 * 1024) {
+  return new Promise((resolve, reject) => {
+    let len = 0;
+    const chunks = [];
+    req.on("data", (chunk) => {
+      len += chunk.length;
+      if (len > maxBytes) {
+        req.destroy();
+        reject(new Error(`body too large (>${maxBytes})`));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      const text = Buffer.concat(chunks).toString("utf8");
+      if (!text) return resolve({});
+      try {
+        resolve(JSON.parse(text));
+      } catch {
+        reject(new Error("body 不是合法 JSON"));
+      }
+    });
+    req.on("error", reject);
+  });
 }
 
 function handleHealth(res) {
@@ -830,6 +889,8 @@ async function handleJobDetail(workersDir, res, id) {
   if (!existsSync(jobFile)) return notFound(res, `job ${id} not found`);
   const job = readJob(jobFile);
   const events = tailJobEvents(job, 100);
+  const latestReply = latestReplyFromEvents(events);
+  const fullReply = detailText(job.fullOutput || latestReply || job.summary || "");
   return jsonResponse(res, 200, {
     id: job.id,
     status: job.status,
@@ -844,6 +905,10 @@ async function handleJobDetail(workersDir, res, id) {
     elapsedSeconds: job.elapsedSeconds,
     model: job.model,
     summary: job.summary || null,
+    fullReply: fullReply.text || null,
+    fullReplyChars: fullReply.chars,
+    fullReplyTruncated: fullReply.truncated,
+    fullReplyLimit: fullReply.limit,
     error: job.error || null,
     events: events.map((e) => ({
       time: e.time,
@@ -853,7 +918,7 @@ async function handleJobDetail(workersDir, res, id) {
       message: e.message || null,
       isError: Boolean(e.isError),
     })),
-    latestReply: latestReplyFromEvents(events),
+    latestReply,
   });
 }
 
@@ -914,6 +979,46 @@ async function handleCompactions(workersDir, res, url) {
         : null,
     })),
     note: "Codex shadow 压缩只用于评估，不会替换 Pi 真实压缩结果。",
+  });
+}
+
+async function handleQualityMetrics(workersDir, res, url) {
+  const rawDate = url.searchParams.get("date");
+  const date = rawDate && rawDate.trim() ? rawDate.trim() : localDateString(new Date());
+  const worker = url.searchParams.get("worker") || undefined;
+  const rawLimit = (url.searchParams.get("limit") || "").trim().toLowerCase();
+  const limit = rawLimit === "all"
+    ? "all"
+    : Math.min(5000, Math.max(1, Number(rawLimit) || (date === "all" ? 5000 : 120)));
+  const cacheKey = JSON.stringify({ workersDir, date, worker: worker || "", limit });
+  const bypassCache = url.searchParams.get("refresh") === "1" || url.searchParams.get("noCache") === "1";
+  const cached = qualityMetricsCache.get(cacheKey);
+  if (!bypassCache && cached && cached.expiresAt > Date.now()) {
+    return jsonResponse(res, 200, {
+      ...cached.report,
+      cache: { hit: true, cachedAt: cached.cachedAt, ttlMs: QUALITY_CACHE_TTL_MS },
+    });
+  }
+  const report = buildFactoryQualityReport({
+    workersDir,
+    date,
+    worker,
+    limit,
+  });
+  qualityMetricsCache.set(cacheKey, {
+    report,
+    cachedAt: new Date().toISOString(),
+    expiresAt: Date.now() + QUALITY_CACHE_TTL_MS,
+  });
+  if (qualityMetricsCache.size > 20) {
+    const now = Date.now();
+    for (const [key, value] of qualityMetricsCache) {
+      if (value.expiresAt <= now || qualityMetricsCache.size > 20) qualityMetricsCache.delete(key);
+    }
+  }
+  return jsonResponse(res, 200, {
+    ...report,
+    cache: { hit: false, ttlMs: QUALITY_CACHE_TTL_MS },
   });
 }
 
@@ -993,8 +1098,193 @@ async function handleProjects(workersDir, res) {
 }
 
 // ---------------------------------------------------------------------------
-// Project detail
+// Talk · Web 版 /talk 员工名
 // ---------------------------------------------------------------------------
+// 设计：
+// - Web server 是独立进程，不能直接调用 Pi 主进程内的 startTalkMessage。
+// - 因此这里不再直接 createJob，避免制造永远没人执行的 queued 悬空 job。
+// - 这里只写 web-talk intent；Pi 主进程 reload 后会轮询并调用正常 /talk 背后的
+//   startTalkMessage(worker, message)，从而复用同一套空闲/忙碌排队/事件/记忆机制。
+async function handleTalkMessage(workersDir, res, pathname, body) {
+  const m = pathname.match(/^\/api\/talk\/(.+)$/);
+  if (!m) return notFound(res, "路径格式错误");
+  const worker = decodeURIComponent(m[1]);
+  if (!worker) return badRequest(res, "worker name required");
+  // 验证员工存在：
+  // - Pi 后端员工通常有 `.pi/workers/sessions/<name>.jsonl`
+  // - Codex 后端员工的真实 session 在 `~/.codex/sessions`，本目录可能没有同名 session 文件；
+  //   这类员工必须从主 session 里的 ox-worker-* registry 恢复。
+  const sessionExists = existsSync(join(workersDir, "sessions", `${worker}.jsonl`));
+  const registry = getWorkerRegistry(workersDir);
+  const regInfo = registry.get(worker);
+  if (!sessionExists && !regInfo) {
+    return badRequest(res, `员工 ${worker} 不存在（既不在员工 registry，也没有 sessions/ 本地 session）。完整路径检查后重试。`);
+  }
+  if (regInfo?.status === "fired") {
+    return badRequest(res, `员工 ${worker} 已离职，不能对话。`);
+  }
+  const message = String(body?.message ?? "").trim();
+  if (!message) return badRequest(res, "message 不能为空");
+  if (message.length > 16000) return badRequest(res, "message 过长 (>16000)");
+
+  try {
+    const request = createWebTalkRequest(workersDir, {
+      worker,
+      message,
+      from: String(body?.from || "web").trim() || "web",
+    });
+    return jsonResponse(res, 202, {
+      ok: true,
+      request: {
+        id: request.id,
+        status: request.status,
+        worker: request.worker,
+        message: request.message,
+        createdAt: request.createdAt,
+      },
+      note: "Web talk 请求已提交，等待 Pi 主进程接管并走正常 /talk 调度。若刚更新代码，需要 reload Pi 后才会自动接管。",
+    });
+  } catch (err) {
+    return errorResponse(res, 500, "创建 web talk 请求失败", String(err?.message || err));
+  }
+}
+
+async function handleTalkRequestStatus(workersDir, res, pathname, url) {
+  const prefix = "/api/talk-requests/";
+  if (pathname.startsWith(prefix)) {
+    const id = decodeURIComponent(pathname.slice(prefix.length));
+    if (!id) return badRequest(res, "request id required");
+    const request = getWebTalkRequest(workersDir, id);
+    if (!request) return notFound(res, `talk request not found: ${id}`);
+    return jsonResponse(res, 200, { generatedAt: new Date().toISOString(), request });
+  }
+  const worker = url.searchParams.get("worker") || undefined;
+  const limit = Math.min(200, Math.max(1, Number(url.searchParams.get("limit")) || 50));
+  const requests = listWebTalkRequests(workersDir, { worker, limit }).reverse();
+  return jsonResponse(res, 200, {
+    generatedAt: new Date().toISOString(),
+    worker: worker || null,
+    total: requests.length,
+    requests,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Quality · 每 job 一行派生指标，供前端做趋势/散点分析
+// ---------------------------------------------------------------------------
+// 后端能提供的字段：
+//   worker / project / status / kind
+//   time (createdAt ISO)
+//   inputTokens / outputTokens / cachedInputTokens / cachedTokens (计算口径 = inputTokens + outputTokens + cachedInputTokens)
+//   turns / elapsedMs (= elapsedSeconds * 1000)
+//   taskChars (= len(job.task))
+//   summaryChars (= len(job.summary))
+//   toolCalls (从 events 数 tool_start 个数)
+//   compactions (= 从同名 compactions/ 是否存在 .codex.md / .pi.md 推 count)
+//   emotionScore (session jsonl 里查 emotionScore 标记，没有则为 null)
+async function handleQuality(workersDir, res, url) {
+  const limit = Math.min(20000, Math.max(1, Number(url.searchParams.get("limit")) || 5000));
+  const worker = url.searchParams.get("worker") || null;
+  const compactionsDir = join(workersDir, "compactions");
+  const sessionsDir = join(workersDir, "sessions");
+  const sessionEmotionCache = new Map(); // worker -> [{ts, score}]
+  if (existsSync(sessionsDir)) {
+    for (const name of readdirSync(sessionsDir)) {
+      if (!name.endsWith(".jsonl")) continue;
+      const w = name.slice(0, -".jsonl".length);
+      try {
+        const lines = readFileSync(join(sessionsDir, name), "utf8").split("\n");
+        const points = [];
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          let entry;
+          try { entry = JSON.parse(line); } catch { continue; }
+          const usage = entry?.message?.usage || entry?.usage;
+          const emo = usage?.emotionScore ?? entry?.message?.emotionScore ?? entry?.emotionScore;
+          const t = entry?.timestamp || entry?.time || entry?.createdAt;
+          if (typeof emo === "number" && t) {
+            points.push({ t: new Date(t).getTime() || 0, score: emo });
+          }
+        }
+        if (points.length) sessionEmotionCache.set(w, points);
+      } catch { /* ignore */ }
+    }
+  }
+
+  const jobs = listJobs(workersDir, { limit });
+  const rows = [];
+  for (const job of jobs) {
+    if (worker && job.worker !== worker) continue;
+    // tool_calls 计数从 events 读取
+    let toolCalls = 0;
+    let thinkingBlocks = 0;
+    try {
+      const events = tailJobEvents(job, 500);
+      for (const e of events) {
+        if (e.type === "tool_start") toolCalls += 1;
+        if (e.type === "thinking") thinkingBlocks += 1;
+      }
+    } catch { /* 读不到则不填 */ }
+    // compaction hits (从 compactions/<jobId>.{codex,pi}.md 是否存在推 count)
+    let compactions = 0;
+    if (existsSync(compactionsDir)) {
+      for (const ext of [".codex.md", ".pi.md"]) {
+        if (existsSync(join(compactionsDir, `${job.id}${ext}`))) compactions += 1;
+      }
+    }
+    const input = Number(job.inputTokens || 0);
+    const output = Number(job.outputTokens || 0);
+    const cache = Number(job.cachedInputTokens || 0);
+    const elapsedMs = Number(job.elapsedSeconds || 0) * 1000;
+    const task = String(job.task || "");
+    const summary = String(job.summary || "");
+    rows.push({
+      jobId: job.id,
+      worker: job.worker || "",
+      project: job.project || "",
+      kind: job.kind || "",
+      status: job.status || "",
+      time: job.createdAt || "",
+      inputTokens: input,
+      outputTokens: output,
+      cachedTokens: cache,
+      totalTokens: input + output + cache,
+      turns: Number(job.turns || 0),
+      elapsedMs,
+      taskChars: task.length,
+      summaryChars: summary.length,
+      toolCalls,
+      compactions,
+      thinkingBlocks,
+    });
+  }
+
+  // 按员工聚合：每个员工的 job 数 + 总 token 数 + 平均耗时 + 工具总调用 + 压缩总次数
+  const byWorkerMap = new Map();
+  for (const r of rows) {
+    if (!r.worker) continue;
+    const w = byWorkerMap.get(r.worker) || { worker: r.worker, jobs: 0, totalInputTokens: 0, totalOutputTokens: 0, totalToolCalls: 0, totalElapsedMs: 0, totalTasks: 0, totalCompactions: 0 };
+    w.jobs += 1;
+    w.totalInputTokens += r.inputTokens;
+    w.totalOutputTokens += r.outputTokens;
+    w.totalToolCalls += r.toolCalls;
+    w.totalElapsedMs += r.elapsedMs;
+    w.totalCompactions += r.compactions;
+    byWorkerMap.set(r.worker, w);
+  }
+  const byWorker = [...byWorkerMap.values()].sort((a, b) => b.jobs - a.jobs);
+
+  return jsonResponse(res, 200, {
+    generatedAt: new Date().toISOString(),
+    total: rows.length,
+    rows,
+    byWorker,
+    emotionAvailable: sessionEmotionCache.size > 0,
+    emotionPoints: Object.fromEntries(sessionEmotionCache),
+    note: "sessionContextTokens / emotionScore / inputChars / outputChars 这些字段在当前会话 jsonl 未产生；后端有会随时补上。",
+  });
+}
+
 async function handleProjectDetail(workersDir, res, id) {
   const project = resolveStoredProject(workersDir, id);
   if (!project) {

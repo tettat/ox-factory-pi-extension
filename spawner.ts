@@ -20,6 +20,8 @@ import {
   updateJob,
 } from "./jobs.mjs";
 import { runCodexWorkerStreaming, steerCodexWorker } from "./codex-backend.mjs";
+import { buildFactoryWorkerHandbook } from "./factory-handbook.mjs";
+import { scoreUserEmotion } from "./quality-metrics.mjs";
 
 const OWNER_INSTANCE_ID = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
@@ -154,15 +156,10 @@ function addUsageToResult(result: SpawnResult, usage: any) {
 }
 
 function communicationInstructions(worker: Worker): string {
-  const commCli = path.resolve(getWorkersDir(), "..", "extensions", "ox-factory", "comm-cli.mjs");
-  const workersDir = getWorkersDir();
-  return [
-    "## 工厂通信",
-    "如需联系其他员工，必须走授权式通信，不能直接改 messages/permissions 文件。",
-    "未授权时通信会被拒绝；不要绕过权限。",
-    `发送消息：node ${commCli} send --workers-dir ${workersDir} --from ${JSON.stringify(worker.id)} --to 对方员工 --content "消息内容"`,
-    `查看收件箱：node ${commCli} inbox --workers-dir ${workersDir} --worker ${JSON.stringify(worker.id)}`,
-  ].join("\n");
+  return buildFactoryWorkerHandbook(worker, {
+    workersDir: getWorkersDir(),
+    backend: worker.backend ?? "pi",
+  });
 }
 
 export async function spawnWorker(options: SpawnOptions): Promise<SpawnResult> {
@@ -544,6 +541,34 @@ export function startWorkerJob(
     return updated;
   };
 
+  const recordQualityEmotionAsync = (finishedJob: any, assistantText: string) => {
+    const userText = options.task || "";
+    if (!userText.trim()) return;
+    void scoreUserEmotion({
+      workersDir: getWorkersDir(),
+      job: finishedJob,
+      userText,
+      assistantText,
+    }).then((record: any) => {
+      if (!record || record.status === "disabled") return;
+      appendJobEvent(finishedJob, {
+        type: record.status === "scored" ? "quality_emotion" : "quality_emotion_status",
+        status: record.status,
+        score: record.score ?? null,
+        label: record.label || "",
+        reason: record.reason || record.error || "",
+        provider: record.provider || "",
+        model: record.model || "",
+        apiKeyEnv: record.apiKeyEnv || undefined,
+      });
+    }).catch((error: any) => {
+      appendJobEvent(finishedJob, {
+        type: "quality_emotion_error",
+        message: error?.message || String(error),
+      });
+    });
+  };
+
   const startedMs = Date.now();
   const run = options.deliveryMode === "steer" && (options.worker.backend ?? "pi") === "codex" && options.worker.codexActiveTurnId
     ? steerCodexWorker({ ...options, workersDir: getWorkersDir() }, (event: StreamEvent) => {
@@ -573,18 +598,20 @@ export function startWorkerJob(
       fullOutput: result.output || "",
     };
     if (failed) patch.error = result.errorMessage || result.stderr || `worker exited with code ${result.exitCode}`;
-    finishIfOpen(patch, { type: patch.status, text: patch.error || patch.summary || "" });
+    const finishedJob = finishIfOpen(patch, { type: patch.status, text: patch.error || patch.summary || "" });
+    recordQualityEmotionAsync(finishedJob, result.output || patch.error || "");
     return result;
   }).catch((error: any) => {
     const elapsedSeconds = Math.max(0, Math.round((Date.now() - startedMs) / 1000));
     const message = error?.message || String(error);
-    finishIfOpen({
+    const finishedJob = finishIfOpen({
       status: "failed",
       finishedAt: new Date().toISOString(),
       elapsedSeconds,
       exitCode: 1,
       error: message,
     }, { type: "error", message });
+    recordQualityEmotionAsync(finishedJob, message);
     return {
       exitCode: 1,
       output: "",

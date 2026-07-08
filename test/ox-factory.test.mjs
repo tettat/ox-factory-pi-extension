@@ -49,6 +49,13 @@ import {
   serializeFactoryCompactionMessages,
 } from "../compaction.mjs";
 import {
+  buildFactoryQualityReport,
+  formatFactoryQualityReport,
+  readQualityMonitorConfig,
+  scoreUserEmotion,
+  writeQualityMonitorConfig,
+} from "../quality-metrics.mjs";
+import {
   grantPermission,
   hasPermission,
   listMessages,
@@ -75,6 +82,7 @@ import {
 } from "../projects.mjs";
 import {
   buildCodexBaseInstructions,
+  buildCodexTaskContent,
   codexNotificationToStreamEvents,
   createCodexTokenUsageTracker,
   extractCodexTokenUsage,
@@ -84,6 +92,9 @@ import {
   subtractCodexTokenUsage,
 } from "../codex-backend.mjs";
 import {
+  buildFactoryWorkerHandbook,
+} from "../factory-handbook.mjs";
+import {
   parseCodexRolloutLines,
   repairCodexJobTokenMetadata,
   summarizeSegments,
@@ -91,6 +102,14 @@ import {
 import { selectNextPending, shouldRunInProcess } from "../queue-utils.mjs";
 import { repairToolResultParents } from "../session-repair.mjs";
 import { resolveProjectMarkdownDocRef } from "../web-server.mjs";
+import {
+  acceptWebTalkRequest,
+  createWebTalkRequest,
+  failWebTalkRequest,
+  getWebTalkRequest,
+  listPendingWebTalkRequests,
+  listWebTalkRequests,
+} from "../web-talk.mjs";
 
 const testDir = dirname(fileURLToPath(import.meta.url));
 
@@ -1326,6 +1345,19 @@ test("factory pick is exposed as a tool and slash command", () => {
   assert.match(indexSource, /pickUnreadJob/);
 });
 
+test("pick command attaches the picked worker to talk unless peeking", () => {
+  const indexSource = readFileSync(join(testDir, "../index.ts"), "utf8");
+  const attachBlock = indexSource.match(/function attachPickedJobToTalk[\s\S]*?\n  }\n\n  pi\.registerCommand\("talk"/)?.[0] || "";
+  const pickBlock = indexSource.match(/pi\.registerCommand\("pick"[\s\S]*?\n  }\);\n\n  pi\.registerCommand\("report"/)?.[0] || "";
+
+  assert.match(attachBlock, /talkTarget\s*=\s*workerId/);
+  assert.match(attachBlock, /activeTalkJobId\s*=\s*isTerminalJob\(picked\.job\)\s*\?\s*null\s*:\s*picked\.job\.id/);
+  assert.match(attachBlock, /sendTalkMessage\(workerId/);
+  assert.match(attachBlock, /customType:\s*"ox-talk-attached"/);
+  assert.match(pickBlock, /!pickArgs\.peek/);
+  assert.match(pickBlock, /attachPickedJobToTalk\(picked,\s*content,\s*ctx\)/);
+});
+
 test("token report is exposed as a natural-language tool without a slash command", () => {
   const indexSource = readFileSync(join(testDir, "../index.ts"), "utf8");
 
@@ -1377,6 +1409,104 @@ test("ox web command starts and opens the local dashboard", () => {
   assert.match(indexSource, /127\.0\.0\.1/);
   assert.match(indexSource, /--status/);
   assert.match(indexSource, /--no-open/);
+});
+
+test("web talk requests are event-sourced and do not create jobs in web-server", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-web-talk-test-"));
+  try {
+    const request = createWebTalkRequest(workersDir, {
+      worker: "八村",
+      message: "你好",
+      from: "web",
+    });
+    assert.equal(request.status, "pending");
+    assert.equal(listPendingWebTalkRequests(workersDir).length, 1);
+
+    const accepted = acceptWebTalkRequest(workersDir, {
+      requestId: request.id,
+      jobId: "job-1",
+      deliveryMode: "message",
+      placement: "马上开始",
+    });
+    assert.equal(accepted.status, "accepted");
+    assert.equal(accepted.jobId, "job-1");
+    assert.equal(listPendingWebTalkRequests(workersDir).length, 0);
+    assert.equal(getWebTalkRequest(workersDir, request.id).status, "accepted");
+
+    const failedRequest = createWebTalkRequest(workersDir, {
+      worker: "八村",
+      message: "第二条",
+    });
+    const failed = failWebTalkRequest(workersDir, {
+      requestId: failedRequest.id,
+      error: "员工休假",
+    });
+    assert.equal(failed.status, "failed");
+    assert.equal(failed.error, "员工休假");
+    assert.equal(listWebTalkRequests(workersDir).length, 2);
+
+    const webServerSource = readFileSync(join(testDir, "../web-server.mjs"), "utf8");
+    const indexSource = readFileSync(join(testDir, "../index.ts"), "utf8");
+    assert.match(webServerSource, /createWebTalkRequest/);
+    assert.match(webServerSource, /getWorkerRegistry\(workersDir\)/);
+    assert.match(webServerSource, /Codex 后端员工的真实 session/);
+    assert.doesNotMatch(webServerSource, /sessions\/ 下找不到对应 session/);
+    assert.doesNotMatch(webServerSource, /createJob\(workersDir,\s*\{\s*kind:\s*"talk"/);
+    assert.match(indexSource, /listPendingWebTalkRequests/);
+    assert.match(indexSource, /startTalkMessage\(w!, message, ctx, undefined, \{ attach: false, notify: false \}\)/);
+    assert.match(indexSource, /options:\s*\{ attach\?: boolean; notify\?: boolean \}/);
+    assert.match(indexSource, /const notifyConsole = options\.notify !== false/);
+    assert.match(indexSource, /if \(notifyConsole\) ctx\?\.ui\?\.notify/);
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("web job detail exposes full worker reply instead of summary-only truncation", () => {
+  const webServerSource = readFileSync(join(testDir, "../web-server.mjs"), "utf8");
+  const webAppSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
+
+  assert.match(webServerSource, /JOB_DETAIL_REPLY_MAX_CHARS\s*=\s*200_000/);
+  assert.match(webServerSource, /fullReply:\s*fullReply\.text \|\| null/);
+  assert.match(webServerSource, /fullReplyTruncated:\s*fullReply\.truncated/);
+  assert.match(webServerSource, /job\.fullOutput \|\| latestReply \|\| job\.summary/);
+  assert.match(webAppSource, /const replyText = d\.fullReply \|\| d\.latestReply \|\| d\.summary \|\| ""/);
+  assert.match(webAppSource, /text:\s*"AI 响应"/);
+  assert.match(webAppSource, /响应过长，已展示前/);
+});
+
+test("talk live output does not persist custom messages by default", () => {
+  const indexSource = readFileSync(join(testDir, "../index.ts"), "utf8");
+  assert.match(indexSource, /function shouldPersistTalkLiveMessages/);
+  assert.match(indexSource, /OX_FACTORY_TALK_LIVE_MESSAGES/);
+  assert.match(indexSource, /if \(!shouldPersistTalkLiveMessages\(\)\) return;/);
+  assert.match(indexSource, /tailJobEvents\(job,\s*20\)/);
+  assert.match(indexSource, /tailJobEvents\(finished,\s*20\)/);
+  assert.doesNotMatch(indexSource, /当前 talk 面板会跟随输出/);
+});
+
+test("web dashboard exposes a real i18n language switch", () => {
+  const html = readFileSync(join(testDir, "../web/index.html"), "utf8");
+  const appSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
+  const styleSource = readFileSync(join(testDir, "../web/styles.css"), "utf8");
+
+  assert.match(html, /id="langSwitch"/);
+  assert.match(html, /id="langSwitchText"/);
+  assert.match(html, /data-i18n="brand\.title"/);
+  assert.match(appSource, /LANG_STORAGE_KEY/);
+  assert.match(appSource, /function applyStaticI18n/);
+  assert.match(appSource, /function setLanguage/);
+  assert.match(appSource, /#langSwitch/);
+  assert.match(styleSource, /\.lang-switch/);
+});
+
+test("web topbar i18n helper is not shadowed by totals locals", () => {
+  const appSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
+  const setTopbarBlock = appSource.match(/function setTopbar\(overview\) \{[\s\S]*?\n  \}/)?.[0] || "";
+
+  assert.match(setTopbarBlock, /const totals = overview\?\.totals \|\| \{\}/);
+  assert.doesNotMatch(setTopbarBlock, /const t = overview\?\.totals/);
+  assert.match(setTopbarBlock, /\$\("#lastUpdated"\)\.textContent = `\$\{t\("topbar\.updatedAt"\)\}/);
 });
 
 test("tokens page route-refreshes when date or trend filters change", () => {
@@ -1448,11 +1578,41 @@ test("codex base instructions include reset handoff once a thread is reset", () 
     id: "步美",
     role: "programmer",
     codexThreadHandoff: "旧 thread: abc\n最近 job: touch 失败，需要 full access",
-  });
+  }, "", { workersDir: "/tmp/ox-workers" });
 
   assert.match(instructions, /旧 Codex thread handoff/);
   assert.match(instructions, /旧 thread: abc/);
   assert.match(instructions, /touch 失败/);
+  assert.match(instructions, /牛马工厂工作手册/);
+  assert.match(instructions, /comm-cli\.mjs send/);
+});
+
+test("factory worker handbook documents authorized comm cli for every backend", () => {
+  const handbook = buildFactoryWorkerHandbook({
+    id: "乔治",
+    role: "programmer",
+  }, { workersDir: "/tmp/ox-workers", backend: "codex" });
+
+  assert.match(handbook, /牛马工厂工作手册/);
+  assert.match(handbook, /授权式通信/);
+  assert.match(handbook, /comm-cli\.mjs check --workers-dir \/tmp\/ox-workers --subject "乔治" --action message:send --target 对方员工/);
+  assert.match(handbook, /comm-cli\.mjs send --workers-dir \/tmp\/ox-workers --from "乔治" --to 对方员工 --content "消息内容"/);
+  assert.match(handbook, /comm-cli\.mjs inbox --workers-dir \/tmp\/ox-workers --worker "乔治"/);
+  assert.match(handbook, /留言不是派活/);
+});
+
+test("codex task content repeats factory handbook so existing threads learn comm tools", () => {
+  const content = buildCodexTaskContent({
+    worker: { id: "乔治", role: "programmer" },
+    task: "给光彦发一条消息问进展",
+    project: "talk",
+    workersDir: "/tmp/ox-workers",
+  });
+
+  assert.match(content, /## 任务\n给光彦发一条消息问进展/);
+  assert.match(content, /牛马工厂工作手册/);
+  assert.match(content, /comm-cli\.mjs send --workers-dir \/tmp\/ox-workers --from "乔治" --to 对方员工/);
+  assert.match(content, /不要直接改 messages\/permissions 文件/);
 });
 
 test("codex token usage extractor supports common app-server usage shapes", () => {
@@ -1864,6 +2024,81 @@ test("main agent shadow compaction is enabled by default without env flags", asy
   }
 });
 
+test("worker shadow compaction is enabled by default without env flags", async () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-compaction-worker-default-test-"));
+  const previousMode = process.env.OX_FACTORY_CODEX_COMPACTION_MODE;
+  const previousScope = process.env.OX_FACTORY_CODEX_COMPACTION_SCOPE;
+  const previousWorkers = process.env.OX_FACTORY_CODEX_COMPACTION_WORKERS;
+  const previousLegacy = process.env.OX_FACTORY_CODEX_COMPACTION;
+  delete process.env.OX_FACTORY_CODEX_COMPACTION_MODE;
+  delete process.env.OX_FACTORY_CODEX_COMPACTION_SCOPE;
+  delete process.env.OX_FACTORY_CODEX_COMPACTION_WORKERS;
+  delete process.env.OX_FACTORY_CODEX_COMPACTION;
+  try {
+    const sessionFile = join(workersDir, "sessions", "包包.jsonl");
+    mkdirSync(dirname(sessionFile), { recursive: true });
+    let calls = 0;
+    const event = {
+      reason: "threshold",
+      preparation: {
+        firstKeptEntryId: "worker-default-keep",
+        tokensBefore: 111740,
+        messagesToSummarize: [{ role: "user", content: "包包默认 worker shadow 压缩评估" }],
+        turnPrefixMessages: [],
+      },
+    };
+    const ctx = {
+      cwd: "/repo",
+      sessionManager: { getSessionFile: () => sessionFile },
+      ui: { notify() {} },
+    };
+
+    const result = await handleFactoryCompactionEvent(event, ctx, {
+      workersDir,
+      runCodexCompactionFn: async ({ worker }) => {
+        calls += 1;
+        assert.equal(worker.id, "包包");
+        assert.equal(worker.targetType, "worker");
+        return {
+          summary: "## Worker State\n包包默认开启 shadow。\n\n## Factory Context\n牛马工厂。\n\n## Next Turn Instructions\n1. 继续。",
+          firstKeptEntryId: "worker-default-keep",
+          tokensBefore: 111740,
+          details: { model: "gpt-5.5" },
+        };
+      },
+    });
+
+    assert.equal(result, undefined);
+    assert.equal(calls, 1);
+
+    const record = await handleFactoryCompactionCompleted({
+      reason: "threshold",
+      compactionEntry: {
+        summary: "## Goal\nPi worker 摘要",
+        firstKeptEntryId: "worker-default-keep",
+        tokensBefore: 111740,
+      },
+    }, ctx, {
+      workersDir,
+      awaitShadowWrite: true,
+    });
+
+    assert.equal(record.targetType, "worker");
+    assert.equal(record.worker, "包包");
+    assert.equal(record.decision, "pi_used_codex_shadow_only");
+  } finally {
+    if (previousMode === undefined) delete process.env.OX_FACTORY_CODEX_COMPACTION_MODE;
+    else process.env.OX_FACTORY_CODEX_COMPACTION_MODE = previousMode;
+    if (previousScope === undefined) delete process.env.OX_FACTORY_CODEX_COMPACTION_SCOPE;
+    else process.env.OX_FACTORY_CODEX_COMPACTION_SCOPE = previousScope;
+    if (previousWorkers === undefined) delete process.env.OX_FACTORY_CODEX_COMPACTION_WORKERS;
+    else process.env.OX_FACTORY_CODEX_COMPACTION_WORKERS = previousWorkers;
+    if (previousLegacy === undefined) delete process.env.OX_FACTORY_CODEX_COMPACTION;
+    else process.env.OX_FACTORY_CODEX_COMPACTION = previousLegacy;
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
 test("main agent compaction refuses apply mode unless explicitly forced", async () => {
   const workersDir = mkdtempSync(join(tmpdir(), "ox-compaction-main-apply-test-"));
   try {
@@ -1951,6 +2186,218 @@ test("compaction report CLI prints shadow comparison records", () => {
     const report = JSON.parse(jsonOutput);
     assert.equal(report.records[0].worker, "东子");
   } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("quality report correlates context, compactions, input/output, latency and tools", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-quality-report-test-"));
+  try {
+    const job = createJob(workersDir, {
+      worker: "包包",
+      project: "talk",
+      task: "这个回复不太行，你重新检查一下页面报错。",
+      cwd: "/repo",
+      sessionFile: join(workersDir, "sessions", "包包.jsonl"),
+    });
+    appendJobEvent(job, { type: "started", message: "start" });
+    appendJobEvent(job, { type: "tool_start", name: "bash", args: { command: "node --check web/app.js" } });
+    appendJobEvent(job, { type: "tool_end", name: "bash", result: { exitCode: 0 } });
+    appendJobEvent(job, { type: "done", text: "已经定位到变量遮蔽，并修复完成。" });
+    updateJob(job, {
+      status: "done",
+      createdAt: "2026-07-07T10:00:00.000Z",
+      startedAt: "2026-07-07T10:00:00.000Z",
+      finishedAt: "2026-07-07T10:00:12.000Z",
+      elapsedSeconds: 12,
+      summary: "已经定位到变量遮蔽，并修复完成。",
+      fullOutput: "已经定位到变量遮蔽，并修复完成。",
+      model: "MiniMax-M3",
+      inputTokens: 100,
+      cachedInputTokens: 300,
+      outputTokens: 20,
+      reasoningOutputTokens: 5,
+      totalTokens: 120,
+    });
+
+    mkdirSync(join(workersDir, "sessions"), { recursive: true });
+    writeFileSync(join(workersDir, "sessions", "包包.jsonl"), [
+      JSON.stringify({ type: "message", id: "u1", timestamp: "2026-07-07T09:00:00Z", message: { role: "user", content: "早期输入" } }),
+      JSON.stringify({ type: "message", id: "a1", timestamp: "2026-07-07T09:00:02Z", message: { role: "assistant", content: [{ type: "text", text: "早期输出" }] } }),
+      JSON.stringify({ type: "compaction", id: "cmp1", timestamp: "2026-07-07T09:30:00Z", summary: "压缩摘要", tokensBefore: 8888, firstKeptEntryId: "u1" }),
+    ].join("\n") + "\n", "utf8");
+
+    const report = buildFactoryQualityReport({ workersDir, date: "2026-07-07", limit: 20 });
+    assert.equal(report.config.enabled, false);
+    assert.equal(report.workers.length, 1);
+    assert.equal(report.workers[0].worker, "包包");
+    assert.equal(report.workers[0].session.compactionCount, 1);
+    assert.equal(report.workers[0].session.messageCount, 2);
+    assert.ok(report.workers[0].session.estimatedContextTokens > 0);
+    assert.equal(report.workers[0].jobs.count, 1);
+    assert.equal(report.workers[0].jobs.avgResponseMs, 12000);
+    assert.equal(report.workers[0].jobs.toolCalls, 1);
+    assert.equal(report.turns[0].inputChars, "这个回复不太行，你重新检查一下页面报错。".length);
+    assert.equal(report.turns[0].taskChars, "这个回复不太行，你重新检查一下页面报错。".length);
+    assert.equal(report.turns[0].outputChars, "已经定位到变量遮蔽，并修复完成。".length);
+    assert.equal(report.turns[0].summaryChars, "已经定位到变量遮蔽，并修复完成。".length);
+    assert.equal(report.turns[0].elapsedSeconds, 12);
+    assert.equal(report.turns[0].cachedInputTokens, 300);
+    assert.equal(report.turns[0].reasoningOutputTokens, 5);
+    assert.equal(report.turns[0].model, "MiniMax-M3");
+    assert.equal(report.turns[0].emotionScore, null);
+    assert.match(formatFactoryQualityReport(report), /包包/);
+    assert.match(formatFactoryQualityReport(report), /工具调用/);
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("quality report backfills all usable history and drops inconsistent jobs", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-quality-history-test-"));
+  try {
+    mkdirSync(join(workersDir, "sessions"), { recursive: true });
+    writeFileSync(join(workersDir, "sessions", "包包.jsonl"), [
+      JSON.stringify({ type: "message", id: "u1", timestamp: "2026-07-05T09:00:00Z", message: { role: "user", content: "历史输入" } }),
+      JSON.stringify({ type: "message", id: "a1", timestamp: "2026-07-05T09:00:02Z", message: { role: "assistant", content: [{ type: "text", text: "历史输出" }] } }),
+      JSON.stringify({ type: "compaction", id: "cmp1", timestamp: "2026-07-06T09:30:00Z", summary: "历史压缩", tokensBefore: 2000 }),
+      JSON.stringify({ type: "message", id: "u2", timestamp: "2026-07-07T09:00:00Z", message: { role: "user", content: "今天输入" } }),
+    ].join("\n") + "\n", "utf8");
+
+    const oldJob = createJob(workersDir, {
+      worker: "包包",
+      project: "talk",
+      task: "历史任务",
+      cwd: "/repo",
+      sessionFile: join(workersDir, "sessions", "包包.jsonl"),
+    });
+    appendJobEvent(oldJob, { type: "tool_start", name: "bash", args: {} });
+    appendJobEvent(oldJob, { type: "done", text: "历史完成" });
+    updateJob(oldJob, {
+      status: "done",
+      createdAt: "2026-07-05T10:00:00.000Z",
+      startedAt: "2026-07-05T10:00:00.000Z",
+      finishedAt: "2026-07-05T10:00:10.000Z",
+      elapsedSeconds: 10,
+      fullOutput: "历史完成",
+    });
+
+    const todayJob = createJob(workersDir, {
+      worker: "包包",
+      project: "talk",
+      task: "今天任务",
+      cwd: "/repo",
+      sessionFile: join(workersDir, "sessions", "包包.jsonl"),
+    });
+    appendJobEvent(todayJob, { type: "done", text: "今天完成" });
+    updateJob(todayJob, {
+      status: "done",
+      createdAt: "2026-07-07T10:00:00.000Z",
+      startedAt: "2026-07-07T10:00:00.000Z",
+      finishedAt: "2026-07-07T10:00:04.000Z",
+      elapsedSeconds: 4,
+      fullOutput: "今天完成",
+    });
+
+    const runningJob = createJob(workersDir, { worker: "包包", project: "talk", task: "还没完", cwd: "/repo" });
+    updateJob(runningJob, { status: "running", createdAt: "2026-07-07T11:00:00.000Z" });
+
+    const badDateJob = createJob(workersDir, { worker: "包包", project: "talk", task: "坏时间", cwd: "/repo" });
+    updateJob(badDateJob, { status: "done", createdAt: "not-a-date", fullOutput: "坏时间完成" });
+
+    const noOutputJob = createJob(workersDir, { worker: "包包", project: "talk", task: "无输出", cwd: "/repo" });
+    updateJob(noOutputJob, { status: "done", createdAt: "2026-07-07T12:00:00.000Z" });
+
+    const report = buildFactoryQualityReport({ workersDir, date: "all", limit: "all" });
+    assert.equal(report.date, "all");
+    assert.equal(report.totals.turns, 2);
+    assert.equal(report.history.droppedJobs, 3);
+    assert.deepEqual(report.dates.map((d) => d.date), ["2026-07-05", "2026-07-07"]);
+    assert.equal(report.dates[0].turns, 1);
+    assert.equal(report.dates[1].turns, 1);
+    assert.ok(report.turns.every((turn) => turn.status === "done"));
+    assert.equal(report.turns.find((turn) => turn.taskPreview === "历史任务").toolCalls, 1);
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("quality monitor config is persisted and factory tool is exposed", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-quality-config-test-"));
+  try {
+    assert.equal(readQualityMonitorConfig(workersDir).enabled, false);
+    const config = writeQualityMonitorConfig(workersDir, {
+      enabled: true,
+      provider: "deepseek",
+      endpoint: "https://api.deepseek.com/v1/chat/completions",
+      model: "deepseek-chat",
+      apiKeyEnv: "DEEPSEEK_API_KEY",
+    });
+    assert.equal(config.enabled, true);
+    assert.equal(readQualityMonitorConfig(workersDir).provider, "deepseek");
+
+    const indexSource = readFileSync(join(testDir, "../index.ts"), "utf8");
+    const webServerSource = readFileSync(join(testDir, "../web-server.mjs"), "utf8");
+    const webAppSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
+    assert.match(indexSource, /name:\s*"factory_quality_monitor_config"/);
+    assert.match(webServerSource, /\/api\/quality-metrics/);
+    assert.match(webServerSource, /date === "all"/);
+    assert.match(webServerSource, /qualityMetricsCache/);
+    assert.match(webAppSource, /renderQualityMetrics/);
+    assert.match(webAppSource, /qualityDateMode/);
+    assert.match(webAppSource, /qualityMetricsHost/);
+    assert.match(webAppSource, /modelForTurn/);
+    assert.match(webAppSource, /turn\??\.model/);
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("quality emotion scorer writes bounded 1-5 scores when enabled", async () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-quality-emotion-test-"));
+  const oldKey = process.env.DEEPSEEK_API_KEY;
+  try {
+    process.env.DEEPSEEK_API_KEY = "test-key";
+    const job = createJob(workersDir, {
+      worker: "包包",
+      project: "talk",
+      task: "这次做得不错，继续。",
+      cwd: "/repo",
+      sessionFile: join(workersDir, "sessions", "包包.jsonl"),
+    });
+    updateJob(job, { status: "done", summary: "收到，我继续。" });
+    writeQualityMonitorConfig(workersDir, {
+      enabled: true,
+      provider: "deepseek",
+      endpoint: "https://api.deepseek.com/v1/chat/completions",
+      model: "deepseek-chat",
+      apiKeyEnv: "DEEPSEEK_API_KEY",
+    });
+    const calls = [];
+    const result = await scoreUserEmotion({
+      workersDir,
+      job,
+      userText: job.task,
+      assistantText: "收到，我继续。",
+      fetchFn: async (url, init) => {
+        calls.push({ url, init });
+        return {
+          ok: true,
+          json: async () => ({
+            choices: [{ message: { content: JSON.stringify({ score: 4, label: "认可", reason: "用户给出正向反馈" }) } }],
+          }),
+        };
+      },
+    });
+    assert.equal(calls.length, 1);
+    assert.equal(result.status, "scored");
+    assert.equal(result.score, 4);
+    const report = buildFactoryQualityReport({ workersDir, limit: 20 });
+    assert.equal(report.totals.scoredTurns, 1);
+    assert.equal(report.turns[0].emotionScore, 4);
+  } finally {
+    if (oldKey == null) delete process.env.DEEPSEEK_API_KEY;
+    else process.env.DEEPSEEK_API_KEY = oldKey;
     rmSync(workersDir, { recursive: true, force: true });
   }
 });

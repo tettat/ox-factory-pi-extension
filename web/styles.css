@@ -244,7 +244,22 @@ img { max-width: 100%; }
   box-shadow: var(--shadow-1);
 }
 .btn:hover { background: var(--bg-hover); border-color: var(--border-strong); }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn--primary { background: var(--accent); color: var(--text-inverse); border-color: var(--accent-strong); }
+.btn--primary:hover:not(:disabled) { background: var(--accent-strong); border-color: var(--accent-strong); }
+.btn--ghost { background: transparent; border-color: transparent; box-shadow: none; }
+.btn--ghost:hover { background: var(--bg-subtle); border-color: var(--border-soft); }
 .btn__icon { font-size: 14px; line-height: 1; }
+.lang-switch {
+  min-width: 86px;
+  justify-content: center;
+  letter-spacing: 0.02em;
+}
+.lang-switch[aria-pressed="true"] {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
 
 .timestamp {
   font-family: var(--font-mono);
@@ -960,6 +975,51 @@ img { max-width: 100%; }
 .cmp-card__body { font-family: var(--font-mono); font-size: 11px; background: var(--bg-canvas); padding: 8px 10px; border-radius: var(--r-1); max-height: 200px; overflow: auto; white-space: pre-wrap; word-break: break-word; line-height: 1.5; }
 .cmp-card__col--pi    .cmp-card__label { color: var(--status-done-fg); }
 .cmp-card__col--codex .cmp-card__label { color: var(--accent); }
+.quality-panel { display: flex; flex-direction: column; gap: 12px; }
+.quality-filters { margin-bottom: 12px; }
+.quality-date-strip {
+  min-height: 128px;
+  display: flex;
+  align-items: end;
+  gap: 8px;
+  padding: 12px 4px 4px;
+  overflow-x: auto;
+}
+.quality-date-strip__item {
+  min-width: 52px;
+  display: grid;
+  grid-template-rows: auto 86px auto;
+  align-items: end;
+  justify-items: center;
+  gap: 4px;
+  padding: 6px 4px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-2);
+  background: var(--bg-subtle);
+  transition: transform var(--dur-fast), border-color var(--dur-fast), background var(--dur-fast);
+}
+.quality-date-strip__item:hover {
+  transform: translateY(-1px);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.quality-date-strip__date,
+.quality-date-strip__val {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+}
+.quality-date-strip__bar {
+  width: 18px;
+  border-radius: 999px 999px 3px 3px;
+  background: var(--grad-accent-bar);
+  box-shadow: 0 4px 12px rgba(44, 95, 219, 0.16);
+}
+.quality-table th,
+.quality-table td,
+.quality-turn-table th,
+.quality-turn-table td { white-space: nowrap; }
+.quality-turn-table .td--task { min-width: 260px; max-width: 460px; }
 
 .warn-banner {
   padding: 10px 16px;
@@ -980,6 +1040,74 @@ img { max-width: 100%; }
 .empty__icon { font-size: 28px; color: var(--text-muted); opacity: 0.5; }
 .empty__title { font-size: 14px; font-weight: 600; color: var(--text-secondary); }
 .empty__hint  { font-size: 12px; color: var(--text-muted); }
+
+/* ==========================================================================
+   Talk Panel · Worker Detail 的「和 TA 对话」模块
+   ========================================================================== */
+.talk-panel { gap: 14px; }
+.talk-panel__meta { display: flex; flex-wrap: wrap; gap: 6px; }
+.talk-panel__row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 12px;
+  align-items: stretch;
+}
+.talk-panel__input {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.5;
+  resize: vertical;
+  min-height: 80px;
+  max-height: 360px;
+  padding: 8px 10px;
+}
+.talk-panel__actions {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  min-width: 100px;
+}
+.talk-panel__feedback {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-align: center;
+  padding: 4px 6px;
+  border-radius: var(--r-1);
+  background: var(--bg-subtle);
+  color: var(--text-muted);
+  min-height: 18px;
+}
+.talk-panel__feedback--error { background: var(--status-error-bg); color: var(--status-error-fg); }
+.talk-panel__feedback--ok { background: var(--status-done-bg); color: var(--status-done-fg); }
+.talk-panel__hint { font-size: 11px; color: var(--text-muted); margin: 0; }
+
+.talk-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.talk-list__item {
+  display: flex; flex-direction: column; gap: 4px;
+  padding: 8px 10px;
+  background: var(--bg-subtle);
+  border-radius: var(--r-2);
+  border-left: 3px solid var(--accent);
+}
+.talk-list__head { display: flex; align-items: center; gap: 8px; }
+.talk-list__id { font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); }
+.talk-list__time { font-family: var(--font-mono); font-size: 10px; color: var(--text-muted); margin-right: auto; }
+.talk-list__btn { padding: 2px 8px; font-size: 11px; }
+.talk-list__task {
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+@media (max-width: 640px) {
+  .talk-panel__row { grid-template-columns: 1fr; }
+  .talk-panel__actions { flex-direction: row; min-width: 0; }
+}
 
 .error-box {
   padding: 16px 18px;
@@ -1082,6 +1210,94 @@ img { max-width: 100%; }
 .trend-kpi__label { font-size: 10px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.08em; }
 .trend-kpi__value { font-family: var(--font-mono); font-size: 20px; font-weight: 600; line-height: 1.1; margin: 4px 0; letter-spacing: -0.01em; }
 .trend-kpi__sub { font-size: 10px; color: var(--text-secondary); }
+
+/* ==========================================================================
+   Quality Charts · 趋势图谱 · SVG 散点 + 折线
+   ========================================================================== */
+.quality-charts { gap: 14px; }
+.quality-charts__filter {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px;
+  background: var(--bg-subtle);
+  border-radius: var(--r-2);
+}
+.quality-charts__filter .muted { font-size: 11px; color: var(--text-muted); margin-left: auto; }
+.quality-kpi-row { padding: 6px 0; }
+.quality-kpi-row .kpi { padding: 8px 12px; }
+
+.charts-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-top: 16px;
+}
+.chart-card {
+  background: var(--bg-canvas);
+  border: 1px solid var(--border-faint);
+  border-radius: var(--r-2);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  position: relative;
+}
+.chart-card__head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.chart-card__title { font-size: 13px; font-weight: 600; margin: 0; color: var(--text-primary); }
+.chart-card__hint { font-size: 10px; color: var(--text-muted); font-family: var(--font-mono); }
+.chart-card__legend { display: flex; gap: 10px; flex-wrap: wrap; }
+.chart-card__legend-item { display: flex; align-items: center; gap: 4px; font-size: 10px; color: var(--text-secondary); }
+.chart-card__swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+
+.chart-svg {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+.chart-svg circle {
+  transition: r var(--dur-fast) var(--ease-out), fill-opacity var(--dur-fast) var(--ease-out);
+  cursor: pointer;
+}
+.chart-svg circle:hover { r: 6; fill-opacity: 0.9; }
+
+.chart-tip {
+  position: absolute;
+  background: var(--text-primary);
+  color: var(--text-inverse);
+  padding: 8px 10px;
+  border-radius: var(--r-2);
+  font-size: 11px;
+  font-family: var(--font-mono);
+  line-height: 1.5;
+  box-shadow: var(--shadow-3);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--dur-fast) var(--ease-out);
+  max-width: 320px;
+  z-index: 5;
+}
+.chart-tip--show { opacity: 1; }
+.chart-tip code { background: rgba(255, 255, 255, 0.15); padding: 0 4px; border-radius: 3px; font-size: 10px; }
+.chart-tip strong { color: var(--text-inverse); }
+
+@media (max-width: 1279px) {
+  .charts-grid { grid-template-columns: 1fr; }
+}
+@media (max-width: 640px) {
+  .quality-charts__filter { flex-wrap: wrap; }
+}
+
+/* Custom chart · 任意 X/Y 联动 */
+.quality-custom { margin-top: 16px; }
+.quality-custom__filter {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px;
+  background: var(--bg-subtle);
+  border-radius: var(--r-2);
+  margin-bottom: 4px;
+}
+.quality-custom__filter .muted { font-size: 11px; color: var(--text-muted); margin-left: auto; }
+.quality-custom .chart-card { background: var(--bg-canvas); }
+.quality-custom .chart-card__head { padding: 0 0 6px; }
 
 .trend-chart__bars {
   display: flex;
@@ -1543,4 +1759,31 @@ img { max-width: 100%; }
 .tag--mono {
   font-family: ui-monospace, SFMono-Regular, monospace;
   font-size: 0.7rem;
+}
+
+/* ===== Vacation (休假) 状态 ===== */
+.dot--vacation {
+  background: #818cf8;
+}
+.avatar--vacation {
+  background: linear-gradient(135deg, #c7d2fe, #a5b4fc);
+  color: #312e81;
+  opacity: 0.8;
+}
+.worker-card--vacation {
+  opacity: 0.7;
+  border-left: 3px solid #818cf8;
+}
+.worker-card__vacation-badge {
+  font-size: 0.7rem;
+  color: #4338ca;
+  background: #e0e7ff;
+  padding: 1px 6px;
+  border-radius: 10px;
+  margin-left: 6px;
+  font-weight: 500;
+}
+.pill--vacation {
+  background: #e0e7ff;
+  color: #4338ca;
 }

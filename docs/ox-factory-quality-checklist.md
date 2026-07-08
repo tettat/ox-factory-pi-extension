@@ -1,6 +1,6 @@
 # 牛马工厂质量 Checklist
 
-更新时间：2026-07-06 +0800
+更新时间：2026-07-07 +0800
 
 定位：`talk / ox-factory` 的功能质量总账。用于把我们聊过并确认过的需求拆成可验收条目，持续记录能力边界、实现状态、测试证据、剩余风险和下一步。  
 关系：`docs/ox-factory-improvement-tracker.md` 记录问题 backlog；本文记录“要做到什么程度才算稳”。
@@ -35,12 +35,60 @@
 | P0 | 运行控制：取消 / steer / 休假 | 能取消当前后台 job；steer 文案按 Codex/Pi 后端讲清楚；员工可设休假并从新任务入口排除 | 代码完成-待 reload 验证 | 已新增 `factory_cancel_job`、`/cancel`、`factory_worker_status`、`vacation` 状态与 Web API 只读暴露 | reload 后验证休假拒绝新任务、返岗可接活、取消 running/queued job、Codex/Pi steer placement 正确；包包补页面展示 | `index.ts`, `registry.ts`, `types.ts`, `web-server.mjs`, OF-028 | 2026-07-06 |
 | P0 | `/pick` 未读成果入口 | 主 agent / 用户能从后台 job 中随机捞一个未读终态成果，展示短结果并标记已读；`--peek` 只预览不标已读 | 代码完成-待 reload 验证 | 已新增 `job-read.jsonl`、`job-pick.mjs`、`factory_pick`、`/pick` 和 `/pick --peek` | reload 后说“pick 一个结果看看”验证自然语言工具触发；`/pick [员工名] --peek` 验证预览不标已读 | `job-pick.mjs`, `factory_pick`, `/pick`, `pickUnreadJob...` 单测 | 2026-07-05 |
 | P1 | 员工 Token 监控 | 按日期/员工统计 input/cached-input/output/reasoning-output/total token；不算钱、不做绩效；session 优先、job 兜底；主 agent 通过自然语言触发 | 代码完成-待 reload 验证 | 已修复 Codex 记 0 并补 cached/reasoning；2026-07-06 发现 `last_token_usage` 只是 Codex 任务内最后一次模型调用，光彦当天 job 口径低估约 35x；已改主链路为 `total_token_usage` 累计 delta，并新增 rollout 回算/修复脚本 | reload 后验证新 Codex job；历史可用 `codex-rollout-token-report.mjs --apply-jobs` 恢复/核对；已审计所有 Codex done job，当前可匹配已修复 281/284，剩余 3 个无独立 rollout 段不猜 | `token-report.mjs`, `token-report-cli.mjs`, `codex-backend.mjs`, `codex-rollout-token-report.mjs`, `factory_token_report` | 2026-07-06 |
+| P1 | 回复质量 / 上下文观测 | 回溯 jobs/events/session，把上下文估算、压缩次数、会话轮次、输入/输出长度、响应耗时、工具调用和情绪评分关联起来 | 代码完成-待 reload 验证 | 新增全历史 `date=all` 回溯、异常 job 丢弃、按天分布和 Web 压缩页“全部历史/指定日期”切换；本机已扫 770 个 job，可用 762，丢弃 8 | reload/Web 重启后在 `#/compactions?qdate=all` 查看；主 agent 可继续开启新 turn 情绪评分 | `quality-metrics.mjs`, `spawner.ts`, `index.ts`, `web-server.mjs`, `web/app.js`, `ox-factory.test.mjs` | 2026-07-07 |
 | P1 | Codex 员工运行配置 | 能显式修正 Codex 员工 sandbox / approval；运行态 thread 更新不能覆盖人工授权配置；旧 thread sandbox 粘住时可 reset thread 并带 handoff | 代码完成-待 reload 验证 | 已新增 `factory_worker_config`；`updateWorkerConfig` 改为只追加显式 patch；补 `resetCodexThread` 清空 `codexThreadId` 并生成最近 job handoff，下一次任务新建 full-access thread；`name`/`workerId` 均可指定员工；Codex 招募默认 `danger-full-access`，只有显式指定时才收紧 sandbox | 需要 reload 一次加载新工具；reload 后重新招募 Codex 员工默认就是 full access；对旧员工/旧 thread 可执行 `factory_worker_config(name=步美, codexSandbox=danger-full-access, codexApprovalPolicy=never, resetCodexThread=true)` 后再只测 touch | `index.ts`, `registry.ts`, `codex-backend.mjs`, `types.ts`, `ox-factory.test.mjs`, OF-006/OF-023 | 2026-07-05 |
 | P1 | reload/job 恢复 | 不再粗暴 stale；补 ownerPid/ownerInstanceId/heartbeat；能识别 fresh orphan-running；stale 后 late event 不再污染正常事件流 | 代码完成-待 reload 验证 | 已落地 heartbeat、startup recovery、late-event guard 和单测 | reload 后人工验证 running job 不被误标 stale，过期 job 仍 stale | `jobs.mjs`, `spawner.ts`, `index.ts`, `ox-factory.test.mjs` | 2026-06-30 |
 | P1 | Web 展示与启动入口 | Web agent 基于稳定数据接口做 dashboard；用户可用 `/ox-web` 启动/打开本地页面 | 代码完成-待 reload 验证 | 已补 `/ox-web`：健康检查、未启动自动后台启动、打开浏览器、状态查询、日志路径 | reload 后执行 `/ox-web --status` 与 `/ox-web` 人工验证 | `web-server.mjs`, `index.ts`, `README.md`, `INSTALL.md`, OF-022 | 2026-07-06 |
+| P1 | Web 员工对话入口 | 员工详情页发送消息后走正常 `/talk` 背后的调度机制；空闲马上开始、忙碌自动排队；Web server 不直接伪造 queued job | 代码完成-待 reload 验证 | 新增 `web-talk-requests.jsonl` intent 桥；Web server 只写请求，Pi 主进程轮询后调用 `startTalkMessage`；修正八村 smoke 造成悬空 job 的根因 | reload Pi 后从员工详情页发一条真实消息，确认 request 变 accepted 且生成正常 talk job；Web 已重启、API smoke 已确认不再直接写 jobs | `web-talk.mjs`, `web-server.mjs`, `index.ts`, `web/app.js`, `ox-factory.test.mjs` | 2026-07-07 |
 | P1 | Web 项目视角 / 定时任务视图 | Overview 使用 Project Entity 作为项目态势主视角；Schedules 页面只读展示 runner/cron/factory_queue 流水；Project 文档入口支持外链打开和本地 Markdown 渲染 | 已派活给包包 | 已补 `/api/project-doc` 只读接口和安全路径校验，并将前端渲染任务派给包包 | 包包实现 Project 详情页文档点击：外链新开，本地 md 用 `mdNode()` 渲染 | `docs/ox-factory-web-project-schedule-handoff-baobao.md`, `docs/ox-factory-web-project-doc-handoff-baobao.md`, OF-025, `web-server.mjs` | 2026-07-05 |
-| P1 | Pi display-only 输出探针 | 评估 `ctx.ui.setWidget` 作为 live 输出展示通道，避免 `custom_message` 污染主上下文 | 已验证-待接入 | 临时 Pi 已验证 widget display-only 可展示且未落 `custom_message`；临时 Minimax worker 证明旧 `/talk` 功能链路可跑但仍污染 session；Pi 上游交接文档已整理 | 实现 `talkLiveSink`，再做一轮 “widget live + 无 ox-talk-live custom_message” 回归 | `docs/pi-display-only-output-plan.md`, `docs/pi-custom-message-context-handoff.md`, OF-024 | 2026-07-04 |
+| P1 | Pi display-only 输出探针 | 评估 display-only 通道，避免 `custom_message` 污染主上下文 | 局部止血-待 widget 化 | 已默认关闭 `/talk` live custom_message，started/attached/finished 只保留短卡片；主 session 已手工备份并清理 43MB→0.7MB；真正 widget sink 后续继续做 | reload 后验证新 `/talk` 不再写 `ox-talk-live`；继续实现 `talkLiveSink` widget | `index.ts`, `docs/pi-display-only-output-plan.md`, `docs/pi-custom-message-context-handoff.md`, OF-024 | 2026-07-08 |
 | P1 | 内网 Codebase 分享 / 安装体验 | 朋友 clone 后知道放到哪里、怎么检查、怎么启动 Web、哪些运行数据不提交；不携带用户 token | 已确认 | 文档完成-已验证 | 跑 `install-check` + `verify`；后续开 remote 前人工看 staged diff | `README.md`, `INSTALL.md`, `.env.example`, `install-check.mjs`, OF-029 | 2026-07-06 |
+
+---
+
+
+## OF-034 回复质量 / 上下文观测
+
+模块整体状态：对齐度 `已确认`；完成度 `代码完成-待 reload 验证`；用例覆盖 `已有单测 + API smoke`；文档覆盖 `已在总账细化`；检查时间 `2026-07-07`。
+
+### 已确认需求
+
+1. 监控员工会话状态：上下文长度估算、压缩次数、会话轮次。
+2. 关联每个 turn 的用户输入长度、模型输出长度、总响应时间、工具调用次数和 token 元数据。
+3. 支持回溯历史：优先从现有 `jobs/*.json`、`events/*.jsonl`、`sessions/*.jsonl` 计算，不强依赖一直在线监控。
+4. 支持可选情绪评分旁路：默认关闭；主 agent 开启后，用固定模型对用户输入打 1~5 分，1=明显不满/上一轮可能差，3=中性，5=满意。
+5. 页面先挂在“压缩”页，和 Codex shadow 压缩对比一起观察上下文/质量变化。
+
+### 验收表
+
+| 分类 | 子项/用例 | 预期行为 | 对齐度 | 完成度 | 用例覆盖 | 证据 | 检查时间 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 数据层 | 回溯聚合 | 从 jobs/events/session 计算输入/输出/耗时/工具/上下文/压缩 | 已确认 | 代码完成 | 已有单测 | `quality report correlates...` | 2026-07-07 |
+| 数据层 | 情绪记录 | 开启后把评分 append 到 `.pi/workers/quality-emotion.jsonl`，不保存 API key | 已确认 | 代码完成 | 已有单测 | `quality emotion scorer...` | 2026-07-07 |
+| 工具 | `factory_quality_report` | 主 agent 可自然语言查看质量报告，支持 date/worker/limit/json | 已确认 | 代码完成 | 工具名校验 | `index.ts` | 2026-07-07 |
+| 工具 | `factory_quality_monitor_config` | 主 agent 可开启/关闭评分旁路并配置 provider/model/endpoint/env | 已确认 | 代码完成 | 已有单测 | `quality monitor config...` | 2026-07-07 |
+| 执行链路 | 异步评分 | 新 job 完成后 fire-and-forget 评分，不阻塞员工回复；失败只写状态事件 | 已确认 | 代码完成 | 源码校验 | `spawner.ts` | 2026-07-07 |
+| Web | 压缩页质量面板 | `/api/quality-metrics` 供 Web 展示 KPI、员工表、最近 turn 表 | 已确认 | 代码完成 | API smoke + node check | `web-server.mjs`, `web/app.js` | 2026-07-07 |
+| Web | 自定义散点字段/模型筛选 | `taskChars/summaryChars/elapsedSeconds/cachedInputTokens/model` 直接由 quality API 返回；模型下拉优先前端从 turn.model 计算，jobs 索引只兜底 | 已确认 | 代码完成-已验证 | 已有单测 + API smoke | `quality-metrics.mjs`, `web/app.js`, `quality report correlates...` | 2026-07-07 |
+
+
+### 2026-07-07 全历史回溯结果
+
+- 本机 `.pi/workers` 已实际跑过全历史回溯 smoke。
+- 扫描 job：770
+- 可用 turn：762
+- 丢弃 job：8
+  - `empty_output`: 6
+  - `non_terminal`: 2
+- 覆盖日期：2026-06-26 ~ 2026-07-07，共 9 天
+- Web API smoke：`/api/quality-metrics?date=all&limit=all` 返回 `turns=762`、`dates=9`。
+
+### 当前边界
+
+- 历史每 turn 上下文长度是“回放估算”：按员工 session JSONL 时间戳回放到 `job.createdAt`；旧记录如果缺时间戳，只能按可见记录估算。
+- 情绪分绑定“当前用户输入”，语义是用户对上一轮/当前状态的情绪反馈；不是模型自动质量真值。
+- 默认不开情绪评分；开启后需要 Pi 进程环境里存在 `apiKeyEnv`（默认 `DEEPSEEK_API_KEY`）。
+- 直接用 `factory_talk` 非后台且不写 job 的旧路径仍不能完整进入 turn 样本；`/talk`、`factory_command`、后台 talk、in-process queue 已走 job 口径。
 
 ---
 
@@ -121,6 +169,7 @@
 4. 展示短结果，不把完整输出灌回主 agent；完整记录通过 `/attach <jobId>` / `factory_attach` 查看。
 5. 已读状态独立 append-only 落盘，不改 job 原始 metadata / events，兼容旧 `jobs` 体系。
 6. 用户只是想“先看一眼、晚点再看”时，可用 `/pick --peek` 或 `/pick 员工名 --peek`，不标记已读。
+7. `/pick` 默认不仅展示结果，还应接入被 pick 员工的 talk；`--peek` 保持只看不接入。
 
 ### 验收表
 
@@ -130,7 +179,7 @@
 | 筛选 | 终态未读 | 只从终态 job 中挑选；已读 job 默认跳过 | 已确认 | 代码完成 | 已有单测 | `pickUnreadJob` | 2026-07-05 |
 | 展示 | 短结果 | Markdown 展示 worker/project/status/task/最近结果，并给出 `/attach <jobId>` | 已确认 | 代码完成 | 已有单测 | `formatPickedJob` | 2026-07-05 |
 | 工具 | `factory_pick` | 主 agent 可通过自然语言触发 pick，支持 worker/project/status/mode/markRead/limit | 已确认 | 代码完成 | 工具名校验 | `factory pick is exposed...` | 2026-07-05 |
-| 命令 | `/pick` | 用户可直接 `/pick` 或 `/pick 员工名`，默认随机并标记已读 | 已确认 | 代码完成 | 工具名校验 | `registerCommand("pick"` | 2026-07-05 |
+| 命令 | `/pick` | 用户可直接 `/pick` 或 `/pick 员工名`，默认随机、标记已读，并切换到被 pick 员工的 talk | 已确认 | 代码完成 | 已有单测 | `pick command attaches the picked worker to talk unless peeking` | 2026-07-07 |
 | 命令 | `/pick --peek` | 用户可预览一个未读结果但不写 `job_read`，之后仍会被 pick 到 | 已确认 | 代码完成 | 已有单测 + 工具名校验 | `parsePickCommandArgs supports peek...`, `--peek` | 2026-07-05 |
 
 ### 当前边界
@@ -254,6 +303,7 @@
 | 收件箱 | inbox | 员工可以查看发给自己的消息；广播消息对所有员工可见 | 已确认 | 代码完成 | 已有单测 | `listMessages`, `factory_inbox` | 2026-06-30 |
 | 收件箱 | 已读状态 | 标记已读通过 append `read` event，不改写历史消息 | 已确认 | 代码完成 | 已有单测 | `markMessageRead`, `factory_message_read` | 2026-06-30 |
 | 员工子进程 | CLI 通信入口 | 员工没有主工厂工具时，可通过 `comm-cli.mjs send/inbox/check` 走同一套授权规则 | 已确认 | 代码完成 | 已有单测 | `comm-cli.mjs`, `comm CLI lets authorized worker...` | 2026-06-30 |
+| 员工提示 | 工厂手册注入 | Pi/Codex 后端任务都会注入 `comm-cli.mjs check/send/inbox` 用法；Codex 还在 baseInstructions 和每个 turn 重复短手册，旧 thread 不 reset 也能学到 | 已确认 | 代码完成 | 已有单测 | `factory-handbook.mjs`, `buildCodexTaskContent`, `factory worker handbook...` | 2026-07-08 |
 | 派活权限 | work action 预留 | `work:request` / `work:assign` 只作为权限模型预留；当前不自动 dispatch/queue | 已确认 | 代码完成 | 不适用 | `comm.mjs` action list | 2026-06-30 |
 | 管理动作 | fire 权限 | `worker:fire` 纳入权限动作；`factory_fire` 默认以秘书执行，派派/管理层可显式作为 actor 执行，普通员工无授权会被拒绝 | 已确认 | 代码完成 | 已有单测 | `factory_fire`, `paipai is a builtin factory admin...` | 2026-07-05 |
 | 审批 | 未授权 fallback | 当前不做 approval 队列；没授权就是没权限 | 已确认 | 暂缓审批实现 | 不适用 | 本文已确认需求 | 2026-06-30 |
@@ -430,6 +480,7 @@ node .pi/extensions/ox-factory/codex-rollout-token-report.mjs --workers-dir .pi/
 | 报告入口 | 工具 + CLI | 用户可问“看看压缩对比”触发 `factory_compaction_report`；CLI 支持 Markdown / JSON，JSON 保留结构化原始字段 | 已确认 | 代码完成 | 已有单测 + CLI smoke | `compaction-report.mjs`, `factory_compaction_report` | 2026-07-02 |
 | 主 agent shadow | 默认只评估不采纳 | 无需环境变量即可识别 `~/.pi/agent/sessions/...` 主会话并触发 Codex shadow，记录 `targetType=main` / `worker=主agent`，Pi 摘要仍为真实结果 | 已确认 | 已验证（待真实样本） | 已有单测 + CLI smoke | `main agent shadow compaction is enabled by default...`; `compaction-report.mjs --target main` | 2026-07-02 |
 | 主 agent 防误用 | 拒绝 apply | 主 agent scope 下即使误配 `mode=apply`，默认也不调用 Codex、不返回 compaction，只通知应使用 shadow；除非未来显式危险开关 | 已确认 | 代码完成 | 已有单测 | `main agent compaction refuses apply mode...` | 2026-07-02 |
+| 员工压缩监控 | worker 默认 shadow | reload 后员工 session 触发压缩也默认进入 Codex shadow 对比；旧数据可按 compaction event 只读回溯补写，不改真实 session | 已确认 | 已验证 | 已有单测 + 真实回溯 smoke | `worker shadow compaction is enabled by default...`; `compaction-shadow.jsonl` 包包 2026-07-07 两条回溯 | 2026-07-08 |
 
 ### 当前入口
 
@@ -499,6 +550,8 @@ node .pi/extensions/ox-factory/compaction-report.mjs --workers-dir .pi/workers -
 | 安全边界 | 只读优先 | 第一版不直接派活、不改权限、不 apply 主 agent 压缩；高风险动作回到主 agent 确认 | 已确认方向 | 设计完成 | 待补 | `docs/ox-factory-web-visualization-plan.md` | 2026-07-02 |
 | 主 agent | 可视化主会话 | Web 压缩页能按 `target=main` 展示 Pi vs Codex shadow 对比 | 已确认方向 | 依赖 OF-021 已完成数据层 | 已有单测覆盖数据层 | `factory_compaction_report`, `compaction-report.mjs --target main` | 2026-07-02 |
 | 启动入口 | `/ox-web` | Pi 内一条指令检查/启动/打开 `127.0.0.1` 本地 dashboard；已运行则复用；支持 status/no-open/自定义端口 | 已确认 | 代码完成 | 静态单测 | `registerCommand("ox-web")`, `ensureOxWebDashboard` | 2026-07-06 |
+| 压缩页性能 | 先展示对比记录 | `/compactions` 页面不再等待质量指标全量扫描；压缩对比先渲染，质量观测异步加载，且 `/api/quality-metrics` 有 30 秒短缓存 | 已确认 | 已验证 | `npm run verify` + API smoke | `web/app.js`, `web-server.mjs`, `/api/quality-metrics` cache | 2026-07-08 |
+| Web 对话 | Codex 员工无本地 session | `/api/talk/:worker` 不能只看 `.pi/workers/sessions/<name>.jsonl`；Codex 员工应通过主 session registry 识别并提交 web-talk intent | 已确认 | 已验证 | `npm run verify` + API smoke | `web-server.mjs`, `web talk requests...`, `POST /api/talk/派派` 空消息返回 message 校验而非员工不存在 | 2026-07-08 |
 
 ### 下一步
 

@@ -746,7 +746,7 @@ export async function handleFactoryCompactionEvent(event, ctx, options = {}) {
   const target = resolveCompactionTarget(sessionFile, { ...options, scope: initialScope });
   const scope = configuredScope || (target.targetType === "main" ? "main" : "workers");
   const targetInScope = targetMatchesScope(target, scope);
-  const mode = (!modeSetting.explicit && target.targetType === "main" && targetInScope)
+  const mode = (!modeSetting.explicit && targetInScope && (target.targetType === "main" || target.targetType === "worker"))
     ? "shadow"
     : modeSetting.mode;
   if (mode === "off") return undefined;

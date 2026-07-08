@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { createWriteStream, mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { buildFactoryWorkerHandbook } from "./factory-handbook.mjs";
 
 export const DEFAULT_CODEX_SERVER_URL = "ws://127.0.0.1:48177";
 
@@ -271,12 +272,14 @@ export function codexNotificationToStreamEvents(message) {
   }
 }
 
-export function buildCodexBaseInstructions(worker, agentDef = "") {
+export function buildCodexBaseInstructions(worker, agentDef = "", { workersDir } = {}) {
   const handoff = typeof worker.codexThreadHandoff === "string" ? worker.codexThreadHandoff.trim() : "";
   return [
     `你的名字叫 **${worker.id}**，职位是 ${worker.role}。`,
     "",
     "你是牛马工厂里的 Codex 员工。保持这个身份和长期上下文，不要因为新的 turn 忘记之前的工作。",
+    "",
+    buildFactoryWorkerHandbook(worker, { workersDir, backend: "codex" }),
     handoff ? `\n## 旧 Codex thread handoff\n\n${handoff}` : "",
     agentDef.trim() ? `\n${agentDef.trim()}` : "",
   ].join("\n").trim();
@@ -435,22 +438,23 @@ function approvalPolicy(worker) {
   return worker.codexApprovalPolicy || process.env.OX_CODEX_APPROVAL_POLICY || "never";
 }
 
-function taskContent({ worker, task, project, additionalContext }) {
+export function buildCodexTaskContent({ worker, task, project, additionalContext, workersDir }) {
   const lines = [`你的名字叫 **${worker.id}**，职位是 ${worker.role}。`, ""];
   if (project) lines.push(`## 项目: ${project}`, "");
   lines.push("## 任务", task);
   if (additionalContext) lines.push("", "## 附加上下文", additionalContext);
+  lines.push("", buildFactoryWorkerHandbook(worker, { workersDir, backend: "codex" }));
   return lines.join("\n");
 }
 
-async function startThread(client, { worker, cwd, agentDef, ephemeral = false }) {
+async function startThread(client, { worker, cwd, agentDef, workersDir, ephemeral = false }) {
   const model = normalizeCodexModel(worker.model);
   return client.request("thread/start", {
     cwd: cwd || process.cwd(),
     approvalPolicy: approvalPolicy(worker),
     sandbox: sandboxMode(worker),
     model: model || null,
-    baseInstructions: buildCodexBaseInstructions(worker, agentDef),
+    baseInstructions: buildCodexBaseInstructions(worker, agentDef, { workersDir }),
     ephemeral,
   });
 }
@@ -469,7 +473,7 @@ export async function createCodexWorkerThread({ worker, cwd, agentDef, workersDi
   try {
     await client.connect();
     await client.initialize();
-    const start = await startThread(client, { worker, cwd, agentDef, ephemeral: false });
+    const start = await startThread(client, { worker, cwd, agentDef, workersDir, ephemeral: false });
     return {
       threadId: start.thread.id,
       serverUrl: url,
@@ -498,12 +502,12 @@ async function ensureThread(client, { worker, cwd, agentDef, workersDir, onWorke
         approvalPolicy: approvalPolicy(worker),
         sandbox: sandboxMode(worker),
         model: model || null,
-        baseInstructions: buildCodexBaseInstructions(worker, agentDef),
+        baseInstructions: buildCodexBaseInstructions(worker, agentDef, { workersDir }),
       });
       return resume.thread.id;
     } catch (error) {
       if (!shouldReplaceCodexThread(error)) throw error;
-      const created = await startThread(client, { worker, cwd, agentDef, ephemeral: false });
+      const created = await startThread(client, { worker, cwd, agentDef, workersDir, ephemeral: false });
       const threadId = created.thread.id;
       worker.codexThreadId = threadId;
       worker.codexServerUrl = url;
@@ -513,7 +517,7 @@ async function ensureThread(client, { worker, cwd, agentDef, workersDir, onWorke
     }
   }
 
-  const created = await startThread(client, { worker, cwd, agentDef, ephemeral: false });
+  const created = await startThread(client, { worker, cwd, agentDef, workersDir, ephemeral: false });
   const threadId = created.thread.id;
   worker.codexThreadId = threadId;
   worker.codexServerUrl = url;
@@ -600,7 +604,7 @@ export async function runCodexWorkerStreaming(options, onEvent) {
 
     const start = await client.request("turn/start", {
       threadId,
-      input: [{ type: "text", text: taskContent({ worker, task, project, additionalContext }), text_elements: [] }],
+      input: [{ type: "text", text: buildCodexTaskContent({ worker, task, project, additionalContext, workersDir }), text_elements: [] }],
       cwd: cwd || process.cwd(),
       model: model || null,
       effort: normalizeCodexEffort(worker.thinking),

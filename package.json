@@ -6,7 +6,7 @@
   "description": "牛马工厂 Pi extension: worker orchestration, reporting, project tracking, and local dashboard.",
   "scripts": {
     "install-check": "node install-check.mjs",
-    "check": "node --check projects.mjs && node --check web-server.mjs && node --check web/app.js && node --check install-check.mjs && bash -n scripts/install.sh && node validate-tools.mjs",
+    "check": "node --check projects.mjs && node --check factory-handbook.mjs && node --check codex-backend.mjs && node --check web-server.mjs && node --check web/app.js && node --check install-check.mjs && bash -n scripts/install.sh && node validate-tools.mjs",
     "test": "node --test test/ox-factory.test.mjs",
     "verify": "npm run check && npm test"
   }
