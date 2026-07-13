@@ -24,3 +24,16 @@ workers/
 .last-output-*.json
 *.bak
 *.tmp
+
+# Local/internal factory notes kept outside the public source tree
+# These files may contain worker names, internal rollout notes, handoff reports,
+# or private operating history. Keep them locally, but do not publish them.
+docs/local/
+docs/internal/
+docs/plans/
+docs/superpowers/
+docs/ox-factory-*.md
+docs/pi-*-handoff.md
+docs/worker-compaction-monitoring-report.md
+docs/ox-projects/ox-factory-*.md
+docs/pi-display-only-output-plan.md

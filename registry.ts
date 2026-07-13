@@ -62,6 +62,15 @@ export interface HireOptions {
   codexServerUrl?: string;
   codexApprovalPolicy?: Worker["codexApprovalPolicy"];
   codexSandbox?: Worker["codexSandbox"];
+  claudeSessionId?: string;
+  claudeSessionInitialized?: boolean;
+  claudeCwd?: string;
+  claudeCommand?: string;
+  claudePermissionMode?: Worker["claudePermissionMode"];
+  claudeTools?: string;
+  claudeAllowedTools?: string[] | string;
+  claudeDisallowedTools?: string[] | string;
+  claudeBare?: boolean;
 }
 
 export function hire(name: string, role: WorkerRole, model?: string, thinking?: string, options: HireOptions = {}): Worker {
@@ -73,6 +82,7 @@ export function hire(name: string, role: WorkerRole, model?: string, thinking?: 
     sessionFile: workerSessionFile(name),
     role,
     backend: options.backend ?? "pi",
+    avatar: undefined,
     model,
     thinking: thinking as Worker["thinking"],
     codexThreadId: options.codexThreadId,
@@ -80,6 +90,15 @@ export function hire(name: string, role: WorkerRole, model?: string, thinking?: 
     codexApprovalPolicy: options.codexApprovalPolicy,
     codexSandbox: options.codexSandbox,
     codexThreadHandoff: undefined,
+    claudeSessionId: options.claudeSessionId,
+    claudeSessionInitialized: options.claudeSessionInitialized,
+    claudeCwd: options.claudeCwd,
+    claudeCommand: options.claudeCommand,
+    claudePermissionMode: options.claudePermissionMode,
+    claudeTools: options.claudeTools,
+    claudeAllowedTools: options.claudeAllowedTools,
+    claudeDisallowedTools: options.claudeDisallowedTools,
+    claudeBare: options.claudeBare,
     status: "idle",
     hired: new Date().toISOString().slice(0, 10),
     projects: [],
@@ -104,6 +123,15 @@ export function hire(name: string, role: WorkerRole, model?: string, thinking?: 
     codexApprovalPolicy: w.codexApprovalPolicy,
     codexSandbox: w.codexSandbox,
     codexThreadHandoff: w.codexThreadHandoff,
+    claudeSessionId: w.claudeSessionId,
+    claudeSessionInitialized: w.claudeSessionInitialized,
+    claudeCwd: w.claudeCwd,
+    claudeCommand: w.claudeCommand,
+    claudePermissionMode: w.claudePermissionMode,
+    claudeTools: w.claudeTools,
+    claudeAllowedTools: w.claudeAllowedTools,
+    claudeDisallowedTools: w.claudeDisallowedTools,
+    claudeBare: w.claudeBare,
     hired: w.hired,
     sessionFile: w.sessionFile,
   });
@@ -117,6 +145,7 @@ export function updateWorkerConfig(workerId: string, patch: Partial<Worker>) {
 
   const allowedKeys = [
     "backend",
+    "avatar",
     "model",
     "thinking",
     "codexThreadId",
@@ -124,6 +153,15 @@ export function updateWorkerConfig(workerId: string, patch: Partial<Worker>) {
     "codexApprovalPolicy",
     "codexSandbox",
     "codexThreadHandoff",
+    "claudeSessionId",
+    "claudeSessionInitialized",
+    "claudeCwd",
+    "claudeCommand",
+    "claudePermissionMode",
+    "claudeTools",
+    "claudeAllowedTools",
+    "claudeDisallowedTools",
+    "claudeBare",
   ] as const;
 
   const entry: Record<string, unknown> = { workerId };
@@ -353,6 +391,18 @@ function workerStatusIcon(w: Worker): string {
   return "😴 空闲";
 }
 
+function backendLabel(backend?: WorkerBackend): string {
+  if (backend === "codex") return "Codex";
+  if (backend === "claude") return "Claude";
+  return "Pi";
+}
+
+function backendProfileLabel(backend?: WorkerBackend): string {
+  if (backend === "codex") return "Codex app-server";
+  if (backend === "claude") return "Claude Code CLI";
+  return "Pi CLI";
+}
+
 export function listWorkers(): string {
   const all = [...workers.values()];
   if (all.length === 0) return "🏭 工厂暂无员工。";
@@ -363,7 +413,7 @@ export function listWorkers(): string {
     lines.push(`### ${w.id}`);
     lines.push(`| 职位 | 入职 | 状态 | 配置 |`);
     lines.push(`|------|------|------|------|`);
-    const backend = (w.backend ?? "pi") === "codex" ? "Codex" : "Pi";
+    const backend = backendLabel(w.backend ?? "pi");
     const cfg = [backend, w.model, w.thinking ? `思考 ${w.thinking}` : ""].filter(Boolean).join(" · ") || "默认";
     const history = w.promotions.length > 0 ? w.promotions.map((p) => `${p.from}→${p.to}`).join(", ") : "—";
     lines.push(`| ${w.role} | ${w.hired} | ${statusIcon} | ${cfg} |`);
@@ -397,7 +447,7 @@ export function formatWorkerProfile(w: Worker): string {
   lines.push(`| 职位 | 入职 | 状态 | 模型 | 思考 |`);
   lines.push(`|------|------|------|------|------|`);
   lines.push(`| ${w.role} | ${w.hired} | ${statusIcon} | ${w.model || "默认"} | ${w.thinking || "默认"} |`);
-  lines.push(`\n**后端**：${(w.backend ?? "pi") === "codex" ? "Codex app-server" : "Pi CLI"}`);
+  lines.push(`\n**后端**：${backendProfileLabel(w.backend ?? "pi")}`);
   const responsibilitySummary = summarizeResponsibilities(w.responsibilities || []);
   if (responsibilitySummary) {
     lines.push("");
@@ -405,6 +455,7 @@ export function formatWorkerProfile(w: Worker): string {
     for (const item of responsibilitySummary.split("\n")) lines.push(`- ${item}`);
   }
   if (w.codexThreadId) lines.push(`\n**Codex Thread**：${w.codexThreadId}`);
+  if (w.claudeSessionId) lines.push(`\n**Claude Session**：${w.claudeSessionId}`);
   if (w.promotions.length > 0) {
     lines.push("");
     lines.push(`**角色变动**：${w.promotions.map((p) => `${p.from} → ${p.to} (${p.date})`).join(" · ")}`);
@@ -450,6 +501,15 @@ export function restoreFromEntries(entries: any[]) {
           codexApprovalPolicy: d.codexApprovalPolicy,
           codexSandbox: d.codexSandbox,
           codexThreadHandoff: d.codexThreadHandoff,
+          claudeSessionId: d.claudeSessionId,
+          claudeSessionInitialized: d.claudeSessionInitialized,
+          claudeCwd: d.claudeCwd,
+          claudeCommand: d.claudeCommand,
+          claudePermissionMode: d.claudePermissionMode,
+          claudeTools: d.claudeTools,
+          claudeAllowedTools: d.claudeAllowedTools,
+          claudeDisallowedTools: d.claudeDisallowedTools,
+          claudeBare: d.claudeBare,
           status: (d.status as WorkerStatus) || "idle",
           hired: d.hired,
     projects: [],
@@ -518,6 +578,15 @@ export function restoreFromEntries(entries: any[]) {
           if ("codexApprovalPolicy" in entry.data) w.codexApprovalPolicy = entry.data.codexApprovalPolicy;
           if ("codexSandbox" in entry.data) w.codexSandbox = entry.data.codexSandbox;
           if ("codexThreadHandoff" in entry.data) w.codexThreadHandoff = entry.data.codexThreadHandoff;
+          if ("claudeSessionId" in entry.data) w.claudeSessionId = entry.data.claudeSessionId;
+          if ("claudeSessionInitialized" in entry.data) w.claudeSessionInitialized = entry.data.claudeSessionInitialized;
+          if ("claudeCwd" in entry.data) w.claudeCwd = entry.data.claudeCwd;
+          if ("claudeCommand" in entry.data) w.claudeCommand = entry.data.claudeCommand;
+          if ("claudePermissionMode" in entry.data) w.claudePermissionMode = entry.data.claudePermissionMode;
+          if ("claudeTools" in entry.data) w.claudeTools = entry.data.claudeTools;
+          if ("claudeAllowedTools" in entry.data) w.claudeAllowedTools = entry.data.claudeAllowedTools;
+          if ("claudeDisallowedTools" in entry.data) w.claudeDisallowedTools = entry.data.claudeDisallowedTools;
+          if ("claudeBare" in entry.data) w.claudeBare = entry.data.claudeBare;
         }
         break;
       }

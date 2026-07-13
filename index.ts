@@ -34,7 +34,8 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { request as httpRequest } from "node:http";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -74,7 +75,7 @@ import {
   type SpawnResult,
   type StreamEvent,
 } from "./spawner.ts";
-import { createCodexWorkerThread, normalizeCodexModel } from "./codex-backend.mjs";
+import { assertWorkerThinkingSupported, createCodexWorkerThread, normalizeCodexModel } from "./codex-backend.mjs";
 import {
   appendJobEvent,
   createJob,
@@ -110,11 +111,13 @@ import {
   formatPermissions,
   grantPermission,
   hasPermission,
+  isFactoryAdmin,
   listMessages,
   listPermissions,
   markMessageRead,
   revokePermission,
   sendAuthorizedMessage,
+  sendTaskResultMessage,
 } from "./comm.mjs";
 import { formatResponsibilitiesMarkdown } from "./responsibilities.mjs";
 import {
@@ -130,9 +133,47 @@ import {
 } from "./projects.mjs";
 import {
   acceptWebTalkRequest,
+  acceptWebTalkJobControlRequest,
+  claimWebTalkRequest,
   failWebTalkRequest,
+  failWebTalkJobControlRequest,
   listPendingWebTalkRequests,
+  listPendingWebTalkJobControlRequests,
 } from "./web-talk.mjs";
+import {
+  acceptMainAgentTalkRequest,
+  claimMainAgentTalkRequest,
+  failMainAgentTalkRequest,
+  listPendingMainAgentTalkRequests,
+} from "./main-agent-talk.mjs";
+import {
+  acceptWorkerTaskRequest,
+  claimWorkerTaskRequest,
+  createWorkerTaskRequest,
+  failWorkerTaskRequest,
+  getWorkerTaskRequest,
+  listPendingWorkerTaskRequests,
+  listWorkerTaskRequests,
+  reportWorkerTaskResult,
+  recoverStaleWorkerTaskRequests,
+} from "./task-requests.mjs";
+import {
+  formatOutsourceProfiles,
+  formatOutsourceRuns,
+  getOutsourceProfile,
+  getOutsourceRun,
+  listOutsourceProfiles,
+  listOutsourceRuns,
+  upsertOutsourceProfile,
+  waitForOutsourceRuns,
+} from "./outsource-agents.mjs";
+import {
+  normalizeOutsourceWait,
+  renderOutsourceResult,
+  renderOutsourceWaitResult,
+  startOutsourceRunJob,
+} from "./outsource-dispatcher.mjs";
+import { getWorkerRegistrySnapshot } from "./worker-registry-snapshot.mjs";
 
 // ─── Role Schema ────────────────────────────────────────
 
@@ -195,16 +236,100 @@ function spawnSucceeded(r: SpawnResult): boolean {
   return r.exitCode === 0 && !["error", "aborted"].includes(r.stopReason ?? "");
 }
 
+function backendDisplayName(backend: string | undefined): string {
+  if (backend === "codex") return "Codex app-server";
+  if (backend === "claude") return "Claude Code CLI";
+  return "Pi CLI";
+}
+
 function workerUnavailableReason(w: Worker | undefined, name: string): string {
   if (!w) return `员工 "${name}" 不存在`;
   if (w.status === "fired") return `员工 "${name}" 已离职`;
   if (w.status === "vacation") return `员工 "${name}" 正在休假，不接新任务`;
+  if ((w.backend ?? "pi") === "codex" && !String(w.codexThreadId || "").trim()) {
+    return `员工 "${name}" 缺少 Codex thread 绑定；为避免新开空白 thread，已拒绝派活。请先修复 codexThreadId。`;
+  }
+  if ((w.backend ?? "pi") === "claude" && !String(w.claudeSessionId || "").trim()) {
+    return `员工 "${name}" 缺少 Claude session 绑定；为避免新开空白 session，已拒绝派活。请先修复 claudeSessionId。`;
+  }
   return "";
 }
 
 function workerCanAcceptWork(w: Worker | undefined, name: string): { ok: boolean; reason?: string } {
   const reason = workerUnavailableReason(w, name);
   return reason ? { ok: false, reason } : { ok: true };
+}
+
+function recoverWorkerFromRegistrySnapshot(workerId: string): Worker | undefined {
+  const name = String(workerId || "").trim();
+  if (!name) return undefined;
+  const snapshot = getWorkerRegistrySnapshot(getWorkersDir()).get(name);
+  const existing = workers.get(name);
+  if (!snapshot) return existing;
+  if (existing) {
+    const fields = [
+      "backend",
+      "model",
+      "thinking",
+      "codexThreadId",
+      "codexServerUrl",
+      "codexApprovalPolicy",
+      "codexSandbox",
+      "codexThreadHandoff",
+      "claudeSessionId",
+      "claudeSessionInitialized",
+      "claudeCwd",
+      "claudeCommand",
+      "claudePermissionMode",
+      "claudeTools",
+      "claudeAllowedTools",
+      "claudeDisallowedTools",
+      "claudeBare",
+      "sessionFile",
+    ] as const;
+    for (const field of fields) {
+      if (field in snapshot && (snapshot as any)[field] !== undefined) {
+        (existing as any)[field] = (snapshot as any)[field];
+      }
+    }
+    if (snapshot.role) existing.role = snapshot.role as WorkerRole;
+    if (snapshot.status === "fired" || snapshot.status === "vacation") {
+      existing.status = snapshot.status;
+    } else if (existing.status !== "working" && snapshot.status) {
+      existing.status = snapshot.status;
+    }
+    return existing;
+  }
+  const backend = snapshot.backend ?? "pi";
+  const worker: Worker = {
+    id: name,
+    sessionFile: snapshot.sessionFile || path.join(getWorkersDir(), "sessions", `${name}.jsonl`),
+    role: (snapshot.role || "programmer") as WorkerRole,
+    backend,
+    model: backend === "codex" ? normalizeCodexModel(snapshot.model) : snapshot.model,
+    thinking: snapshot.thinking,
+    codexThreadId: snapshot.codexThreadId,
+    codexServerUrl: snapshot.codexServerUrl,
+    codexApprovalPolicy: snapshot.codexApprovalPolicy,
+    codexSandbox: snapshot.codexSandbox,
+    codexThreadHandoff: snapshot.codexThreadHandoff,
+    claudeSessionId: snapshot.claudeSessionId,
+    claudeSessionInitialized: snapshot.claudeSessionInitialized,
+    claudeCwd: snapshot.claudeCwd,
+    claudeCommand: snapshot.claudeCommand,
+    claudePermissionMode: snapshot.claudePermissionMode,
+    claudeTools: snapshot.claudeTools,
+    claudeAllowedTools: snapshot.claudeAllowedTools,
+    claudeDisallowedTools: snapshot.claudeDisallowedTools,
+    claudeBare: snapshot.claudeBare,
+    status: snapshot.status || "idle",
+    hired: snapshot.hired || new Date().toISOString().slice(0, 10),
+    projects: [],
+    promotions: [],
+    responsibilities: [],
+  };
+  workers.set(name, worker);
+  return worker;
 }
 
 function setWorkerIdleIfStillWorking(w: Worker) {
@@ -279,29 +404,56 @@ function parseOxWebArgs(raw: string = "") {
   return options;
 }
 
-async function isOxWebDashboardHealthy(url: string): Promise<boolean> {
+async function httpGetText(url: string, timeout = 800): Promise<{ statusCode: number; body: string }> {
   return new Promise((resolve) => {
     let settled = false;
-    const finish = (value: boolean) => {
+    const finish = (value: { statusCode: number; body: string }) => {
       if (settled) return;
       settled = true;
       resolve(value);
     };
-    const req = httpRequest(`${url}/api/health`, { timeout: 800 }, (res) => {
+    const req = httpRequest(url, { timeout }, (res) => {
       let body = "";
       res.setEncoding("utf8");
       res.on("data", (chunk) => { body += chunk; });
       res.on("end", () => {
-        finish(res.statusCode === 200 && body.includes("ox-factory-web-dashboard"));
+        finish({ statusCode: res.statusCode || 0, body });
       });
     });
-    req.on("error", () => finish(false));
+    req.on("error", () => finish({ statusCode: 0, body: "" }));
     req.on("timeout", () => {
       req.destroy();
-      finish(false);
+      finish({ statusCode: 0, body: "" });
     });
     req.end();
   });
+}
+
+async function checkOxWebDashboard(url: string): Promise<{ baseHealthy: boolean; requiredApisHealthy: boolean; healthy: boolean; detail: string }> {
+  const health = await httpGetText(`${url}/api/health`);
+  const baseHealthy = health.statusCode === 200 && health.body.includes("ox-factory-web-dashboard");
+  if (!baseHealthy) {
+    return { baseHealthy: false, requiredApisHealthy: false, healthy: false, detail: "health endpoint is not ox-factory" };
+  }
+  let featureAdvertised = false;
+  try {
+    const parsed = JSON.parse(health.body);
+    featureAdvertised = Boolean(parsed?.features?.taskRequests);
+  } catch {
+    featureAdvertised = false;
+  }
+  const taskRequests = await httpGetText(`${url}/api/task-requests?limit=1`);
+  const requiredApisHealthy = featureAdvertised || taskRequests.statusCode === 200;
+  return {
+    baseHealthy,
+    requiredApisHealthy,
+    healthy: baseHealthy && requiredApisHealthy,
+    detail: requiredApisHealthy ? "ok" : "missing required /api/task-requests; web server process is stale",
+  };
+}
+
+async function isOxWebDashboardHealthy(url: string): Promise<boolean> {
+  return (await checkOxWebDashboard(url)).healthy;
 }
 
 async function waitForOxWebDashboard(url: string, timeoutMs = 5000) {
@@ -324,11 +476,62 @@ function openExternalUrl(url: string) {
   child.unref();
 }
 
+function listeningPidForPort(port: number): number | null {
+  if (process.platform === "win32") return null;
+  try {
+    const output = execFileSync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-Fp"], {
+      encoding: "utf8",
+      timeout: 1200,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const match = output.match(/^p(\d+)/m);
+    if (!match) return null;
+    const pid = Number(match[1]);
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+async function waitForPortToClose(port: number, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!listeningPidForPort(port)) return true;
+    await sleep(150);
+  }
+  return !listeningPidForPort(port);
+}
+
+async function stopOxWebDashboardOnPort(port: number): Promise<boolean> {
+  const pid = listeningPidForPort(port);
+  if (!pid || pid === process.pid) return false;
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch {
+    return false;
+  }
+  if (await waitForPortToClose(port)) return true;
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+    return false;
+  }
+  return await waitForPortToClose(port, 1500);
+}
+
 async function ensureOxWebDashboard(port: number) {
   const url = `http://127.0.0.1:${port}`;
   const logPath = path.join(getWorkersDir(), `web-server-${port}.log`);
-  if (await isOxWebDashboardHealthy(url)) {
+  const current = await checkOxWebDashboard(url);
+  if (current.healthy) {
     return { url, status: "running", logPath };
+  }
+  let staleRestarted = false;
+  if (current.baseHealthy && !current.requiredApisHealthy) {
+    staleRestarted = await stopOxWebDashboardOnPort(port);
+    if (!staleRestarted) {
+      throw new Error(`检测到旧版牛马工厂 Web 服务占用 ${url}，但无法自动停止。请手动结束该端口上的 web-server 进程后重试 /ox-web。`);
+    }
   }
 
   const webServerPath = path.resolve(getWorkersDir(), "..", "extensions", "ox-factory", "web-server.mjs");
@@ -359,7 +562,7 @@ async function ensureOxWebDashboard(port: number) {
   oxWebServerProcess.unref();
 
   const healthy = await waitForOxWebDashboard(url);
-  return { url, status: healthy ? "started" : "starting", logPath };
+  return { url, status: healthy ? (staleRestarted ? "restarted" : "started") : "starting", logPath };
 }
 
 function clampNumber(value: unknown, fallback: number, min: number, max: number): number {
@@ -430,6 +633,30 @@ function markJobAborted(job: any, reason: string, actor = "用户") {
   return updated;
 }
 
+function pruneTerminalRunningJob(workerId: string, reason: string): any | null {
+  const running = workerRunningJobs.get(workerId);
+  if (!running) return null;
+  let current: any;
+  try {
+    current = readJob(running);
+  } catch {
+    return null;
+  }
+  if (!isTerminalJob(current)) return null;
+  workerRunningJobs.delete(workerId);
+  workerJobControllers.delete(running.id);
+  appendJobEvent(current, {
+    type: "running_handle_pruned",
+    text: reason,
+    originalJobId: running.id,
+    terminalStatus: current.status,
+  });
+  const worker = workers.get(workerId);
+  const queue = workerJobQueues.get(workerId) ?? [];
+  if (worker && queue.length === 0) setWorkerIdleIfStillWorking(worker);
+  return current;
+}
+
 function jobIdMatches(job: any, jobIdOrPrefix: string) {
   const needle = String(jobIdOrPrefix || "").trim();
   return needle && (job.id === needle || String(job.id || "").startsWith(needle));
@@ -444,6 +671,17 @@ function cancelWorkerJob(input: { jobId?: string; worker?: string; reason?: stri
   for (const [workerId, job] of workerRunningJobs.entries()) {
     if (workerFilter && workerId !== workerFilter) continue;
     if (jobId && !jobIdMatches(job, jobId)) continue;
+    const alreadyTerminal = pruneTerminalRunningJob(workerId, "cancel requested for a job that is already terminal on disk");
+    if (alreadyTerminal) {
+      refreshWorkerQueuePositions(workerId);
+      setTimeout(() => void drainWorkerJobQueue(workerId), 0);
+      return {
+        status: "cleared-terminal-handle",
+        worker: workerId,
+        job: alreadyTerminal,
+        message: "已清理当前 Pi 进程里的幽灵 running handle；该 job 在磁盘上已经是终态，等待队列会继续流转",
+      };
+    }
     const controller = workerJobControllers.get(job.id);
     const aborted = markJobAborted(job, reason, actor);
     controller?.abort();
@@ -487,7 +725,66 @@ function cancelWorkerJob(input: { jobId?: string; worker?: string; reason?: stri
   };
 }
 
+function editQueuedWorkerJob(input: { jobId?: string; worker?: string; task?: string; actor?: string } = {}) {
+  const actor = input.actor || "用户";
+  const workerFilter = input.worker || "";
+  const jobId = input.jobId || "";
+  const task = String(input.task || "").trim();
+  if (!task) return { status: "invalid", message: "编辑后的任务内容为空" };
+
+  for (const [workerId, queue] of workerJobQueues.entries()) {
+    if (workerFilter && workerId !== workerFilter) continue;
+    const item = queue.find((candidate) => !jobId || jobIdMatches(candidate.job, jobId));
+    if (!item) continue;
+    item.options.task = task;
+    const updated = updateJob(item.job, {
+      task,
+      editedAt: new Date().toISOString(),
+      editedBy: actor,
+    });
+    appendJobEvent(updated, {
+      type: "edited",
+      text: task,
+      actor,
+      message: "queued job task edited before execution",
+    });
+    return {
+      status: "edited",
+      worker: workerId,
+      job: updated,
+      message: "已更新 Pi 主进程内存队列中的 job 内容",
+    };
+  }
+
+  const running = [...workerRunningJobs.entries()].find(([workerId, job]) => {
+    if (workerFilter && workerId !== workerFilter) return false;
+    if (jobId && !jobIdMatches(job, jobId)) return false;
+    return true;
+  });
+  if (running) {
+    return {
+      status: "running-not-editable",
+      worker: running[0],
+      job: running[1],
+      message: "job 已经运行，不能安全改写；请改用 steer 追加新指令或取消后重发",
+    };
+  }
+
+  const openJobs = listJobs(getWorkersDir(), { worker: workerFilter || undefined, limit: 500 })
+    .filter((job: any) => !isTerminalJob(job))
+    .sort((a: any, b: any) => String(b.updatedAt || b.createdAt || "").localeCompare(String(a.updatedAt || a.createdAt || "")));
+  const job = jobId ? openJobs.find((candidate: any) => jobIdMatches(candidate, jobId)) : openJobs[0];
+  if (!job) return { status: "not-found", message: "没有找到可编辑的未完成 job" };
+  return {
+    status: "not-editable-no-handle",
+    worker: job.worker,
+    job,
+    message: "找到了未完成 job，但它不在当前 Pi 主进程内存队列中；为避免执行内容和元数据不一致，未改写",
+  };
+}
+
 function refreshWorkerQueuePositions(workerId: string) {
+  pruneTerminalRunningJob(workerId, "queue position refresh observed a terminal running job on disk");
   const queue = workerJobQueues.get(workerId) ?? [];
   const running = workerRunningJobs.get(workerId);
   let previousId = running?.id || "";
@@ -501,7 +798,10 @@ function refreshWorkerQueuePositions(workerId: string) {
 }
 
 async function drainWorkerJobQueue(workerId: string) {
-  if (workerRunningJobs.has(workerId)) return;
+  if (workerRunningJobs.has(workerId)) {
+    const pruned = pruneTerminalRunningJob(workerId, "queue drain observed a terminal running job on disk");
+    if (!pruned) return;
+  }
   const queue = workerJobQueues.get(workerId);
   const item = queue?.shift();
   if (!item) return;
@@ -579,12 +879,21 @@ export default function (pi: ExtensionAPI) {
   let lastSessionCtx: any = null;
   let webTalkPoller: ReturnType<typeof setInterval> | null = null;
   let webTalkDraining = false;
+  let webTalkControlDraining = false;
+  let mainAgentTalkPoller: ReturnType<typeof setInterval> | null = null;
+  let mainAgentTalkDraining = false;
+  let workerTaskPoller: ReturnType<typeof setInterval> | null = null;
+  let workerTaskDraining = false;
+  let talkTarget: string | null = null;
+  let activeTalkJobId: string | null = null;
+  let mainAgentActive = false;
 
   function ensureWebTalkPoller(ctx?: any) {
     if (ctx) lastSessionCtx = ctx;
     if (webTalkPoller) return;
     webTalkPoller = setInterval(() => {
       void drainWebTalkRequests(lastSessionCtx);
+      void drainWebTalkJobControls(lastSessionCtx);
     }, 1000);
     (webTalkPoller as any).unref?.();
   }
@@ -596,9 +905,14 @@ export default function (pi: ExtensionAPI) {
       const pending = listPendingWebTalkRequests(getWorkersDir(), { limit: 20 });
       for (const request of pending) {
         try {
+          const claimed = claimWebTalkRequest(getWorkersDir(), {
+            requestId: request.id,
+            claimedBy: `pi:${process.pid}`,
+          });
+          if (!claimed) continue;
           const workerId = String(request.worker || "").trim();
           const message = String(request.message || "").trim();
-          const w = workers.get(workerId);
+          const w = recoverWorkerFromRegistrySnapshot(workerId);
           const availability = workerCanAcceptWork(w, workerId);
           if (!availability.ok) {
             failWebTalkRequest(getWorkersDir(), {
@@ -615,7 +929,8 @@ export default function (pi: ExtensionAPI) {
             continue;
           }
 
-          const job = startTalkMessage(w!, message, ctx, undefined, { attach: false, notify: false });
+          const requestedMode = request.mode === "queue" || request.mode === "steer" ? request.mode : undefined;
+          const job = startTalkMessage(w!, message, ctx, requestedMode, { attach: false, notify: false });
           if (!job) {
             failWebTalkRequest(getWorkersDir(), {
               requestId: request.id,
@@ -641,6 +956,228 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  async function drainWebTalkJobControls(_ctx?: any) {
+    if (!initialized || webTalkControlDraining) return;
+    webTalkControlDraining = true;
+    try {
+      const pending = listPendingWebTalkJobControlRequests(getWorkersDir(), { limit: 20 });
+      for (const request of pending) {
+        try {
+          if (request.action === "cancel") {
+            const result = cancelWorkerJob({
+              jobId: request.jobId || undefined,
+              worker: request.worker || undefined,
+              actor: request.from || "web",
+              reason: request.reason || "用户通过 Web 取消 job",
+            });
+            if (result.status === "not-found") {
+              failWebTalkJobControlRequest(getWorkersDir(), {
+                requestId: request.id,
+                error: result.message,
+              });
+            } else {
+              acceptWebTalkJobControlRequest(getWorkersDir(), {
+                requestId: request.id,
+                status: result.status,
+                message: result.message,
+              });
+            }
+            continue;
+          }
+
+          if (request.action === "edit") {
+            const result = editQueuedWorkerJob({
+              jobId: request.jobId || undefined,
+              worker: request.worker || undefined,
+              task: request.message || "",
+              actor: request.from || "web",
+            });
+            if (result.status !== "edited") {
+              failWebTalkJobControlRequest(getWorkersDir(), {
+                requestId: request.id,
+                error: result.message,
+              });
+            } else {
+              acceptWebTalkJobControlRequest(getWorkersDir(), {
+                requestId: request.id,
+                status: result.status,
+                message: result.message,
+              });
+            }
+            continue;
+          }
+
+          failWebTalkJobControlRequest(getWorkersDir(), {
+            requestId: request.id,
+            error: `不支持的 web job control action: ${request.action}`,
+          });
+        } catch (error: any) {
+          failWebTalkJobControlRequest(getWorkersDir(), {
+            requestId: request.id,
+            error: error?.message || String(error),
+          });
+        }
+      }
+    } finally {
+      webTalkControlDraining = false;
+    }
+  }
+
+  function ensureMainAgentTalkPoller(ctx?: any) {
+    if (ctx) lastSessionCtx = ctx;
+    if (mainAgentTalkPoller) return;
+    mainAgentTalkPoller = setInterval(() => {
+      void drainMainAgentTalkRequests(lastSessionCtx);
+    }, 1000);
+    (mainAgentTalkPoller as any).unref?.();
+  }
+
+  async function drainMainAgentTalkRequests(ctx?: any) {
+    if (!initialized || mainAgentTalkDraining || !ctx) return;
+    // 轻量第一版：只在秘书完全空闲、且用户没有停留在 /talk 员工模式时投递。
+    // 这样 Web 侧不会抢占控制台当前 turn，也不会被 /talk input hook 当成员工消息拦截。
+    if (mainAgentActive || talkTarget || (typeof ctx.isIdle === "function" && !ctx.isIdle())) return;
+    mainAgentTalkDraining = true;
+    try {
+      const pending = listPendingMainAgentTalkRequests(getWorkersDir(), { limit: 1 });
+      for (const request of pending) {
+        try {
+          const claimed = claimMainAgentTalkRequest(getWorkersDir(), {
+            requestId: request.id,
+            claimedBy: `pi:${process.pid}`,
+          });
+          if (!claimed) continue;
+          const message = String(request.message || "").trim();
+          if (!message) {
+            failMainAgentTalkRequest(getWorkersDir(), {
+              requestId: request.id,
+              error: "主 agent Web 消息为空",
+            });
+            continue;
+          }
+          if (mainAgentActive || talkTarget || (typeof ctx.isIdle === "function" && !ctx.isIdle())) break;
+          await pi.sendUserMessage(message);
+          acceptMainAgentTalkRequest(getWorkersDir(), {
+            requestId: request.id,
+            deliveryMode: "idle",
+            placement: "秘书空闲，已作为真实用户消息投递",
+          });
+        } catch (error: any) {
+          failMainAgentTalkRequest(getWorkersDir(), {
+            requestId: request.id,
+            error: error?.message || String(error),
+          });
+        }
+      }
+    } finally {
+      mainAgentTalkDraining = false;
+    }
+  }
+
+  function ensureWorkerTaskPoller(ctx?: any) {
+    if (ctx) lastSessionCtx = ctx;
+    if (workerTaskPoller) return;
+    workerTaskPoller = setInterval(() => {
+      void drainWorkerTaskRequests(lastSessionCtx);
+    }, 1000);
+    (workerTaskPoller as any).unref?.();
+  }
+
+  function buildAssignedTaskPrompt(request: any): string {
+    return [
+      `你收到一项来自 ${request.from || "用户"} 的工厂派活。`,
+      ``,
+      `task request id: ${request.id}`,
+      `source: ${request.source || "worker"}`,
+      `project: ${request.project || "factory-task"}`,
+      ``,
+      `任务内容：`,
+      String(request.task || "").trim(),
+      ``,
+      `请直接执行任务。完成后不需要手动发消息；系统会把本 job 的结果回传给派活者 ${request.from || "用户"}。`,
+    ].join("\n");
+  }
+
+  async function drainWorkerTaskRequests(_ctx?: any) {
+    if (!initialized || workerTaskDraining) return;
+    workerTaskDraining = true;
+    try {
+      recoverStaleWorkerTaskRequests(getWorkersDir(), {
+        recoveredBy: `pi:${process.pid}`,
+      });
+      const pending = listPendingWorkerTaskRequests(getWorkersDir(), { limit: 20 });
+      for (const request of pending) {
+        try {
+          const claimed = claimWorkerTaskRequest(getWorkersDir(), {
+            requestId: request.id,
+            claimedBy: `pi:${process.pid}`,
+          });
+          if (!claimed) continue;
+          const from = String(claimed.from || "用户").trim() || "用户";
+          const targetWorkerId = String(claimed.to || "").trim();
+          const task = String(claimed.task || "").trim();
+          if (!targetWorkerId || targetWorkerId === "*") {
+            failWorkerTaskRequest(getWorkersDir(), {
+              requestId: request.id,
+              error: "派活目标不能为空，且暂不支持广播目标 *",
+            });
+            continue;
+          }
+          if (!hasPermission(getWorkersDir(), { subject: from, action: "work:assign", target: targetWorkerId })) {
+            failWorkerTaskRequest(getWorkersDir(), {
+              requestId: request.id,
+              error: `${from} 没有权限对 ${targetWorkerId} 执行 work:assign`,
+            });
+            continue;
+          }
+          const worker = recoverWorkerFromRegistrySnapshot(targetWorkerId);
+          const availability = workerCanAcceptWork(worker, targetWorkerId);
+          if (!availability.ok) {
+            failWorkerTaskRequest(getWorkersDir(), {
+              requestId: request.id,
+              error: availability.reason || `员工 ${targetWorkerId} 当前不可接活`,
+            });
+            continue;
+          }
+          if (!task) {
+            failWorkerTaskRequest(getWorkersDir(), {
+              requestId: request.id,
+              error: "派活任务为空",
+            });
+            continue;
+          }
+
+          const { job, deliveryMode, placement } = enqueueWorkerCommand({
+            worker: worker!,
+            task: buildAssignedTaskPrompt(claimed),
+            project: claimed.project || "factory-task",
+            cwd: claimed.cwd || process.cwd(),
+            mode: claimed.mode || "auto",
+            kind: "assigned-task",
+            sourceTaskRequestId: claimed.id,
+            assignedBy: from,
+            returnTo: from,
+            source: "worker_task_assign",
+            displayChannel: "talk",
+          });
+          acceptWorkerTaskRequest(getWorkersDir(), {
+            requestId: request.id,
+            jobId: job.id,
+            deliveryMode,
+            placement,
+          });
+        } catch (error: any) {
+          failWorkerTaskRequest(getWorkersDir(), {
+            requestId: request.id,
+            error: error?.message || String(error),
+          });
+        }
+      }
+    } finally {
+      workerTaskDraining = false;
+    }
+  }
+
   pi.on("session_start", async (_event, ctx) => {
     lastSessionCtx = ctx;
     if (!initialized) {
@@ -657,6 +1194,8 @@ export default function (pi: ExtensionAPI) {
         ctx.ui?.notify?.(`保留 ${recovery.recovered} 个仍有新鲜 heartbeat 的员工 job 为 orphan-running`, "info");
       }
       ensureWebTalkPoller(ctx);
+      ensureMainAgentTalkPoller(ctx);
+      ensureWorkerTaskPoller(ctx);
     }
     const entries = ctx.sessionManager.getEntries();
     mainSessionEntries = entries;
@@ -696,13 +1235,13 @@ export default function (pi: ExtensionAPI) {
       ),
       model: Type.Optional(Type.String({ description: "指定模型（覆盖 profile 的默认值）" })),
       thinking: Type.Optional(
-        StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"] as const, {
-          description: "思考深度（覆盖 profile 的默认值）",
+        StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const, {
+          description: "思考深度（覆盖 profile 的默认值）。max/ultra 仅适用于 Codex 后端；ultra 还会允许 Codex 自动委派子任务。",
         }),
       ),
       backend: Type.Optional(
-        StringEnum(["pi", "codex"] as const, {
-          description: "员工后端。pi=当前 Pi CLI 子进程；codex=本机 Codex app-server thread。",
+        StringEnum(["pi", "codex", "claude"] as const, {
+          description: "员工后端。pi=当前 Pi CLI 子进程；codex=本机 Codex app-server thread；claude=本机 Claude Code CLI session。",
           default: "pi",
         }),
       ),
@@ -719,6 +1258,16 @@ export default function (pi: ExtensionAPI) {
           default: "danger-full-access",
         }),
       ),
+      claudeCommand: Type.Optional(Type.String({ description: "Claude Code CLI 命令，默认 claude。可填自定义 wrapper 路径。" })),
+      claudePermissionMode: Type.Optional(
+        StringEnum(["acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"] as const, {
+          description: "Claude Code permission mode；不填则沿用本机 Claude 配置。",
+        }),
+      ),
+      claudeTools: Type.Optional(Type.String({ description: "Claude Code --tools 参数，例如 default、空字符串或 Bash,Edit,Read。" })),
+      claudeAllowedTools: Type.Optional(Type.String({ description: "Claude Code --allowedTools，逗号或空格分隔。" })),
+      claudeDisallowedTools: Type.Optional(Type.String({ description: "Claude Code --disallowedTools，逗号或空格分隔。" })),
+      claudeBare: Type.Optional(Type.Boolean({ description: "是否启用 Claude --bare。默认 false，通常不建议开启以免绕过本机定制配置。", default: false })),
     }),
     async execute(_tcid, params) {
       try {
@@ -740,10 +1289,11 @@ export default function (pi: ExtensionAPI) {
         }
 
         const backend = params.backend ?? "pi";
+        assertWorkerThinkingSupported(backend, thinking);
         if (backend === "codex") {
           model = normalizeCodexModel(model);
         }
-        if (backend === "codex" && workers.has(params.name) && workers.get(params.name)?.status !== "fired") {
+        if ((backend === "codex" || backend === "claude") && workers.has(params.name) && workers.get(params.name)?.status !== "fired") {
           throw new Error(`员工 "${params.name}" 已存在`);
         }
 
@@ -781,24 +1331,43 @@ export default function (pi: ExtensionAPI) {
           };
         }
 
-        const w = hire(params.name, params.role as WorkerRole, model, thinking, { backend, ...codexOptions });
+        let claudeOptions: any = {};
+        if (backend === "claude") {
+          claudeOptions = {
+            backend: "claude",
+            claudeSessionId: randomUUID(),
+            claudeSessionInitialized: false,
+            claudeCwd: process.cwd(),
+            claudeCommand: params.claudeCommand,
+            claudePermissionMode: params.claudePermissionMode,
+            claudeTools: params.claudeTools,
+            claudeAllowedTools: params.claudeAllowedTools,
+            claudeDisallowedTools: params.claudeDisallowedTools,
+            claudeBare: params.claudeBare,
+          };
+        }
+
+        const w = hire(params.name, params.role as WorkerRole, model, thinking, { backend, ...codexOptions, ...claudeOptions });
         const cfgLines: string[] = [
           `🎉 **${w.id}** 已入职！`,
           `- 职位: ${w.role}`,
-          `- 后端: ${(w.backend ?? "pi") === "codex" ? "Codex app-server" : "Pi CLI"}`,
+          `- 后端: ${backendDisplayName(w.backend ?? "pi")}`,
           `- 入职日期: ${w.hired}`,
         ];
         if (w.model) cfgLines.push(`- 模型: ${w.model}`);
         if (w.thinking) cfgLines.push(`- 思考深度: ${w.thinking}`);
         if (w.codexThreadId) cfgLines.push(`- Codex thread: ${w.codexThreadId}`);
         if (w.codexServerUrl) cfgLines.push(`- Codex server: ${w.codexServerUrl}`);
+        if (w.claudeSessionId) cfgLines.push(`- Claude session: ${w.claudeSessionId}`);
+        if (w.claudeCommand) cfgLines.push(`- Claude command: ${w.claudeCommand}`);
+        if (w.claudePermissionMode) cfgLines.push(`- Claude permission: ${w.claudePermissionMode}`);
         cfgLines.push(`- 状态: 待命中`);
         cfgLines.push(``);
         cfgLines.push(`现在可以用「派活」给 ${w.id} 分配任务。`);
 
         return {
           content: [{ type: "text", text: cfgLines.join("\n") }],
-          details: { worker: { id: w.id, role: w.role, backend: w.backend, model: w.model, thinking: w.thinking, hired: w.hired, codexThreadId: w.codexThreadId, codexServerUrl: w.codexServerUrl } },
+          details: { worker: { id: w.id, role: w.role, backend: w.backend, model: w.model, thinking: w.thinking, hired: w.hired, codexThreadId: w.codexThreadId, codexServerUrl: w.codexServerUrl, claudeSessionId: w.claudeSessionId, claudeCwd: w.claudeCwd } },
         };
       } catch (e: any) {
         return {
@@ -819,7 +1388,7 @@ export default function (pi: ExtensionAPI) {
     description: "解雇一名员工（标记为离职，不删除记录）。",
     parameters: Type.Object({
       name: Type.String({ description: "员工姓名" }),
-      actor: Type.Optional(Type.String({ description: "操作人，默认秘书；派派/秘书/主agent 等管理层可执行" })),
+      actor: Type.Optional(Type.String({ description: "操作人，默认秘书；管理员可通过 OX_FACTORY_ADMINS 或 workers/local-admins.json 扩展" })),
     }),
     async execute(_tcid, params) {
       try {
@@ -956,10 +1525,10 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       name: Type.String({ description: "员工姓名" }),
       newRole: Type.Optional(RoleSchema),
-      model: Type.Optional(Type.String({ description: "更换模型" })),
+      model: Type.Optional(Type.String({ description: "更换模型。Codex 员工默认保留原 thread 和记忆，从下一次 turn 生效。" })),
       thinking: Type.Optional(
-        StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"] as const, {
-          description: "调整思考深度",
+        StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const, {
+          description: "调整思考深度。max/ultra 仅适用于 Codex 后端；ultra 还会允许 Codex 自动委派子任务。",
         }),
       ),
     }),
@@ -981,6 +1550,7 @@ export default function (pi: ExtensionAPI) {
           updateWorkerConfig(w.id, { model: nextModel });
         }
         if (params.thinking !== undefined) {
+          assertWorkerThinkingSupported(w.backend ?? "pi", params.thinking);
           changes.push(`思考深度: ${params.thinking}`);
           updateWorkerConfig(w.id, { thinking: params.thinking as Worker["thinking"] });
         }
@@ -1013,10 +1583,11 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       name: Type.Optional(Type.String({ description: "员工姓名" })),
       workerId: Type.Optional(Type.String({ description: "员工姓名/ID；兼容旧提示里的 workerId 写法" })),
-      model: Type.Optional(Type.String({ description: "更换模型" })),
+      avatar: Type.Optional(Type.String({ description: "员工头像。支持 emoji/短文本，或 http(s)/data:image 图片 URL；传空字符串可清空。" })),
+      model: Type.Optional(Type.String({ description: "更换模型。Codex 员工默认保留原 thread 和记忆，从下一次 turn 生效。" })),
       thinking: Type.Optional(
-        StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"] as const, {
-          description: "调整思考深度",
+        StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const, {
+          description: "调整思考深度。max/ultra 仅适用于 Codex 后端；ultra 还会允许 Codex 自动委派子任务。",
         }),
       ),
       codexApprovalPolicy: Type.Optional(
@@ -1035,6 +1606,19 @@ export default function (pi: ExtensionAPI) {
         default: false,
       })),
       resetNote: Type.Optional(Type.String({ description: "resetCodexThread 的原因，会写入新 thread 的 handoff 摘要" })),
+      claudeSessionId: Type.Optional(Type.String({ description: "Claude Code session id。谨慎修改；用于把员工重新指向已有 Claude session。" })),
+      claudeSessionInitialized: Type.Optional(Type.Boolean({ description: "Claude session 是否已经初始化；已存在的 session 应设为 true。" })),
+      claudeCwd: Type.Optional(Type.String({ description: "Claude session 绑定的工作目录；默认招募时的项目目录。" })),
+      claudeCommand: Type.Optional(Type.String({ description: "Claude Code CLI 命令，默认 claude。" })),
+      claudePermissionMode: Type.Optional(
+        StringEnum(["acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"] as const, {
+          description: "Claude Code permission mode；清空需要重新招募或手动修 registry。",
+        }),
+      ),
+      claudeTools: Type.Optional(Type.String({ description: "Claude Code --tools 参数。" })),
+      claudeAllowedTools: Type.Optional(Type.String({ description: "Claude Code --allowedTools，逗号或空格分隔。" })),
+      claudeDisallowedTools: Type.Optional(Type.String({ description: "Claude Code --disallowedTools，逗号或空格分隔。" })),
+      claudeBare: Type.Optional(Type.Boolean({ description: "是否启用 Claude --bare。" })),
     }),
     async execute(_tcid, params) {
       try {
@@ -1045,11 +1629,16 @@ export default function (pi: ExtensionAPI) {
 
         const patch: Partial<Worker> = {};
         const changes: string[] = [];
+        if (params.avatar !== undefined) {
+          patch.avatar = String(params.avatar || "").trim() || null;
+          changes.push(`头像: ${w.avatar || "—"} → ${patch.avatar || "—"}`);
+        }
         if (params.model) {
           patch.model = (w.backend ?? "pi") === "codex" ? normalizeCodexModel(params.model) : params.model;
           changes.push(`模型: ${w.model || "—"} → ${patch.model}`);
         }
         if (params.thinking !== undefined) {
+          assertWorkerThinkingSupported(w.backend ?? "pi", params.thinking);
           patch.thinking = params.thinking as Worker["thinking"];
           changes.push(`思考深度: ${w.thinking || "—"} → ${patch.thinking}`);
         }
@@ -1075,6 +1664,52 @@ export default function (pi: ExtensionAPI) {
           patch.codexThreadHandoff = buildCodexThreadHandoff(w, previousThreadId, params.resetNote);
           w.codexActiveTurnId = null;
           changes.push(`Codex thread: ${previousThreadId || "—"} → 下次任务新建（已生成 handoff）`);
+        }
+        if (params.claudeSessionId !== undefined) {
+          if ((w.backend ?? "pi") !== "claude") throw new Error("claudeSessionId 只适用于 Claude 员工");
+          patch.claudeSessionId = params.claudeSessionId || null;
+          patch.claudeSessionInitialized = Boolean(params.claudeSessionInitialized);
+          changes.push(`Claude session: ${w.claudeSessionId || "—"} → ${patch.claudeSessionId || "—"}`);
+        }
+        if (params.claudeSessionInitialized !== undefined && params.claudeSessionId === undefined) {
+          if ((w.backend ?? "pi") !== "claude") throw new Error("claudeSessionInitialized 只适用于 Claude 员工");
+          patch.claudeSessionInitialized = params.claudeSessionInitialized;
+          changes.push(`Claude initialized: ${w.claudeSessionInitialized ? "true" : "false"} → ${patch.claudeSessionInitialized ? "true" : "false"}`);
+        }
+        if (params.claudeCwd !== undefined) {
+          if ((w.backend ?? "pi") !== "claude") throw new Error("claudeCwd 只适用于 Claude 员工");
+          patch.claudeCwd = params.claudeCwd || null;
+          changes.push(`Claude cwd: ${w.claudeCwd || "—"} → ${patch.claudeCwd || "—"}`);
+        }
+        if (params.claudeCommand !== undefined) {
+          if ((w.backend ?? "pi") !== "claude") throw new Error("claudeCommand 只适用于 Claude 员工");
+          patch.claudeCommand = params.claudeCommand || undefined;
+          changes.push(`Claude command: ${w.claudeCommand || "claude"} → ${patch.claudeCommand || "claude"}`);
+        }
+        if (params.claudePermissionMode !== undefined) {
+          if ((w.backend ?? "pi") !== "claude") throw new Error("claudePermissionMode 只适用于 Claude 员工");
+          patch.claudePermissionMode = params.claudePermissionMode as Worker["claudePermissionMode"];
+          changes.push(`Claude permission: ${w.claudePermissionMode || "本机默认"} → ${patch.claudePermissionMode || "本机默认"}`);
+        }
+        if (params.claudeTools !== undefined) {
+          if ((w.backend ?? "pi") !== "claude") throw new Error("claudeTools 只适用于 Claude 员工");
+          patch.claudeTools = params.claudeTools;
+          changes.push(`Claude tools: ${w.claudeTools || "本机默认"} → ${patch.claudeTools || "本机默认"}`);
+        }
+        if (params.claudeAllowedTools !== undefined) {
+          if ((w.backend ?? "pi") !== "claude") throw new Error("claudeAllowedTools 只适用于 Claude 员工");
+          patch.claudeAllowedTools = params.claudeAllowedTools;
+          changes.push(`Claude allowedTools: ${w.claudeAllowedTools || "—"} → ${patch.claudeAllowedTools || "—"}`);
+        }
+        if (params.claudeDisallowedTools !== undefined) {
+          if ((w.backend ?? "pi") !== "claude") throw new Error("claudeDisallowedTools 只适用于 Claude 员工");
+          patch.claudeDisallowedTools = params.claudeDisallowedTools;
+          changes.push(`Claude disallowedTools: ${w.claudeDisallowedTools || "—"} → ${patch.claudeDisallowedTools || "—"}`);
+        }
+        if (params.claudeBare !== undefined) {
+          if ((w.backend ?? "pi") !== "claude") throw new Error("claudeBare 只适用于 Claude 员工");
+          patch.claudeBare = params.claudeBare;
+          changes.push(`Claude bare: ${w.claudeBare ? "true" : "false"} → ${patch.claudeBare ? "true" : "false"}`);
         }
 
         if (changes.length === 0) {
@@ -1533,12 +2168,12 @@ export default function (pi: ExtensionAPI) {
       const url = `http://127.0.0.1:${options.port}`;
       try {
         if (options.statusOnly) {
-          const healthy = await isOxWebDashboardHealthy(url);
+          const health = await checkOxWebDashboard(url);
           const content = [
             "## 牛马工厂 Web 大盘",
             "",
             `- URL: ${url}`,
-            `- 状态: ${healthy ? "running" : "stopped / not ox-factory"}`,
+            `- 状态: ${health.healthy ? "running" : health.baseHealthy ? `stale / ${health.detail}` : "stopped / not ox-factory"}`,
             `- 端口: ${options.port}`,
           ].join("\n");
           pi.sendMessage({ customType: "ox-web", content, display: true }, { deliverAs: "nextTurn", triggerTurn: false });
@@ -1556,7 +2191,7 @@ export default function (pi: ExtensionAPI) {
           "## 牛马工厂 Web 大盘",
           "",
           `- URL: ${result.url}`,
-          `- 服务状态: ${result.status === "running" ? "已在运行，直接复用" : result.status === "started" ? "刚刚启动并通过 health check" : "已尝试启动，仍在等待健康检查"}`,
+          `- 服务状态: ${result.status === "running" ? "已在运行，直接复用" : result.status === "restarted" ? "检测到旧版服务并已自动重启" : result.status === "started" ? "刚刚启动并通过 health check" : "已尝试启动，仍在等待健康检查"}`,
           `- 浏览器: ${openStatus}`,
           `- 日志: \`${result.logPath}\``,
           "",
@@ -1586,10 +2221,7 @@ export default function (pi: ExtensionAPI) {
   // ═══════════════════════════════════════════════════════
   // /talk 命令 — 进入/退出对话模式
   // ═══════════════════════════════════════════════════════
-  let talkTarget: string | null = null;
-  let activeTalkJobId: string | null = null;
   const talkLiveBuffers = new Map<string, { workerId: string; lines: string[]; timer: any }>();
-  let mainAgentActive = false;
   let deferredTalkNoticeShown = false;
   const deferredTalkMessages: Array<{ workerId: string; message: any }> = [];
 
@@ -1769,6 +2401,11 @@ export default function (pi: ExtensionAPI) {
     mode = "auto",
     kind = "command",
     sourceMessageId,
+    sourceTaskRequestId,
+    assignedBy,
+    returnTo,
+    source,
+    displayChannel,
   }: {
     worker: Worker;
     task: string;
@@ -1777,7 +2414,13 @@ export default function (pi: ExtensionAPI) {
     mode?: WorkerCommandMode;
     kind?: string;
     sourceMessageId?: string;
+    sourceTaskRequestId?: string;
+    assignedBy?: string;
+    returnTo?: string;
+    source?: string;
+    displayChannel?: string;
   }): { job: any; deliveryMode: TalkDeliveryMode; placement: string } {
+    worker = recoverWorkerFromRegistrySnapshot(worker.id) || worker;
     const availability = workerCanAcceptWork(worker, worker.id);
     if (!availability.ok) throw new Error(availability.reason);
     const openBefore = openWorkerJobs(worker.id);
@@ -1805,6 +2448,11 @@ export default function (pi: ExtensionAPI) {
       queuePosition: busy ? (steerInline ? 1 : deliveryMode === "steer" ? 2 : openBefore.length + 1) : 1,
       queuedBehind: busy ? (deliveryMode === "steer" ? runningJob?.id : openBefore[openBefore.length - 1]?.id) : undefined,
       sourceMessageId,
+      sourceTaskRequestId,
+      assignedBy,
+      returnTo,
+      source,
+      displayChannel,
     });
     appendJobEvent(job, {
       type: "delivery",
@@ -1812,6 +2460,15 @@ export default function (pi: ExtensionAPI) {
     });
     if (sourceMessageId) {
       appendJobEvent(job, { type: "message_wake", messageId: sourceMessageId, text: `wake from message ${sourceMessageId}` });
+    }
+    if (sourceTaskRequestId || assignedBy) {
+      appendJobEvent(job, {
+        type: "assigned_task",
+        taskRequestId: sourceTaskRequestId,
+        assignedBy,
+        returnTo,
+        text: `assigned by ${assignedBy || "unknown"}${sourceTaskRequestId ? ` via ${sourceTaskRequestId}` : ""}`,
+      });
     }
     if (deliveryMode === "steer" && runningJob) {
       appendJobEvent(runningJob, { type: "steer", text: task, queuedJobId: job.id, sourceMessageId });
@@ -1832,6 +2489,50 @@ export default function (pi: ExtensionAPI) {
           success ? "success" : "failed",
           (result.output || result.errorMessage || result.stderr || "").slice(0, 500),
         );
+        if (sourceTaskRequestId && (returnTo || assignedBy)) {
+          const summary = (result.output || result.errorMessage || result.stderr || "").trim();
+          const content = [
+            success ? "✅ 派活任务已完成" : "❌ 派活任务执行失败",
+            "",
+            `- task request: \`${sourceTaskRequestId}\``,
+            `- job: \`${job.id}\``,
+            `- 执行员工: ${worker.id}`,
+            `- 派活来源: ${assignedBy || returnTo}`,
+            `- project: ${project}`,
+            "",
+            "结果摘要：",
+            summary.slice(0, 2000) || (success ? "任务完成，但没有文本输出。" : "任务失败，未提供错误文本。"),
+            summary.length > 2000 ? `\n...(截断，共 ${summary.length} 字符；完整输出请查看 job events)` : "",
+          ].join("\n");
+          try {
+            const message = sendTaskResultMessage(getWorkersDir(), {
+              from: worker.id,
+              to: returnTo || assignedBy,
+              content,
+              jobId: job.id,
+              taskRequestId: sourceTaskRequestId,
+              resultStatus: success ? "done" : "failed",
+            });
+            reportWorkerTaskResult(getWorkersDir(), {
+              requestId: sourceTaskRequestId,
+              jobId: job.id,
+              messageId: message.id,
+              resultStatus: success ? "done" : "failed",
+              summary: summary.slice(0, 500),
+            });
+            appendJobEvent(job, {
+              type: "task_result_message",
+              messageId: message.id,
+              to: returnTo || assignedBy,
+              text: `task result returned to ${returnTo || assignedBy}`,
+            });
+          } catch (error: any) {
+            appendJobEvent(job, {
+              type: "task_result_message_failed",
+              message: error?.message || String(error),
+            });
+          }
+        }
       })
       .catch(() => {
         /* job failure is already persisted by startWorkerJob */
@@ -1854,6 +2555,7 @@ export default function (pi: ExtensionAPI) {
     requestedMode?: TalkDeliveryMode,
     options: { attach?: boolean; notify?: boolean } = {},
   ) {
+    w = recoverWorkerFromRegistrySnapshot(w.id) || w;
     const availability = workerCanAcceptWork(w, w.id);
     if (!availability.ok) {
       ctx?.ui?.notify?.(availability.reason!, "error");
@@ -1971,7 +2673,7 @@ export default function (pi: ExtensionAPI) {
       return false;
     }
 
-    const w = workers.get(workerId);
+    const w = recoverWorkerFromRegistrySnapshot(workerId);
     const availability = workerCanAcceptWork(w, workerId);
     if (!availability.ok) {
       const reason = availability.reason || "员工当前不可接入";
@@ -2023,7 +2725,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      const w = workers.get(name);
+      const w = recoverWorkerFromRegistrySnapshot(name);
       const availability = workerCanAcceptWork(w, name);
       if (!availability.ok) { ctx.ui.notify(availability.reason!, "error"); return; }
 
@@ -2044,7 +2746,7 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify("当前没有接入员工。先用 /talk 员工名。", "error");
       return null;
     }
-    const w = workers.get(talkTarget);
+    const w = recoverWorkerFromRegistrySnapshot(talkTarget);
     const availability = workerCanAcceptWork(w, talkTarget);
     if (!availability.ok) {
       ctx.ui.notify(availability.reason!, "error");
@@ -2212,7 +2914,7 @@ export default function (pi: ExtensionAPI) {
       return { action: "handled" as const };
     }
 
-    const w = workers.get(talkTarget);
+    const w = recoverWorkerFromRegistrySnapshot(talkTarget);
     const availability = workerCanAcceptWork(w, talkTarget);
     if (!availability.ok) {
       ctx.ui.notify(availability.reason!, "error");
@@ -2465,7 +3167,7 @@ export default function (pi: ExtensionAPI) {
     label: "设定员工职责",
     description: [
       "为员工设定当前职责、负责项目或笼统工作范围。",
-      "适合用户说“让东子负责 Web 大盘”“布朗尼负责日报”“美伢做 MR review”。",
+      "适合用户说“让 Alice 负责 Web 大盘”“Bob 负责日报”“Carol 做 MR review”。",
       "这是当前职责，不是历史履历；会写入 .pi/workers/responsibilities.jsonl，Web 大盘可读取。",
     ].join(" "),
     parameters: Type.Object({
@@ -2513,7 +3215,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "factory_responsibility_list",
     label: "查看员工职责",
-    description: "查看员工当前职责 / 负责项目。适合用户问“谁负责什么”“看看东子的职责”。",
+    description: "查看员工当前职责 / 负责项目。适合用户问“谁负责什么”“看看 Alice 的职责”。",
     parameters: Type.Object({
       worker: Type.Optional(Type.String({ description: "只看某个员工" })),
       includeInactive: Type.Optional(Type.Boolean({ description: "是否包含已移除职责", default: false })),
@@ -2671,6 +3373,359 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  function formatWorkerTaskRequestSummary(requests: any[]): string {
+    if (!requests.length) return "暂无派活请求。";
+    return [
+      "| 状态 | 请求 | 来源 | 目标 | job | 模式 | 项目 | 时间 | 任务 |",
+      "|---|---|---|---|---|---|---|---|---|",
+      ...requests.map((request) =>
+        `| ${request.status || "-"} | \`${request.id}\` | ${request.from || "-"} | ${request.to || "-"} | ${request.jobId ? `\`${request.jobId}\`` : "-"} | ${request.deliveryMode || request.mode || "-"} | ${request.project || "-"} | ${request.createdAt || "-"} | ${String(request.task || "").replace(/\s+/g, " ").slice(0, 80)} |`
+      ),
+    ].join("\n");
+  }
+
+  // ═══════════════════════════════════════════════════════
+  // factory_outsource_* — 外包白纸 subagent 模式
+  // ═══════════════════════════════════════════════════════
+  pi.registerTool({
+    name: "factory_outsource_profiles",
+    label: "外包配置",
+    description: [
+      "管理匿名/白纸外包 agent profile。",
+      "外包 agent 不复用员工身份、记忆或 session；只按 profile 的 backend/model/tools 执行当前任务。",
+      "action=upsert 可添加类似 codex-coder、doubao-coder 的外包公司配置。",
+    ].join(" "),
+    parameters: Type.Object({
+      action: Type.Optional(
+        StringEnum(["list", "get", "upsert"] as const, {
+          description: "list=列出，get=查看单个，upsert=新增或更新",
+          default: "list",
+        }),
+      ),
+      name: Type.Optional(Type.String({ description: "profile 名称，如 codex-coder" })),
+      description: Type.Optional(Type.String({ description: "profile 描述" })),
+      backend: Type.Optional(
+        StringEnum(["pi", "codex"] as const, {
+          description: "后端：pi=临时 Pi session，codex=临时 Codex app-server thread",
+          default: "pi",
+        }),
+      ),
+      model: Type.Optional(Type.String({ description: "模型名" })),
+      thinking: Type.Optional(Type.String({ description: "思考深度/effort" })),
+      tools: Type.Optional(Type.Array(Type.String({ description: "允许工具名" }), { description: "允许工具列表；不填使用默认编码工具集" })),
+      skills: Type.Optional(Type.Boolean({ description: "是否启用 skills；外包白纸模式默认 false" })),
+      systemPrompt: Type.Optional(Type.String({ description: "额外/覆盖系统提示；默认强调匿名、无记忆、只执行当前任务" })),
+      maxTurns: Type.Optional(Type.Number({ description: "最大轮数预留字段，默认 1" })),
+      defaultWait: Type.Optional(Type.Boolean({ description: "未显式指定时是否等待结果返回，默认 true" })),
+      timeoutMs: Type.Optional(Type.Number({ description: "默认等待超时；不填/0=不超时" })),
+    }),
+    async execute(_tcid, params) {
+      try {
+        const action = params.action || "list";
+        if (action === "upsert") {
+          const profile = upsertOutsourceProfile(getWorkersDir(), {
+            name: params.name,
+            description: params.description,
+            backend: params.backend || "pi",
+            model: params.model,
+            thinking: params.thinking,
+            tools: params.tools,
+            skills: params.skills,
+            systemPrompt: params.systemPrompt,
+            maxTurns: params.maxTurns,
+            defaultWait: params.defaultWait,
+            timeoutMs: params.timeoutMs,
+            actor: "factory_outsource_profiles",
+          });
+          return {
+            content: [{ type: "text", text: [`✅ 已保存外包 profile: **${profile.name}**`, "", formatOutsourceProfiles([profile])].join("\n") }],
+            details: { profile },
+          };
+        }
+        if (action === "get") {
+          const profile = getOutsourceProfile(getWorkersDir(), params.name || "");
+          if (!profile) return { content: [{ type: "text", text: `❌ 未找到外包 profile: ${params.name || "(empty)"}` }], isError: true, details: {} };
+          return { content: [{ type: "text", text: formatOutsourceProfiles([profile]) }], details: { profile } };
+        }
+        const profiles = listOutsourceProfiles(getWorkersDir());
+        return { content: [{ type: "text", text: formatOutsourceProfiles(profiles) }], details: { profiles } };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `❌ 外包 profile 操作失败: ${e.message}` }], isError: true, details: {} };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "factory_outsource_run",
+    label: "联系外包公司",
+    description: [
+      "启动匿名/白纸外包 agent 执行任务。",
+      "可 background=true 后台跑，也可 wait=true 等到结果再继续；默认按 profile.defaultWait 等待。",
+      "运行会记录为 outsource-run job 和 outsource run，但不会触发员工情绪评分。",
+    ].join(" "),
+    parameters: Type.Object({
+      profile: Type.String({ description: "外包 profile 名称" }),
+      task: Type.String({ description: "要外包 agent 执行的具体任务" }),
+      project: Type.Optional(Type.String({ description: "项目名称，默认 outsource" })),
+      cwd: Type.Optional(Type.String({ description: "工作目录，默认当前目录" })),
+      requestedBy: Type.Optional(Type.String({ description: "派活来源，默认用户；员工派活时填员工名" })),
+      groupId: Type.Optional(Type.String({ description: "可选批次 id，用于等待一组外包 run" })),
+      background: Type.Optional(Type.Boolean({ description: "true=后台返回 run/job id；false=等待完成" })),
+      wait: Type.Optional(Type.Boolean({ description: "是否等待结果；优先级高于 background" })),
+      timeoutMs: Type.Optional(Type.Number({ description: "等待超时；不填/0=不超时（可显式传毫秒数）" })),
+    }),
+    async execute(_tcid, params, signal) {
+      try {
+        const profile = getOutsourceProfile(getWorkersDir(), params.profile);
+        if (!profile) {
+          return { content: [{ type: "text", text: `❌ 未找到外包 profile: ${params.profile}
+
+先用 factory_outsource_profiles action=upsert 创建。` }], isError: true, details: {} };
+        }
+        const shouldWait = normalizeOutsourceWait(params, profile);
+        const { run, job } = startOutsourceRunJob({
+          workersDir: getWorkersDir(),
+          profile,
+          task: params.task,
+          project: params.project || "outsource",
+          cwd: params.cwd || process.cwd(),
+          requestedBy: params.requestedBy || "用户",
+          groupId: params.groupId,
+          wait: shouldWait,
+          background: !shouldWait,
+          detached: !shouldWait,
+          signal,
+        });
+        if (!shouldWait) {
+          return {
+            content: [{
+              type: "text",
+              text: [
+                `🚀 已启动外包 run。`,
+                "",
+                `- run: \`${run.id}\``,
+                `- group: \`${run.groupId}\``,
+                `- job: \`${job.id}\``,
+                `- profile: ${profile.name}`,
+                "",
+                `之后用 \`factory_outsource_wait\` 等结果，或 \`factory_outsource_result\` 查看单个结果。`,
+              ].join("\n"),
+            }],
+            details: { run, job },
+          };
+        }
+        const waited = await waitForOutsourceRuns(getWorkersDir(), {
+          runId: run.id,
+          mode: "all",
+          timeoutMs: params.timeoutMs || profile.timeoutMs || 0,
+          signal,
+        });
+        return {
+          content: [{ type: "text", text: renderOutsourceWaitResult(waited) }],
+          isError: waited.status === "timeout" ? true : undefined,
+          details: { runId: run.id, jobId: job.id, waited },
+        };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `❌ 外包执行失败: ${e.message}` }], isError: true, details: {} };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "factory_outsource_status",
+    label: "外包状态",
+    description: "查看外包 run 列表/状态，可按 runId、groupId、profile、status 过滤。",
+    parameters: Type.Object({
+      runId: Type.Optional(Type.String({ description: "单个 run id" })),
+      groupId: Type.Optional(Type.String({ description: "批次 group id" })),
+      profile: Type.Optional(Type.String({ description: "profile 名称" })),
+      status: Type.Optional(StringEnum(["queued", "running", "done", "failed", "cancelled"] as const, { description: "状态过滤" })),
+      limit: Type.Optional(Type.Number({ description: "最多返回数量，默认 20" })),
+    }),
+    async execute(_tcid, params) {
+      try {
+        const runs = listOutsourceRuns(getWorkersDir(), {
+          runId: params.runId,
+          groupId: params.groupId,
+          profile: params.profile,
+          status: params.status,
+          limit: params.limit || 20,
+        }).reverse();
+        return { content: [{ type: "text", text: formatOutsourceRuns(runs) }], details: { runs } };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `❌ 查询外包状态失败: ${e.message}` }], isError: true, details: {} };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "factory_outsource_wait",
+    label: "等待外包",
+    description: "等待一个外包 run 或一个 group 的外包 run 完成。适合父 agent 派后台外包后稍后收敛结果。",
+    parameters: Type.Object({
+      runId: Type.Optional(Type.String({ description: "单个 run id" })),
+      groupId: Type.Optional(Type.String({ description: "批次 group id" })),
+      mode: Type.Optional(StringEnum(["all", "next"] as const, { description: "all=等全部；next=等任一完成", default: "all" })),
+      timeoutMs: Type.Optional(Type.Number({ description: "等待超时；不填/0=不超时" })),
+      pollIntervalMs: Type.Optional(Type.Number({ description: "轮询间隔，默认 500ms" })),
+    }),
+    async execute(_tcid, params, signal) {
+      try {
+        const waited = await waitForOutsourceRuns(getWorkersDir(), {
+          runId: params.runId,
+          groupId: params.groupId,
+          mode: params.mode || "all",
+          timeoutMs: params.timeoutMs || 0,
+          pollIntervalMs: params.pollIntervalMs || 500,
+          signal,
+        });
+        return {
+          content: [{ type: "text", text: renderOutsourceWaitResult(waited) }],
+          isError: waited.status === "timeout" ? true : undefined,
+          details: { waited },
+        };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `❌ 等待外包失败: ${e.message}` }], isError: true, details: {} };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "factory_outsource_result",
+    label: "外包结果",
+    description: "查看单个外包 run 的结果；可选择等待其完成。",
+    parameters: Type.Object({
+      runId: Type.String({ description: "run id" }),
+      wait: Type.Optional(Type.Boolean({ description: "如果还在运行，是否先等待完成，默认 false" })),
+      timeoutMs: Type.Optional(Type.Number({ description: "等待超时；不填/0=不超时" })),
+      verbose: Type.Optional(Type.Boolean({ description: "是否展示完整输出，默认 false" })),
+    }),
+    async execute(_tcid, params, signal) {
+      try {
+        let run = getOutsourceRun(getWorkersDir(), params.runId);
+        if (!run) return { content: [{ type: "text", text: `❌ 未找到外包 run: ${params.runId}` }], isError: true, details: {} };
+        if (params.wait && !["done", "failed", "cancelled"].includes(run.status)) {
+          await waitForOutsourceRuns(getWorkersDir(), {
+            runId: run.id,
+            mode: "all",
+            timeoutMs: params.timeoutMs || 0,
+            signal,
+          });
+          run = getOutsourceRun(getWorkersDir(), params.runId);
+        }
+        return {
+          content: [{ type: "text", text: renderOutsourceResult(run, params.verbose === true) }],
+          isError: run?.status === "failed" ? true : undefined,
+          details: { run },
+        };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `❌ 查看外包结果失败: ${e.message}` }], isError: true, details: {} };
+      }
+    },
+  });
+
+  // ═══════════════════════════════════════════════════════
+  // factory_task_* — 授权式员工派活
+  // ═══════════════════════════════════════════════════════
+  pi.registerTool({
+    name: "factory_task_assign",
+    label: "员工派活",
+    description: [
+      "让一个来源（用户/员工/秘书）授权式派具体任务给另一个员工。",
+      "和发送消息不同：派活会写入 worker task request intent，由 Pi 主进程检查 work:assign 权限后创建员工 job。",
+      "目标员工忙碌时按 mode 排队或 steer；job 完成后系统会自动把结果消息回给派活来源。",
+    ].join(" "),
+    parameters: Type.Object({
+      from: Type.Optional(Type.String({ description: "派活来源，默认用户；普通员工需要对目标有 work:assign 权限" })),
+      to: Type.String({ description: "目标员工姓名" }),
+      task: Type.String({ description: "要目标员工执行的具体任务" }),
+      project: Type.Optional(Type.String({ description: "项目名称，默认 factory-task" })),
+      mode: Type.Optional(
+        StringEnum(["auto", "queue", "steer", "now"] as const, {
+          description: "auto=空闲立即/忙则排队；queue=明确排队；steer=优先插队/可用时注入 Codex active turn；now=仅空闲才执行",
+          default: "auto",
+        }),
+      ),
+      cwd: Type.Optional(Type.String({ description: "工作目录，默认当前目录" })),
+    }),
+    async execute(_tcid, params) {
+      try {
+        const from = String(params.from || "用户").trim() || "用户";
+        const to = String(params.to || "").trim();
+        if (!hasPermission(getWorkersDir(), { subject: from, action: "work:assign", target: to })) {
+          return { content: [{ type: "text", text: `❌ ${from} 没有权限对 ${to} 执行 work:assign` }], isError: true, details: {} };
+        }
+        const request = createWorkerTaskRequest(getWorkersDir(), {
+          from,
+          to,
+          task: params.task,
+          project: params.project || "factory-task",
+          cwd: params.cwd || process.cwd(),
+          mode: params.mode || "auto",
+          source: "factory-tool",
+        });
+        await drainWorkerTaskRequests(lastSessionCtx);
+        const current = getWorkerTaskRequest(getWorkersDir(), request.id) || request;
+        const lines = [
+          `🧩 已提交员工派活请求。`,
+          ``,
+          `- request: \`${current.id}\``,
+          `- status: ${current.status}`,
+          `- from: ${current.from}`,
+          `- to: ${current.to}`,
+          `- mode: ${current.deliveryMode || current.mode}`,
+          current.jobId ? `- job: \`${current.jobId}\`` : null,
+          current.placement ? `- placement: ${current.placement}` : null,
+          current.error ? `- error: ${current.error}` : null,
+          ``,
+          `派活完成后，系统会自动把 job 结果作为 task_result 消息回给 ${current.from}。`,
+        ].filter(Boolean);
+        return {
+          content: [{ type: "text", text: lines.join("\n") }],
+          isError: current.status === "failed" ? true : undefined,
+          details: { request: current },
+        };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `❌ 派活失败: ${e.message}` }], isError: true, details: {} };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "factory_task_status",
+    label: "查看员工派活",
+    description: "查看授权式员工派活请求的状态、关联 job 和结果回传消息。",
+    parameters: Type.Object({
+      requestId: Type.Optional(Type.String({ description: "派活请求 id；不填则列出最近请求" })),
+      from: Type.Optional(Type.String({ description: "按派活来源过滤" })),
+      to: Type.Optional(Type.String({ description: "按目标员工过滤" })),
+      limit: Type.Optional(Type.Number({ description: "最多返回多少条，默认 20" })),
+    }),
+    async execute(_tcid, params) {
+      try {
+        if (params.requestId) {
+          const request = getWorkerTaskRequest(getWorkersDir(), params.requestId);
+          if (!request) return { content: [{ type: "text", text: `❌ 未找到派活请求 ${params.requestId}` }], isError: true, details: {} };
+          return {
+            content: [{ type: "text", text: formatWorkerTaskRequestSummary([request]) }],
+            details: { request },
+          };
+        }
+        const requests = listWorkerTaskRequests(getWorkersDir(), {
+          from: params.from,
+          to: params.to,
+          limit: params.limit || 20,
+        }).reverse();
+        return {
+          content: [{ type: "text", text: formatWorkerTaskRequestSummary(requests) }],
+          details: { requests },
+        };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `❌ 查询派活失败: ${e.message}` }], isError: true, details: {} };
+      }
+    },
+  });
+
   // ═══════════════════════════════════════════════════════
   // factory_command — 有记忆员工指挥模式
   // ═══════════════════════════════════════════════════════
@@ -2685,7 +3740,8 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       worker: Type.String({ description: "员工姓名" }),
       task: Type.String({ description: "任务描述" }),
-      project: Type.Optional(Type.String({ description: "项目名称，默认 factory-command" })),
+      project: Type.Optional(Type.String({ description: "项目名称；默认 talk，确保员工页对话历史可见" })),
+      assignedBy: Type.Optional(Type.String({ description: "指派者，默认主agent；员工代为调用时填员工名" })),
       mode: Type.Optional(
         StringEnum(["auto", "queue", "steer", "now"] as const, {
           description: "auto=空闲立即/忙则排队；queue=明确排队；steer=Codex 有 active turn 时插入当前 turn，Pi/无 active turn 时排在当前 job 后优先；now=仅空闲才执行",
@@ -2702,10 +3758,13 @@ export default function (pi: ExtensionAPI) {
         const { job, deliveryMode, placement } = enqueueWorkerCommand({
           worker: w,
           task: params.task,
-          project: params.project || "factory-command",
+          project: params.project || "talk",
           cwd: params.cwd || process.cwd(),
           mode: params.mode || "auto",
-          kind: "command",
+          kind: "talk",
+          source: "factory_command",
+          displayChannel: "talk",
+          assignedBy: params.assignedBy || "主agent",
         });
         return {
           content: [
@@ -2717,7 +3776,8 @@ export default function (pi: ExtensionAPI) {
                 `- job: \`${job.id}\``,
                 `- mode: ${deliveryMode}`,
                 `- placement: ${placement}`,
-                `- project: ${job.project || "factory-command"}`,
+                `- project: ${job.project || "talk"}`,
+                `- assignedBy: ${job.assignedBy || "主agent"}`,
                 ``,
                 `完整输出会写入 job events 和员工 session；主 agent 默认只保留这条短摘要。`,
               ].join("\n"),
@@ -3022,7 +4082,7 @@ export default function (pi: ExtensionAPI) {
     label: "日报上下文",
     description: [
       "聚合工厂日报数据源，避免只看 queue.jsonl 误判空转。",
-      "会只读汇总 jobs、queue、员工 session 和当前主 session 管理动作，适合布朗尼写日报前调用。",
+      "会只读汇总 jobs、queue、员工 session 和当前主 session 管理动作，适合 Foreman 写日报前调用。",
     ].join(" "),
     parameters: Type.Object({
       date: Type.Optional(Type.String({ description: "日报日期，格式 YYYY-MM-DD；不填默认今天" })),
@@ -3067,7 +4127,7 @@ export default function (pi: ExtensionAPI) {
     name: "factory_token_report",
     label: "查看 Token 消耗",
     description: [
-      "当用户用自然语言询问 token 消耗、token 用量、某个员工今天/昨天花了多少 token 时调用本工具，例如“看看东子的 token 消耗”。",
+      "当用户用自然语言询问 token 消耗、token 用量、某个员工今天/昨天花了多少 token 时调用本工具，例如“看看 DeveloperA 的 token 消耗”。",
       "按日期统计每个员工 input/output/total token。",
       "只做 token 监控，不计算成本，不做绩效评分。",
       "session usage 优先，job token 作为兜底，避免重复相加。",
@@ -3279,7 +4339,7 @@ export default function (pi: ExtensionAPI) {
       "当前只落地消息通信权限，work:* 作为后续派活权限预留。",
     ].join(" "),
     parameters: Type.Object({
-      subject: Type.String({ description: "被授权员工，例如 派派、布朗尼" }),
+      subject: Type.String({ description: "被授权员工，例如 Alice、Bob" }),
       actions: Type.Array(PermissionActionSchema, { description: "授权动作，如 message:send、message:broadcast" }),
       targets: Type.Array(Type.String(), { description: "目标员工列表；* 表示全员/广播" }),
       grantedBy: Type.Optional(Type.String({ description: "授权人，默认秘书" })),
@@ -3425,7 +4485,7 @@ export default function (pi: ExtensionAPI) {
     async execute(_tcid, params) {
       try {
         const from = params.from || "秘书";
-        if (from !== "秘书" && from !== "主agent" && from !== "主Agent" && from !== "用户" && from !== "user" && from !== "secretary" && from !== "派派") {
+        if (!isFactoryAdmin(getWorkersDir(), from)) {
           const sender = workers.get(from);
           if (!sender || sender.status === "fired") {
             return { content: [{ type: "text", text: `❌ 发送者 ${from} 不存在或已离职。` }], isError: true, details: {} };
@@ -3469,6 +4529,10 @@ export default function (pi: ExtensionAPI) {
                 mode: params.wakeMode || "queue",
                 kind: "inbox",
                 sourceMessageId: message.id,
+                source: "message_wake",
+                displayChannel: "talk",
+                assignedBy: from,
+                returnTo: from,
               });
               wakeResult = { status: "queued", jobId: job.id, placement, mode: deliveryMode };
             }

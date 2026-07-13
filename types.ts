@@ -8,7 +8,7 @@ export const ALL_ROLES: WorkerRole[] = ["programmer", "tester", "reviewer", "for
 
 export type WorkerStatus = "idle" | "working" | "vacation" | "fired";
 
-export type WorkerBackend = "pi" | "codex";
+export type WorkerBackend = "pi" | "codex" | "claude";
 
 export interface ProjectRecord {
   project: string;
@@ -38,15 +38,16 @@ export interface ResponsibilityRecord {
   key?: string;
 }
 
-export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 
-export const ALL_THINKING: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+export const ALL_THINKING: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 
 export interface Worker {
   id: string;
   sessionFile: string;
   role: WorkerRole;
   backend?: WorkerBackend;
+  avatar?: string | null;
   model?: string;
   thinking?: ThinkingLevel;
   codexThreadId?: string | null;
@@ -55,6 +56,15 @@ export interface Worker {
   codexSandbox?: "read-only" | "workspace-write" | "danger-full-access";
   codexThreadHandoff?: string | null;
   codexActiveTurnId?: string | null;
+  claudeSessionId?: string | null;
+  claudeSessionInitialized?: boolean;
+  claudeCwd?: string | null;
+  claudeCommand?: string;
+  claudePermissionMode?: "acceptEdits" | "auto" | "bypassPermissions" | "manual" | "dontAsk" | "plan";
+  claudeTools?: string;
+  claudeAllowedTools?: string[] | string;
+  claudeDisallowedTools?: string[] | string;
+  claudeBare?: boolean;
   status: WorkerStatus;
   hired: string;
   projects: ProjectRecord[];

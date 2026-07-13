@@ -7,6 +7,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { markOutsourceRunsStaleForJob } from "./outsource-agents.mjs";
 
 const TERMINAL_STATUSES = new Set(["done", "failed", "aborted", "stale"]);
 const MAX_LATEST_REPLY_CHARS = 8000;
@@ -175,8 +176,18 @@ export function markOpenJobsStale(workersDir, reason = "previous Pi process exit
       error: reason,
     });
     appendJobEvent(staleJob, { type: "stale", message: reason });
+    markLinkedOutsourceRunsStale(workersDir, staleJob, reason);
   }
   return openJobs.length;
+}
+
+function markLinkedOutsourceRunsStale(workersDir, job, reason) {
+  if (job?.kind !== "outsource-run") return;
+  try {
+    markOutsourceRunsStaleForJob(workersDir, job, reason);
+  } catch {
+    // Job recovery must not fail because an auxiliary outsource index is corrupt.
+  }
 }
 
 export function recoverOpenJobsOnStartup(
@@ -222,6 +233,7 @@ export function recoverOpenJobsOnStartup(
       recoveryCheckedAt: now.toISOString(),
     });
     appendJobEvent(staleJob, { type: "stale", message: reason });
+    markLinkedOutsourceRunsStale(workersDir, staleJob, reason);
     summary.stale++;
   }
 
@@ -300,6 +312,15 @@ export function formatToolResult(name, result, isError = false) {
 export function formatJobEvent(event) {
   if (event.type === "thinking") return `[thinking] ${truncate(event.text || "", 300)}`;
   if (event.type === "text") return `[text] ${truncate(event.text || "")}`;
+  if (event.type === "tool") {
+    const args = formatToolArgs(event.name || "", event.args);
+    const output = truncate(compactWhitespace(event.output || ""), 500);
+    const result = formatToolResult(event.name || "", event.result, event.isError);
+    const parts = [];
+    if (output) parts.push(`output: ${output}`);
+    if (result && result !== output) parts.push(`result: ${result}`);
+    return `[tool${event.isError ? ":error" : ""}] ${event.name || ""}${args ? `: ${args}` : ""}${parts.length ? ` | ${parts.join(" | ")}` : ""}`;
+  }
   if (event.type === "tool_start") {
     const args = formatToolArgs(event.name || "", event.args);
     return `[tool:start] ${event.name || ""}${args ? `: ${args}` : ""}`;
@@ -312,6 +333,8 @@ export function formatJobEvent(event) {
     const text = truncate(compactWhitespace(event.text || ""), 500);
     return `[tool:output] ${event.name || ""}${text ? `: ${text}` : ""}`;
   }
+  if (event.type === "codex_thread") return `[codex:thread] ${event.threadId || event.text || ""}`;
+  if (event.type === "claude_session") return `[claude:session] ${event.sessionId || event.text || ""}`;
   if (event.type === "error") return `[error] ${event.message || event.text || ""}`;
   if (event.type === "late_event_after_terminal") {
     return `[late event after terminal] ${event.originalType || "unknown"} ignored because job is ${event.terminalStatus || "terminal"}`;
@@ -352,6 +375,87 @@ export function compactJobEvents(events = []) {
     compacted.push(event);
   }
   flushText();
+  return compacted;
+}
+
+export function compactJobTimelineEvents(events = []) {
+  const compacted = [];
+  let textBuffer = "";
+  let textTime = null;
+  let activeTool = null;
+
+  const flushText = () => {
+    if (!textBuffer) return;
+    compacted.push({ time: textTime, type: "text", text: textBuffer });
+    textBuffer = "";
+    textTime = null;
+  };
+  const flushTool = () => {
+    if (!activeTool) return;
+    compacted.push(activeTool);
+    activeTool = null;
+  };
+  const sameTool = (event) => {
+    if (!activeTool) return false;
+    if (!event.name || !activeTool.name) return true;
+    return activeTool.name === event.name;
+  };
+  const ensureTool = (event) => {
+    if (activeTool && !sameTool(event)) flushTool();
+    if (!activeTool) {
+      activeTool = {
+        time: event.time || null,
+        type: "tool",
+        name: event.name || null,
+        args: event.args,
+        output: "",
+        isError: false,
+        sourceTypes: [],
+      };
+    }
+    if (event.name && !activeTool.name) activeTool.name = event.name;
+    if (event.args && !activeTool.args) activeTool.args = event.args;
+    if (event.time && !activeTool.time) activeTool.time = event.time;
+    activeTool.sourceTypes.push(event.type);
+    return activeTool;
+  };
+
+  for (const event of events) {
+    if (event.type === "text") {
+      flushTool();
+      if (!textBuffer) textTime = event.time || null;
+      textBuffer += event.text || "";
+      continue;
+    }
+    if (event.type === "tool_start") {
+      flushText();
+      flushTool();
+      ensureTool(event);
+      continue;
+    }
+    if (event.type === "tool_output") {
+      flushText();
+      const tool = ensureTool(event);
+      tool.output += event.text || "";
+      continue;
+    }
+    if (event.type === "tool_end") {
+      flushText();
+      const tool = ensureTool(event);
+      tool.result = event.result;
+      tool.isError = Boolean(event.isError);
+      tool.finishedAt = event.time || null;
+      flushTool();
+      continue;
+    }
+
+    flushText();
+    flushTool();
+    compacted.push(event.type === "done" && event.text ? { ...event, text: "" } : event);
+  }
+
+  flushText();
+  flushTool();
   return compacted;
 }
 

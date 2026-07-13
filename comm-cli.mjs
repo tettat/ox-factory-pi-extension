@@ -8,6 +8,7 @@ import {
   markMessageRead,
   sendAuthorizedMessage,
 } from "./comm.mjs";
+import { createWorkerTaskRequest } from "./task-requests.mjs";
 
 function arg(name) {
   const index = process.argv.indexOf(name);
@@ -23,6 +24,7 @@ function usage() {
   return [
     "Usage:",
     "  node .pi/extensions/ox-factory/comm-cli.mjs send --from 员工 --to 员工 --content 内容 [--workers-dir DIR]",
+    "  node .pi/extensions/ox-factory/comm-cli.mjs assign --from 员工 --to 员工 --task 任务 [--project 项目] [--mode auto|queue|steer|now] [--cwd DIR] [--workers-dir DIR]",
     "  node .pi/extensions/ox-factory/comm-cli.mjs inbox --worker 员工 [--unread-only] [--mark-read] [--workers-dir DIR]",
     "  node .pi/extensions/ox-factory/comm-cli.mjs check --subject 员工 --action message:send --target 员工 [--workers-dir DIR]",
     "",
@@ -46,6 +48,26 @@ try {
       content: arg("--content"),
     });
     console.log(`sent ${message.id}: ${message.from} -> ${message.to}`);
+    process.exit(0);
+  }
+
+  if (command === "assign") {
+    const from = arg("--from") || "用户";
+    const to = arg("--to");
+    if (!hasPermission(workersDir, { subject: from, action: "work:assign", target: to })) {
+      console.error(`${from} 没有权限对 ${to} 执行 work:assign`);
+      process.exit(2);
+    }
+    const request = createWorkerTaskRequest(workersDir, {
+      from,
+      to,
+      task: arg("--task") || arg("--content"),
+      project: arg("--project") || "factory-task",
+      cwd: arg("--cwd"),
+      mode: arg("--mode") || "auto",
+      source: "cli",
+    });
+    console.log(`assigned ${request.id}: ${request.from} -> ${request.to} (${request.mode})`);
     process.exit(0);
   }
 

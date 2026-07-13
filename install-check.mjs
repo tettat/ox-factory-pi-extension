@@ -108,7 +108,7 @@ if (piVersion.error?.code === "ENOENT") {
   warn("pi command exists but `pi --version` did not exit 0; verify your Pi CLI manually");
 }
 
-const secretPattern = /(Bearer\s+[A-Za-z0-9._~+/=-]{10,}|plat_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{20,})/;
+const secretPattern = /(^|[^A-Za-z0-9_])(Bearer\s+[A-Za-z0-9._~+/=-]{10,}|plat_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{20,})/m;
 const secretHits = [];
 walkFiles(here, (path) => {
   if (secretHits.length >= 20) return;
