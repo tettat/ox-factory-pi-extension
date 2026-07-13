@@ -2900,6 +2900,15 @@ test("worker talk list exposes request edit cancel and active job stop controls"
   assert.match(webStyleSource, /\.talk-list__item--request/);
 });
 
+test("worker talk list sorts jobs by submitted time instead of heartbeat updates", () => {
+  const webAppSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
+
+  assert.match(webAppSource, /function talkJobSortTime\(job\) \{/);
+  assert.match(webAppSource, /return job\?\.createdAt \|\| job\?\.updatedAt \|\| "";/);
+  assert.match(webAppSource, /\.\.\.talkJobs\.map\(\(job\) => \(\{ type: "job", at: talkJobSortTime\(job\), job \}\)\)/);
+  assert.match(webAppSource, /text: fmtRelative\(talkJobSortTime\(j\)\)/);
+});
+
 test("talk live output does not persist custom messages by default", () => {
   const indexSource = readFileSync(join(testDir, "../index.ts"), "utf8");
   assert.match(indexSource, /function shouldPersistTalkLiveMessages/);
