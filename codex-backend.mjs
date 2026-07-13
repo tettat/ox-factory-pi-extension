@@ -1,17 +1,30 @@
 import { spawn } from "node:child_process";
 import { createWriteStream, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { buildFactoryWorkerHandbook } from "./factory-handbook.mjs";
+import { buildWorkerSystemPrompt, buildWorkerTaskPrompt } from "./worker-prompts.mjs";
 
 export const DEFAULT_CODEX_SERVER_URL = "ws://127.0.0.1:48177";
 
 const LOCAL_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
+const FACTORY_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
+const PI_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
+
+export function assertWorkerThinkingSupported(backend, thinking) {
+  if (!thinking) return thinking;
+  if (!FACTORY_THINKING_LEVELS.has(thinking)) {
+    throw new Error(`Unknown thinking level: ${thinking}`);
+  }
+  if ((backend || "pi") === "pi" && !PI_THINKING_LEVELS.has(thinking)) {
+    throw new Error(`Thinking levels max and ultra are not supported by Pi workers; use Codex/Claude or lower thinking to xhigh`);
+  }
+  return thinking;
+}
 
 export function normalizeCodexEffort(thinking) {
   if (!thinking) return undefined;
   if (thinking === "off") return "none";
   if (thinking === "minimal") return "low";
-  if (["low", "medium", "high", "xhigh"].includes(thinking)) return thinking;
+  if (["low", "medium", "high", "xhigh", "max", "ultra"].includes(thinking)) return thinking;
   return undefined;
 }
 
@@ -211,6 +224,34 @@ export function getCodexServerUrl(worker = {}) {
   return worker.codexServerUrl || process.env.OX_CODEX_APP_SERVER_URL || DEFAULT_CODEX_SERVER_URL;
 }
 
+export function assertCodexThreadBinding(worker = {}) {
+  const threadId = String(worker.codexThreadId || "").trim();
+  if (!threadId) {
+    throw new Error(
+      `Codex worker ${worker.id || "(unknown)"} missing codexThreadId; refuse to start a new empty thread. ` +
+      `Repair the worker's thread binding or explicitly reset/re-hire the worker.`,
+    );
+  }
+  return threadId;
+}
+
+export function reconcileCodexThreadId(worker = {}, resumedThreadId, onWorkerPatch) {
+  const threadId = String(resumedThreadId || "").trim();
+  if (!threadId) {
+    throw new Error(`Codex worker ${worker.id || "(unknown)"} resume returned an empty thread id`);
+  }
+  if (worker.codexThreadId !== threadId) {
+    worker.codexThreadId = threadId;
+    const patch = {
+      codexThreadId: threadId,
+      codexServerUrl: getCodexServerUrl(worker),
+      model: normalizeCodexModel(worker.model) || worker.model,
+    };
+    onWorkerPatch?.(patch);
+  }
+  return threadId;
+}
+
 export function codexNotificationToStreamEvents(message) {
   if (!message || typeof message !== "object") return [];
   const params = message.params || {};
@@ -275,13 +316,8 @@ export function codexNotificationToStreamEvents(message) {
 export function buildCodexBaseInstructions(worker, agentDef = "", { workersDir } = {}) {
   const handoff = typeof worker.codexThreadHandoff === "string" ? worker.codexThreadHandoff.trim() : "";
   return [
-    `你的名字叫 **${worker.id}**，职位是 ${worker.role}。`,
-    "",
-    "你是牛马工厂里的 Codex 员工。保持这个身份和长期上下文，不要因为新的 turn 忘记之前的工作。",
-    "",
-    buildFactoryWorkerHandbook(worker, { workersDir, backend: "codex" }),
+    buildWorkerSystemPrompt(worker, { agentDef, workersDir, backend: "codex" }),
     handoff ? `\n## 旧 Codex thread handoff\n\n${handoff}` : "",
-    agentDef.trim() ? `\n${agentDef.trim()}` : "",
   ].join("\n").trim();
 }
 
@@ -439,12 +475,7 @@ function approvalPolicy(worker) {
 }
 
 export function buildCodexTaskContent({ worker, task, project, additionalContext, workersDir }) {
-  const lines = [`你的名字叫 **${worker.id}**，职位是 ${worker.role}。`, ""];
-  if (project) lines.push(`## 项目: ${project}`, "");
-  lines.push("## 任务", task);
-  if (additionalContext) lines.push("", "## 附加上下文", additionalContext);
-  lines.push("", buildFactoryWorkerHandbook(worker, { workersDir, backend: "codex" }));
-  return lines.join("\n");
+  return buildWorkerTaskPrompt({ worker, task, project, additionalContext, workersDir });
 }
 
 async function startThread(client, { worker, cwd, agentDef, workersDir, ephemeral = false }) {
@@ -494,36 +525,25 @@ async function ensureThread(client, { worker, cwd, agentDef, workersDir, onWorke
     onWorkerPatch?.({ model });
   }
 
-  if (worker.codexThreadId) {
-    try {
-      const resume = await client.request("thread/resume", {
-        threadId: worker.codexThreadId,
-        cwd: cwd || process.cwd(),
-        approvalPolicy: approvalPolicy(worker),
-        sandbox: sandboxMode(worker),
-        model: model || null,
-        baseInstructions: buildCodexBaseInstructions(worker, agentDef, { workersDir }),
-      });
-      return resume.thread.id;
-    } catch (error) {
-      if (!shouldReplaceCodexThread(error)) throw error;
-      const created = await startThread(client, { worker, cwd, agentDef, workersDir, ephemeral: false });
-      const threadId = created.thread.id;
-      worker.codexThreadId = threadId;
-      worker.codexServerUrl = url;
-      worker.codexThreadHandoff = null;
-      onWorkerPatch?.({ codexThreadId: threadId, codexServerUrl: url, model: model || worker.model, codexThreadHandoff: null });
-      return threadId;
-    }
+  const boundThreadId = assertCodexThreadBinding(worker);
+  try {
+    const resume = await client.request("thread/resume", {
+      threadId: boundThreadId,
+      cwd: cwd || process.cwd(),
+      approvalPolicy: approvalPolicy(worker),
+      sandbox: sandboxMode(worker),
+      model: model || null,
+      baseInstructions: buildCodexBaseInstructions(worker, agentDef, { workersDir }),
+    });
+    return reconcileCodexThreadId(worker, resume.thread.id, onWorkerPatch);
+  } catch (error) {
+    if (!shouldReplaceCodexThread(error)) throw error;
+    throw new Error(
+      `Codex worker ${worker.id} thread ${boundThreadId} cannot be resumed; refusing to silently create a new thread. ` +
+      `Repair codexThreadId with codex-thread-audit.mjs or explicitly reset/re-hire the worker. ` +
+      `Original error: ${error?.message || String(error)}`,
+    );
   }
-
-  const created = await startThread(client, { worker, cwd, agentDef, workersDir, ephemeral: false });
-  const threadId = created.thread.id;
-  worker.codexThreadId = threadId;
-  worker.codexServerUrl = url;
-  worker.codexThreadHandoff = null;
-  onWorkerPatch?.({ codexThreadId: threadId, codexServerUrl: url, model: model || worker.model, codexThreadHandoff: null });
-  return threadId;
 }
 
 export async function runCodexWorkerStreaming(options, onEvent) {
@@ -563,18 +583,17 @@ export async function runCodexWorkerStreaming(options, onEvent) {
     return capturedTokenUsage(id);
   };
   let resolveCompleted;
-  let rejectCompleted;
-  const completedPromise = new Promise((resolve, reject) => {
+  const completedPromise = new Promise((resolve) => {
     resolveCompleted = resolve;
-    rejectCompleted = reject;
   });
-  const timeout = setTimeout(() => rejectCompleted(new Error("Timed out waiting for Codex turn completion")), 30 * 60 * 1000);
 
   try {
     await ensureCodexAppServer(url, { workersDir });
     await client.connect();
     await client.initialize();
     const threadId = await ensureThread(client, { worker, cwd, agentDef, workersDir, onWorkerPatch });
+    result.codexThreadId = threadId;
+    onEvent({ type: "codex_thread", threadId, text: `Codex thread: ${threadId}` });
 
     client.onNotification((message) => {
       const params = message.params || {};
@@ -583,6 +602,7 @@ export async function runCodexWorkerStreaming(options, onEvent) {
       if (message.method === "turn/started" && params.turn?.id) {
         turnId = params.turn.id;
         worker.codexActiveTurnId = turnId;
+        result.codexTurnId = turnId;
         onWorkerPatch?.({ codexActiveTurnId: turnId });
       }
 
@@ -612,6 +632,7 @@ export async function runCodexWorkerStreaming(options, onEvent) {
 
     turnId = start.turn.id;
     worker.codexActiveTurnId = turnId;
+    result.codexTurnId = turnId;
     onWorkerPatch?.({ codexActiveTurnId: turnId });
 
     if (signal) {
@@ -623,7 +644,6 @@ export async function runCodexWorkerStreaming(options, onEvent) {
     }
 
     const turn = await completedPromise;
-    clearTimeout(timeout);
     result.turns = 1;
     const turnUsage = extractCodexTokenUsage(turn);
     const capturedUsage = await waitForCapturedTokenUsage(turn.id);
@@ -651,19 +671,19 @@ export async function runCodexWorkerStreaming(options, onEvent) {
       exitCode: result.exitCode,
       stopReason: result.stopReason,
       text: result.output,
+      codexThreadId: result.codexThreadId,
+      codexTurnId: result.codexTurnId,
     });
     return result;
   } catch (error) {
-    clearTimeout(timeout);
     result.exitCode = 1;
     result.stopReason = "error";
     result.errorMessage = error?.message || String(error);
     result.stderr = result.errorMessage;
     onEvent({ type: "error", message: result.errorMessage });
-    onEvent({ type: "done", turns: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0, model: result.model, exitCode: 1, stopReason: "error", text: result.output });
+    onEvent({ type: "done", turns: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0, model: result.model, exitCode: 1, stopReason: "error", text: result.output, codexThreadId: result.codexThreadId, codexTurnId: result.codexTurnId });
     return result;
   } finally {
-    clearTimeout(timeout);
     worker.codexActiveTurnId = undefined;
     onWorkerPatch?.({ codexActiveTurnId: undefined });
     client.close();

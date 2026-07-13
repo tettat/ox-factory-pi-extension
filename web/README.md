@@ -2,9 +2,6 @@
 
 > read-first 的工厂指挥舱：亮色 + 玻璃感 + 状态光点 + 细线网格。**纯只读**，不写权限 / 不派活 / 不 apply 主 agent 压缩 / 不扫全局 session。
 
-负责人：**八村**（designer + 实现） · Reviewer：**派派**
-
----
 
 ## 启动
 
@@ -176,7 +173,7 @@ Pi (真实) vs Codex (shadow) side-by-side 摘要对比，按时间倒序，最�
 GET /api/health                            HTTP 200
 GET /api/overview                          HTTP 200  (15 workers, 278 jobs, 7 risks, 8 projects)
 GET /api/workers                           HTTP 200
-GET /api/workers/八村                       HTTP 200  (4 jobs, 6 inbox, tokenToday=1.42M)
+GET /api/workers/Alice                      HTTP 200  (4 jobs, 6 inbox, tokenToday=1.42M)
 GET /api/jobs?limit=5&status=done          HTTP 200
 GET /api/jobs/20260702065930-_-s0kxkl      HTTP 200  (100 events)
 GET /api/projects                          HTTP 200
@@ -218,9 +215,9 @@ GET /api/messages                          HTTP 400  (worker required)
 
 **Worker 卡片「消息 N」说明**：当前 `/api/workers` 返回的 `unreadMessages` 字段，实际语义是「主 agent 收件箱中 to=该员工 的消息数」，并不是 per-worker 真正的未读数。Phase 1 文案已改为「消息 N」以避免误导；Phase 2 计划做完整的 per-worker inbox 聚合函数。
 
-## 派派 review 重点
+## Review 重点
 
-派派 review 时建议关注：
+Release review 时建议关注：
 
 1. **是不是"工厂大盘"** — Overview 7 大块信息是否回答"工厂现在怎么样"
 2. **有没有 agent 对话/消息视角** — Overview 消息预览 + Workers 详情收件箱/发件

@@ -1,32 +1,80 @@
 #!/usr/bin/env node
-// 牛马工厂本地只读 Web 驾驶舱 (Phase 1)
+// 牛马工厂本地 Web 驾驶舱 (Phase 1)
 // ---------------------------------------------------------------------------
-// 目标：把 .pi/workers/ 下的工厂运行数据聚合成一个本地只读仪表盘。
-// 边界：纯只读。不写权限 / 不派活 / 不 apply 主 agent 压缩 / 不扫全局 session。
+// 目标：把 .pi/workers/ 下的工厂运行数据聚合成一个本地仪表盘。
+// 边界：读优先；Web talk/control 只写 intent，由 Pi 主进程接管执行。不写权限 / 不 apply 主 agent 压缩 / 不扫全局 session。
 // 数据：复用 jobs / comm / token-report / report-context / compaction 现有模块。
 // ---------------------------------------------------------------------------
 
 import { createServer } from "node:http";
-import { existsSync, readFileSync, statSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { extname, isAbsolute, join, resolve, dirname, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { homedir } from "node:os";
 
-import { listJobs, readJob, tailJobEvents, latestReplyFromEvents } from "./jobs.mjs";
+import {
+  listJobs,
+  readJob,
+  tailJobEvents,
+  latestReplyFromEvents,
+  compactJobTimelineEvents,
+  formatJobEvent,
+} from "./jobs.mjs";
 import {
   readPermissions,
+  hasPermission,
   listPermissions,
   listMessages,
+  markMessageRead,
+  markWorkerMessagesRead,
   formatPermissions,
   formatMessages,
   messagesFile,
   permissionEventsFile,
 } from "./comm.mjs";
 import {
+  cancelWebTalkRequest,
   createWebTalkRequest,
+  createWebTalkJobControlRequest,
+  editWebTalkRequest,
+  getWebTalkJobControlRequest,
   getWebTalkRequest,
+  listWebTalkJobControlRequests,
   listWebTalkRequests,
+  normalizeWebTalkMode,
 } from "./web-talk.mjs";
+import {
+  buildWorkerJobUnreadSummary,
+  markWebJobRead,
+  markWorkerJobsRead,
+} from "./web-job-read.mjs";
+import {
+  createMainAgentTalkRequest,
+  getMainAgentTalkRequest,
+  listMainAgentTalkRequests,
+} from "./main-agent-talk.mjs";
+import {
+  cancelWorkerTaskRequest,
+  createWorkerTaskRequest,
+  editWorkerTaskRequest,
+  getWorkerTaskRequest,
+  listWorkerTaskRequests,
+  normalizeWorkerTaskMode,
+} from "./task-requests.mjs";
+import {
+  findMainSessionFile,
+  getWorkerRegistrySnapshot,
+} from "./worker-registry-snapshot.mjs";
+import {
+  listOutsourceProfiles,
+  getOutsourceProfile,
+  listOutsourceRuns,
+  getOutsourceRun,
+  OUTSOURCE_TERMINAL_STATUSES,
+} from "./outsource-agents.mjs";
+import {
+  normalizeOutsourceWait,
+  startOutsourceRunJob,
+} from "./outsource-dispatcher.mjs";
 import { buildFactoryTokenReport, buildFactoryTokenTrend, formatFactoryTokenReport, localDateString } from "./token-report.mjs";
 import { buildFactoryReportContext, formatFactoryReportContext } from "./report-context.mjs";
 import {
@@ -40,12 +88,14 @@ import {
   summarizeResponsibilities,
 } from "./responsibilities.mjs";
 import { listProjects as listStoredProjects, resolveProject as resolveStoredProject } from "./projects.mjs";
+import { markdownPreviewText } from "./markdown-preview.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const WEB_DIR = join(__dirname, "web");
 const VERSION = "phase-1-0.1.0";
 const REPO_ROOT = resolve(__dirname, "..", "..", "..");
+const AVATAR_DIR = resolve(process.env.OX_FACTORY_AVATAR_DIR || "/tmp/ox-factory-avatars");
 const QUALITY_CACHE_TTL_MS = 30_000;
 const JOB_DETAIL_REPLY_MAX_CHARS = 200_000;
 const qualityMetricsCache = new Map();
@@ -89,6 +139,67 @@ function printHelp() {
       "",
     ].join("\n"),
   );
+}
+
+// ---------------------------------------------------------------------------
+// 外包判定 (可复用且可测试)
+// ---------------------------------------------------------------------------
+
+/**
+ * 判断一个 job 是否是外包执行的。
+ * 可靠识别 kind === "outsource-run"；同时对 worker 名做防御性识别。
+ */
+export function isOutsourceJob(job) {
+  if (!job || typeof job !== "object") return false;
+  if (job.kind && String(job.kind).toLowerCase() === "outsource-run") return true;
+  if (isOutsourceWorkerName(job.worker)) return true;
+  return false;
+}
+
+/**
+ * 判断 worker 名是否是外包虚拟 worker（以 "外包:" 开头）。
+ * 防御性识别，避免历史数据/registry/session 污染正式员工列表。
+ */
+export function isOutsourceWorkerName(name) {
+  if (!name) return false;
+  return String(name).trim().startsWith("外包:");
+}
+
+/**
+ * 计算可靠的完成时间：finishedAt → completedAt → cancelledAt → staleAt → updatedAt。
+ * @param {object} run - outsource run 或 job 对象
+ * @returns {string|null} ISO 时间字符串或 null
+ */
+export function computeReliableFinishedAt(run) {
+  if (!run || typeof run !== "object") return null;
+  const explicitFinishedAt = run.finishedAt || run.completedAt || run.cancelledAt || run.staleAt;
+  if (explicitFinishedAt) return explicitFinishedAt;
+  return OUTSOURCE_TERMINAL_STATUSES.has(run.status) ? run.updatedAt || null : null;
+}
+
+/**
+ * 计算可靠的耗时（毫秒）。
+ * 优先使用持久化的 elapsedMs；否则用 startedAt 或 createdAt 到 finishedAt 计算。
+ * @param {object} run - outsource run 或 job 对象
+ * @param {object} [finishedInfo] - 可选的完成时间覆盖 { finishedAt }
+ * @returns {number|null} 毫秒数或 null
+ */
+export function computeReliableElapsedMs(run, finishedInfo = {}) {
+  if (!run || typeof run !== "object") return null;
+  // 优先使用持久化的 elapsedMs；合法的 0 也接受
+  if (typeof run.elapsedMs === "number" && Number.isFinite(run.elapsedMs) && run.elapsedMs >= 0) return run.elapsedMs;
+  // elapsedSeconds 兜底（job 字段）
+  if (typeof run.elapsedSeconds === "number" && Number.isFinite(run.elapsedSeconds) && run.elapsedSeconds >= 0) return run.elapsedSeconds * 1000;
+  // 计算 startedAt → finishedAt
+  const finishedAt = finishedInfo.finishedAt || computeReliableFinishedAt(run);
+  if (!finishedAt) return null;
+  const startAt = run.startedAt || run.createdAt;
+  if (!startAt) return null;
+  const startMs = Date.parse(startAt);
+  const finishMs = Date.parse(finishedAt);
+  if (!Number.isFinite(startMs) || !Number.isFinite(finishMs)) return null;
+  const elapsed = finishMs - startMs;
+  return Number.isFinite(elapsed) && elapsed >= 0 ? elapsed : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -149,12 +260,12 @@ function listSessionWorkers(workersDir) {
     .map((n) => n.slice(0, -".jsonl".length));
 }
 
-function uniqueWorkers(workersDir) {
-  const sessions = listSessionWorkers(workersDir);
+export function uniqueWorkers(workersDir) {
+  const sessions = listSessionWorkers(workersDir).filter((n) => !isOutsourceWorkerName(n));
   const jobs = listJobs(workersDir, { limit: 100000 });
   const set = new Set(sessions);
   for (const job of jobs) {
-    if (job.worker) set.add(String(job.worker));
+    if (job.worker && !isOutsourceJob(job)) set.add(String(job.worker));
   }
   return [...set].filter(Boolean).sort((a, b) => a.localeCompare(b, "zh-Hans-CN"));
 }
@@ -164,7 +275,12 @@ function summarizeJobForOverview(job) {
     id: job.id,
     status: job.status,
     worker: job.worker,
+    kind: job.kind || "",
     project: job.project || "",
+    displayChannel: job.displayChannel || "",
+    source: job.source || "",
+    assignedBy: job.assignedBy || "",
+    returnTo: job.returnTo || "",
     model: job.model || null,
     task: compactText(job.task || "", 80),
     createdAt: job.createdAt,
@@ -291,7 +407,7 @@ function pickStatus(jobs) {
 // ---------------------------------------------------------------------------
 // 派生项目视角 (从 job.project 聚合)
 // ---------------------------------------------------------------------------
-function buildProjectStrips(workersDir) {
+export function buildProjectStrips(workersDir) {
   const jobs = listJobs(workersDir, { limit: 100000 });
   const byProject = new Map();
   for (const job of jobs) {
@@ -310,7 +426,8 @@ function buildProjectStrips(workersDir) {
     const p = byProject.get(name);
     p.total += 1;
     p.byStatus[job.status] = (p.byStatus[job.status] || 0) + 1;
-    if (job.worker) p.participants.add(job.worker);
+    // 只把正式员工加入 participants，外包虚拟 worker 排除
+    if (job.worker && !isOutsourceJob(job)) p.participants.add(job.worker);
     const lastTs = job.updatedAt || job.createdAt;
     if (lastTs && String(lastTs).localeCompare(String(p.lastActivity)) > 0) {
       p.lastActivity = lastTs;
@@ -378,109 +495,24 @@ function buildRisks(workersDir, jobs, compactions) {
   return risks.sort((a, b) => String(b.at || "").localeCompare(String(a.at || ""))).slice(0, 8);
 }
 
-// ---------------------------------------------------------------------------
-// Worker Registry Snapshot (从主 session 恢复 role/backend/model/thinking)
-// ---------------------------------------------------------------------------
-const _registryCache = { map: null, file: null, mtime: 0 };
-
-function findMainSessionFile(workersDir) {
-  // 从 workersDir 反推项目根: <project>/.pi/workers → <project>
-  const projectRoot = resolve(workersDir, "..", "..");
-  const sanitized = projectRoot.replace(/^\//, "").replace(/\//g, "-");
-  const sessionDirName = "--" + sanitized + "--";
-  const mainSessionDir = join(homedir(), ".pi", "agent", "sessions", sessionDirName);
-  if (!existsSync(mainSessionDir)) return null;
-  // 取最新的 .jsonl（排除 .bak）
-  const files = readdirSync(mainSessionDir)
-    .filter((f) => f.endsWith(".jsonl") && !f.includes(".bak"))
-    .map((f) => {
-      const fp = join(mainSessionDir, f);
-      return { fp, mtime: statSync(fp).mtimeMs };
-    })
-    .sort((a, b) => b.mtime - a.mtime);
-  return files[0]?.fp || null;
-}
-
-function scanWorkerEntries(sessionFile) {
-  // 逐行扫描 ox-worker-* custom entries，重建 registry
-  const workers = new Map();
-  try {
-    const lines = readFileSync(sessionFile, "utf8").split("\n");
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      let obj;
-      try { obj = JSON.parse(line); } catch { continue; }
-      const ct = obj.customType;
-      if (!ct || !ct.startsWith("ox-worker-")) continue;
-      const d = obj.data || {};
-      const wid = d.workerId;
-      if (!wid) continue;
-
-      if (ct === "ox-worker-hire") {
-        workers.set(wid, {
-          role: d.role || null,
-          backend: d.backend || "pi",
-          model: d.model || null,
-          thinking: d.thinking || null,
-          hired: d.hired || null,
-          status: d.status || "idle",
-          fired: false,
-        });
-      } else if (ct === "ox-worker-config") {
-        const w = workers.get(wid);
-        if (w) {
-          if (d.backend) w.backend = d.backend;
-          if (d.model) w.model = d.model;
-          if (d.thinking) w.thinking = d.thinking;
-        }
-      } else if (ct === "ox-worker-promote") {
-        const w = workers.get(wid);
-        if (w && d.to) w.role = d.to;
-      } else if (ct === "ox-worker-fire") {
-        const w = workers.get(wid);
-        if (w) {
-          w.fired = true;
-          w.status = "fired";
-        }
-      } else if (ct === "ox-worker-status") {
-        const w = workers.get(wid);
-        if (w && d.status && d.status !== "working") w.status = d.status;
-      }
-    }
-  } catch {
-    // 读取失败返回空
-  }
-  // 过滤掉已解雇的
-  for (const [name, info] of workers) {
-    if (info.fired) workers.delete(name);
-  }
-  return workers;
-}
-
 function getWorkerRegistry(workersDir) {
-  const sessionFile = findMainSessionFile(workersDir);
-  if (!sessionFile) return new Map();
-
-  const mtime = statSync(sessionFile).mtimeMs;
-  if (_registryCache.map && _registryCache.file === sessionFile && _registryCache.mtime === mtime) {
-    return _registryCache.map;
-  }
-
-  const map = scanWorkerEntries(sessionFile);
-  _registryCache.map = map;
-  _registryCache.file = sessionFile;
-  _registryCache.mtime = mtime;
-  return map;
+  return getWorkerRegistrySnapshot(workersDir);
 }
 
 // ---------------------------------------------------------------------------
 // 员工视角聚合 (含今日 token / 最新 job / 未读消息)
 // ---------------------------------------------------------------------------
-function buildWorkersView(workersDir, jobs, tokenReport, messages, registry) {
+export function buildWorkersView(workersDir, jobs, tokenReport, messages, registry) {
   const reg = registry || getWorkerRegistry(workersDir);
-  const names = [...new Set([...uniqueWorkers(workersDir), ...reg.keys()])]
+  // 过滤掉外包虚拟 worker（防御性：sessions/registry 里可能有 外包: 污染）
+  const allNames = [...new Set([...uniqueWorkers(workersDir), ...reg.keys()])]
     .filter(Boolean)
+    .filter((n) => !isOutsourceWorkerName(n))
     .sort((a, b) => a.localeCompare(b, "zh-Hans-CN"));
+  const names = allNames;
+  const unreadJobs = buildWorkerJobUnreadSummary(workersDir, jobs || []);
+  const talkRequests = listWebTalkRequests(workersDir, { limit: 10000 });
+  const messageEvents = safeReadJsonl(messagesFile(workersDir));
   const tokenMap = new Map((tokenReport?.workers || []).map((t) => [t.worker, t]));
   const responsibilityMap = new Map();
   for (const responsibility of listWorkerResponsibilities(workersDir)) {
@@ -488,10 +520,48 @@ function buildWorkersView(workersDir, jobs, tokenReport, messages, registry) {
     list.push(responsibility);
     responsibilityMap.set(responsibility.worker, list);
   }
-  const msgCount = new Map();
-  for (const m of messages) {
-    const key = m.to;
-    msgCount.set(key, (msgCount.get(key) || 0) + 1);
+  const messageReads = new Map();
+  for (const event of messageEvents) {
+    if (event.type !== "read" || !event.worker || !event.messageId) continue;
+    const reads = messageReads.get(event.worker) || new Set();
+    reads.add(event.messageId);
+    messageReads.set(event.worker, reads);
+  }
+  const messageStats = new Map();
+  function ensureMessageStats(worker) {
+    const key = String(worker || "").trim();
+    if (!key) return null;
+    if (!messageStats.has(key)) messageStats.set(key, { unread: 0, lastMessageAt: null });
+    return messageStats.get(key);
+  }
+  function bumpMessageAt(worker, at) {
+    const stats = ensureMessageStats(worker);
+    if (!stats || !at) return;
+    if (!stats.lastMessageAt || String(at).localeCompare(String(stats.lastMessageAt)) > 0) stats.lastMessageAt = at;
+  }
+  for (const event of messageEvents) {
+    if (event.type !== "message" || !event.id) continue;
+    const at = event.createdAt || null;
+    if (event.from && event.from !== "*") bumpMessageAt(event.from, at);
+    if (event.to === "*") {
+      for (const name of names) {
+        if (name === event.from) continue;
+        bumpMessageAt(name, at);
+        if (!messageReads.get(name)?.has(event.id)) ensureMessageStats(name).unread += 1;
+      }
+    } else if (event.to) {
+      bumpMessageAt(event.to, at);
+      if (!messageReads.get(event.to)?.has(event.id)) ensureMessageStats(event.to).unread += 1;
+    }
+  }
+  const requestAtByWorker = new Map();
+  for (const request of talkRequests) {
+    const worker = String(request.worker || "").trim();
+    if (!worker) continue;
+    const at = request.acceptedAt || request.createdAt || request.editedAt || null;
+    if (!at) continue;
+    const previous = requestAtByWorker.get(worker);
+    if (!previous || String(at).localeCompare(String(previous)) > 0) requestAtByWorker.set(worker, at);
   }
   const jobsByWorker = new Map();
   for (const j of jobs) {
@@ -506,12 +576,38 @@ function buildWorkersView(workersDir, jobs, tokenReport, messages, registry) {
     const regInfo = reg.get(name) || {};
     const status = regInfo.status === "vacation" ? "vacation" : pickStatus(jobsForWorker);
     const token = tokenMap.get(name);
-    const unread = msgCount.get(name) || 0;
+    const messageStat = messageStats.get(name) || {};
+    const unread = messageStat.unread || 0;
+    const unreadJobState = unreadJobs.byWorker.get(name) || {};
+    const unreadJobUpdates = unreadJobState.unreadJobs || 0;
+    const unreadJobEvents = unreadJobState.unreadEvents || 0;
+    const unreadCount = unread + unreadJobUpdates;
     const responsibilities = responsibilityMap.get(name) || [];
+    const lastJobAt = jobsForWorker[0]?.updatedAt || jobsForWorker[0]?.createdAt || null;
+    const lastReplyJob = jobsForWorker.find((job) =>
+      (job.kind === "talk" || job.project === "talk" || job.displayChannel === "talk")
+      && compactText(job.fullOutput || job.summary || job.error || "", 1)
+    );
+    const lastTalkReply = lastReplyJob
+      ? {
+          jobId: lastReplyJob.id,
+          status: lastReplyJob.status,
+          project: lastReplyJob.project || "",
+          contentPreview: markdownPreviewText(lastReplyJob.fullOutput || lastReplyJob.summary || lastReplyJob.error || "", { max: 120 }),
+          updatedAt: lastReplyJob.updatedAt || lastReplyJob.finishedAt || lastReplyJob.createdAt || null,
+        }
+      : null;
+    const lastInteractionAt = [
+      messageStat.lastMessageAt,
+      requestAtByWorker.get(name),
+      unreadJobState.lastUnreadAt,
+      lastJobAt,
+    ].filter(Boolean).sort().at(-1) || null;
     return {
       name,
       status,
       role: regInfo.role || null,
+      avatar: regInfo.avatar || null,
       backend: regInfo.backend || null,
       model: regInfo.model || null,
       thinking: regInfo.thinking || null,
@@ -536,8 +632,22 @@ function buildWorkersView(workersDir, jobs, tokenReport, messages, registry) {
             source: token.source,
           }
         : null,
+      lastTalkReply,
       unreadMessages: unread,
+      unreadJobUpdates,
+      unreadJobEvents,
+      unreadCount,
+      lastUnreadAt: unreadJobState.lastUnreadAt || null,
+      lastInteractionAt,
     };
+  }).sort((a, b) => {
+    const aInteraction = String(a.lastInteractionAt || "");
+    const bInteraction = String(b.lastInteractionAt || "");
+    if (aInteraction || bInteraction) return bInteraction.localeCompare(aInteraction);
+    const aActive = a.status === "idle" ? 0 : 1;
+    const bActive = b.status === "idle" ? 0 : 1;
+    if (aActive !== bActive) return bActive - aActive;
+    return String(a.name || "").localeCompare(String(b.name || ""), "zh-Hans-CN");
   });
 }
 
@@ -553,13 +663,13 @@ function buildRouter({ workersDir }) {
     if (method === "OPTIONS") {
       res.writeHead(204, {
         "access-control-allow-origin": "*",
-        "access-control-allow-methods": "GET,OPTIONS,POST",
+        "access-control-allow-methods": "GET,OPTIONS,POST,PATCH,DELETE",
         "access-control-allow-headers": "content-type",
       });
       res.end();
       return;
     }
-    // /api/talk/:worker 接受 POST；其余仍只 GET
+    // /api/talk/:worker 与 /api/main-agent/talk 接受 POST；其余仍只 GET
     if (method === "POST" && pathname.startsWith("/api/talk/")) {
       try {
         const body = await readJsonBody(req);
@@ -568,9 +678,89 @@ function buildRouter({ workersDir }) {
         return errorResponse(res, 400, `读取请求体失败: ${err.message}`);
       }
     }
+    if (method === "POST" && pathname === "/api/main-agent/talk") {
+      try {
+        const body = await readJsonBody(req);
+        return await handleMainAgentTalkMessage(workersDir, res, body);
+      } catch (err) {
+        return errorResponse(res, 400, `读取请求体失败: ${err.message}`);
+      }
+    }
+    if (method === "POST" && pathname === "/api/task-requests") {
+      try {
+        const body = await readJsonBody(req);
+        return await handleWorkerTaskRequestCreate(workersDir, res, body);
+      } catch (err) {
+        return errorResponse(res, 400, `读取请求体失败: ${err.message}`);
+      }
+    }
+    if ((method === "POST" || method === "PATCH") && pathname === "/api/outsource/runs") {
+      try {
+        const body = await readJsonBody(req);
+        return await handleOutsourceRunCreate(workersDir, res, body);
+      } catch (err) {
+        return errorResponse(res, 400, `读取请求体失败: ${err.message}`);
+      }
+    }
+    if ((method === "PATCH" || method === "POST") && pathname.startsWith("/api/task-requests/")) {
+      try {
+        const body = await readJsonBody(req);
+        return await handleWorkerTaskRequestMutation(workersDir, res, pathname, method, body);
+      } catch (err) {
+        return errorResponse(res, 400, `读取请求体失败: ${err.message}`);
+      }
+    }
+    if ((method === "PATCH" || method === "POST") && pathname.startsWith("/api/talk-requests/")) {
+      try {
+        const body = await readJsonBody(req);
+        return await handleTalkRequestMutation(workersDir, res, pathname, method, body);
+      } catch (err) {
+        return errorResponse(res, 400, `读取请求体失败: ${err.message}`);
+      }
+    }
+    if (method === "POST" && pathname.match(/^\/api\/jobs\/[^/]+\/(read|cancel)$/)) {
+      try {
+        const body = await readJsonBody(req);
+        return await handleJobMutation(workersDir, res, pathname, method, body);
+      } catch (err) {
+        return errorResponse(res, 400, `读取请求体失败: ${err.message}`);
+      }
+    }
+    if (method === "POST" && pathname.match(/^\/api\/messages\/[^/]+\/read$/)) {
+      try {
+        const body = await readJsonBody(req);
+        return await handleMessageMutation(workersDir, res, pathname, body);
+      } catch (err) {
+        return errorResponse(res, 400, `读取请求体失败: ${err.message}`);
+      }
+    }
+    if (method === "POST" && pathname.match(/^\/api\/workers\/[^/]+\/messages\/read$/)) {
+      try {
+        const body = await readJsonBody(req);
+        return await handleWorkerMessagesRead(workersDir, res, pathname, body);
+      } catch (err) {
+        return errorResponse(res, 400, `读取请求体失败: ${err.message}`);
+      }
+    }
+    if (method === "POST" && pathname.match(/^\/api\/workers\/[^/]+\/read$/)) {
+      try {
+        const body = await readJsonBody(req);
+        return await handleWorkerRead(workersDir, res, pathname, body);
+      } catch (err) {
+        return errorResponse(res, 400, `读取请求体失败: ${err.message}`);
+      }
+    }
+    if (method === "PATCH" && pathname.match(/^\/api\/jobs\/[^/]+$/)) {
+      try {
+        const body = await readJsonBody(req);
+        return await handleJobMutation(workersDir, res, pathname, method, body);
+      } catch (err) {
+        return errorResponse(res, 400, `读取请求体失败: ${err.message}`);
+      }
+    }
     if (method !== "GET") {
       res.writeHead(405, {
-        "allow": "GET, OPTIONS, POST /api/talk/*",
+        "allow": "GET, OPTIONS, POST /api/talk/*, POST /api/main-agent/talk, POST /api/task-requests, POST/PATCH /api/outsource/runs, PATCH /api/task-requests/*, POST /api/task-requests/*/cancel, PATCH /api/talk-requests/*, POST /api/talk-requests/*/cancel, POST /api/jobs/*/read, POST /api/jobs/*/cancel, PATCH /api/jobs/*, POST /api/messages/*/read, POST /api/workers/*/messages/read, POST /api/workers/*/read",
         "content-type": "application/json; charset=utf-8",
         "cache-control": "no-store",
       });
@@ -580,6 +770,7 @@ function buildRouter({ workersDir }) {
 
     try {
       if (pathname === "/api/health") return handleHealth(res);
+      if (pathname.startsWith("/api/avatars/")) return await handleAvatarAsset(res, pathname);
       if (pathname === "/api/overview") return await handleOverview(workersDir, res);
       if (pathname === "/api/workers") return await handleWorkers(workersDir, res);
       if (pathname.startsWith("/api/workers/")) {
@@ -589,7 +780,7 @@ function buildRouter({ workersDir }) {
       if (pathname === "/api/jobs") return await handleJobs(workersDir, res, url);
       if (pathname.startsWith("/api/jobs/")) {
         const id = decodeURIComponent(pathname.slice("/api/jobs/".length));
-        return await handleJobDetail(workersDir, res, id);
+        return await handleJobDetail(workersDir, res, id, url);
       }
       if (pathname === "/api/report-context") return await handleReportContext(workersDir, res, url);
       if (pathname === "/api/tokens") return await handleTokens(workersDir, res, url);
@@ -598,8 +789,18 @@ function buildRouter({ workersDir }) {
       if (pathname === "/api/quality-metrics") return await handleQualityMetrics(workersDir, res, url);
       if (pathname === "/api/permissions") return await handlePermissions(workersDir, res);
       if (pathname === "/api/messages") return await handleMessages(workersDir, res, url);
+      if (pathname === "/api/task-requests" || pathname.startsWith("/api/task-requests/")) {
+        return await handleWorkerTaskRequestStatus(workersDir, res, pathname, url);
+      }
       if (pathname === "/api/talk-requests" || pathname.startsWith("/api/talk-requests/")) {
         return await handleTalkRequestStatus(workersDir, res, pathname, url);
+      }
+      if (pathname === "/api/job-controls" || pathname.startsWith("/api/job-controls/")) {
+        return await handleJobControlStatus(workersDir, res, pathname, url);
+      }
+      if (pathname === "/api/main-agent/transcript") return await handleMainAgentTranscript(workersDir, res, url);
+      if (pathname === "/api/main-agent/talk-requests" || pathname.startsWith("/api/main-agent/talk-requests/")) {
+        return await handleMainAgentTalkRequestStatus(workersDir, res, pathname, url);
       }
       if (pathname === "/api/projects") return await handleProjects(workersDir, res);
       if (pathname === "/api/project-doc") return await handleProjectDoc(workersDir, res, url);
@@ -609,6 +810,16 @@ function buildRouter({ workersDir }) {
       }
       if (pathname === "/api/schedules") return await handleSchedules(workersDir, res, url);
       if (pathname === "/api/responsibilities") return await handleResponsibilities(workersDir, res, url);
+      if (pathname === "/api/outsource/profiles") return await handleOutsourceProfiles(workersDir, res);
+      if (pathname.startsWith("/api/outsource/profiles/")) {
+        const name = decodeURIComponent(pathname.slice("/api/outsource/profiles/".length));
+        return await handleOutsourceProfile(workersDir, res, name);
+      }
+      if (pathname === "/api/outsource/runs") return await handleOutsourceRuns(workersDir, res, url);
+      if (pathname.startsWith("/api/outsource/runs/")) {
+        const runId = decodeURIComponent(pathname.slice("/api/outsource/runs/".length));
+        return await handleOutsourceRun(workersDir, res, runId);
+      }
       if (pathname.startsWith("/api/")) {
         return jsonResponse(res, 404, {
           ok: false,
@@ -658,6 +869,12 @@ function handleHealth(res) {
     version: VERSION,
     service: "ox-factory-web-dashboard",
     phase: "1",
+    features: {
+      taskRequests: true,
+      compactJobTimeline: true,
+      mainAgentTalk: true,
+      workerTalkRequests: true,
+    },
     timestamp: new Date().toISOString(),
   });
 }
@@ -814,13 +1031,21 @@ async function handleWorkerDetail(workersDir, res, name) {
   const jobs = listJobs(workersDir, { worker: name, limit: 200 }).sort((a, b) =>
     String(b.createdAt).localeCompare(String(a.createdAt)),
   );
+  const talkRequests = listWebTalkRequests(workersDir, { worker: name, limit: 50 }).reverse();
   const inbox = listMessages(workersDir, { worker: name, limit: 50, includeSent: true });
+  const unreadIncomingMessages = listMessages(workersDir, { worker: name, unreadOnly: true, limit: 100000 })
+    .filter((m) => m.from !== name && (m.to === name || m.to === "*"));
   const tokenReport = buildFactoryTokenReport({ workersDir, date: localDateString(new Date()), worker: name });
   const responsibilities = listWorkerResponsibilities(workersDir, { worker: name });
+  const unreadJobState = buildWorkerJobUnreadSummary(workersDir, jobs).byWorker.get(name) || {};
+  const unreadMessages = unreadIncomingMessages.length;
+  const unreadJobUpdates = unreadJobState.unreadJobs || 0;
+  const unreadJobEvents = unreadJobState.unreadEvents || 0;
   return jsonResponse(res, 200, {
     name,
     status: regInfo.status === "vacation" ? "vacation" : pickStatus(jobs),
     role: regInfo.role || null,
+    avatar: regInfo.avatar || null,
     backend: regInfo.backend || null,
     model: regInfo.model || null,
     thinking: regInfo.thinking || null,
@@ -829,6 +1054,31 @@ async function handleWorkerDetail(workersDir, res, name) {
     responsibilities,
     jobCount: jobs.length,
     jobs: jobs.map(summarizeJobForOverview),
+    talkRequests: talkRequests.map((request) => ({
+      id: request.id,
+      status: request.status,
+      worker: request.worker,
+      from: request.from || null,
+      source: request.source || null,
+      message: request.message || "",
+      mode: request.mode || "auto",
+      deliveryMode: request.deliveryMode || request.resolvedMode || null,
+      placement: request.placement || null,
+      jobId: request.jobId || null,
+      createdAt: request.createdAt,
+      updatedAt: request.editedAt || request.acceptedAt || request.cancelledAt || request.failedAt || request.claimedAt || request.createdAt,
+      claimedAt: request.claimedAt || null,
+      acceptedAt: request.acceptedAt || null,
+      failedAt: request.failedAt || null,
+      cancelledAt: request.cancelledAt || null,
+      error: request.error || null,
+      cancelReason: request.cancelReason || null,
+    })),
+    unreadMessages,
+    unreadJobUpdates,
+    unreadJobEvents,
+    unreadCount: unreadMessages + unreadJobUpdates,
+    lastUnreadAt: unreadJobState.lastUnreadAt || null,
     inbox: inbox.map((m) => ({
       id: m.id,
       from: m.from,
@@ -883,13 +1133,25 @@ async function handleJobs(workersDir, res, url) {
   });
 }
 
-async function handleJobDetail(workersDir, res, id) {
+function jobDetailEventDisplayText(event) {
+  if (!event) return "";
+  if (event.type === "text" || event.type === "thinking") return event.text || "";
+  if (["tool", "tool_start", "tool_output", "tool_end", "done", "codex_thread", "claude_session"].includes(event.type)) {
+    return formatJobEvent(event);
+  }
+  return event.text || event.message || formatJobEvent(event);
+}
+
+async function handleJobDetail(workersDir, res, id, url = null) {
   if (!id) return badRequest(res, "job id required");
   const jobFile = join(workersDir, "jobs", `${id}.json`);
   if (!existsSync(jobFile)) return notFound(res, `job ${id} not found`);
   const job = readJob(jobFile);
-  const events = tailJobEvents(job, 100);
-  const latestReply = latestReplyFromEvents(events);
+  const rawEvents = tailJobEvents(job, 500);
+  const events = compactJobTimelineEvents(rawEvents).slice(-100);
+  const markRead = url?.searchParams?.get("markRead") !== "0";
+  const readMarker = markRead ? markWebJobRead(workersDir, job, { readBy: "web" }) : null;
+  const latestReply = latestReplyFromEvents(rawEvents);
   const fullReply = detailText(job.fullOutput || latestReply || job.summary || "");
   return jsonResponse(res, 200, {
     id: job.id,
@@ -897,6 +1159,10 @@ async function handleJobDetail(workersDir, res, id) {
     kind: job.kind,
     worker: job.worker,
     project: job.project || "",
+    displayChannel: job.displayChannel || "",
+    source: job.source || "",
+    assignedBy: job.assignedBy || "",
+    returnTo: job.returnTo || "",
     task: job.task,
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
@@ -910,11 +1176,18 @@ async function handleJobDetail(workersDir, res, id) {
     fullReplyTruncated: fullReply.truncated,
     fullReplyLimit: fullReply.limit,
     error: job.error || null,
+    read: readMarker
+      ? {
+          marked: true,
+          readAt: readMarker.readAt,
+          eventOffset: readMarker.eventOffset,
+        }
+      : { marked: false },
     events: events.map((e) => ({
       time: e.time,
       type: e.type,
       name: e.name || null,
-      text: e.text || null,
+      text: jobDetailEventDisplayText(e) || null,
       message: e.message || null,
       isError: Boolean(e.isError),
     })),
@@ -1072,6 +1345,57 @@ async function handleMessages(workersDir, res, url) {
   });
 }
 
+async function handleMessageMutation(workersDir, res, pathname, body) {
+  const match = pathname.match(/^\/api\/messages\/([^/]+)\/read$/);
+  if (!match) return notFound(res, "路径格式错误");
+  const messageId = decodeURIComponent(match[1]);
+  const worker = String(body?.worker || "").trim();
+  if (!messageId) return badRequest(res, "message id required");
+  if (!worker) return badRequest(res, "worker required");
+
+  const visible = listMessages(workersDir, { worker, includeSent: true, limit: 100000 })
+    .find((message) => message.id === messageId);
+  if (!visible) return notFound(res, `message ${messageId} not found for ${worker}`);
+  if (visible.from === worker && visible.to !== worker && visible.to !== "*") {
+    return jsonResponse(res, 200, { ok: true, skipped: true, reason: "outgoing message" });
+  }
+
+  const read = markMessageRead(workersDir, { worker, messageId });
+  return jsonResponse(res, 200, { ok: true, read });
+}
+
+async function handleWorkerMessagesRead(workersDir, res, pathname) {
+  const match = pathname.match(/^\/api\/workers\/([^/]+)\/messages\/read$/);
+  if (!match) return notFound(res, "路径格式错误");
+  const worker = decodeURIComponent(match[1]);
+  if (!worker) return badRequest(res, "worker required");
+  const result = markWorkerMessagesRead(workersDir, { worker });
+  return jsonResponse(res, 200, {
+    ok: true,
+    worker,
+    count: result.count,
+    reads: result.reads,
+  });
+}
+
+async function handleWorkerRead(workersDir, res, pathname, body) {
+  const match = pathname.match(/^\/api\/workers\/([^/]+)\/read$/);
+  if (!match) return notFound(res, "路径格式错误");
+  const worker = decodeURIComponent(match[1]);
+  if (!worker) return badRequest(res, "worker required");
+  const readBy = String(body?.from || "web").trim() || "web";
+  const messages = markWorkerMessagesRead(workersDir, { worker });
+  const jobs = listJobs(workersDir, { worker, limit: 100000 });
+  const jobReads = markWorkerJobsRead(workersDir, jobs, { readBy });
+  return jsonResponse(res, 200, {
+    ok: true,
+    worker,
+    messages,
+    jobs: jobReads,
+    count: messages.count + jobReads.count,
+  });
+}
+
 async function handleProjects(workersDir, res) {
   const projects = buildProjectStrips(workersDir);
   const catalog = listStoredProjects(workersDir, { includeArchived: false });
@@ -1126,12 +1450,19 @@ async function handleTalkMessage(workersDir, res, pathname, body) {
   const message = String(body?.message ?? "").trim();
   if (!message) return badRequest(res, "message 不能为空");
   if (message.length > 16000) return badRequest(res, "message 过长 (>16000)");
+  let mode = "auto";
+  try {
+    mode = normalizeWebTalkMode(body?.mode || body?.deliveryMode || "auto");
+  } catch (err) {
+    return badRequest(res, err?.message || String(err));
+  }
 
   try {
     const request = createWebTalkRequest(workersDir, {
       worker,
       message,
       from: String(body?.from || "web").trim() || "web",
+      mode,
     });
     return jsonResponse(res, 202, {
       ok: true,
@@ -1140,13 +1471,275 @@ async function handleTalkMessage(workersDir, res, pathname, body) {
         status: request.status,
         worker: request.worker,
         message: request.message,
+        mode: request.mode,
         createdAt: request.createdAt,
       },
-      note: "Web talk 请求已提交，等待 Pi 主进程接管并走正常 /talk 调度。若刚更新代码，需要 reload Pi 后才会自动接管。",
+      note: "Web talk 请求已提交，等待 Pi 主进程接管并走正常 /talk 调度。mode=auto 表示空闲时 message、忙碌时 queue；mode=queue 强制排队；mode=steer 表示优先插队/可用时注入 Codex active turn。若刚更新代码，需要 reload Pi 后才会自动接管。",
     });
   } catch (err) {
     return errorResponse(res, 500, "创建 web talk 请求失败", String(err?.message || err));
   }
+}
+
+// ---------------------------------------------------------------------------
+// Worker Task Requests · Web 版员工派活 intent
+// ---------------------------------------------------------------------------
+async function handleWorkerTaskRequestCreate(workersDir, res, body) {
+  const from = String(body?.from || "用户").trim() || "用户";
+  const to = String(body?.to || body?.worker || "").trim();
+  const task = String(body?.task || body?.message || "").trim();
+  if (!to) return badRequest(res, "to/worker 不能为空");
+  if (!task) return badRequest(res, "task 不能为空");
+  if (task.length > 16000) return badRequest(res, "task 过长 (>16000)");
+
+  const sessionExists = existsSync(join(workersDir, "sessions", `${to}.jsonl`));
+  const registry = getWorkerRegistry(workersDir);
+  const regInfo = registry.get(to);
+  if (!sessionExists && !regInfo) {
+    return badRequest(res, `员工 ${to} 不存在（既不在员工 registry，也没有 sessions/ 本地 session）。`);
+  }
+  if (regInfo?.status === "fired") {
+    return badRequest(res, `员工 ${to} 已离职，不能派活。`);
+  }
+  if (!hasPermission(workersDir, { subject: from, action: "work:assign", target: to })) {
+    return errorResponse(res, 403, `${from} 没有权限对 ${to} 执行 work:assign`);
+  }
+
+  let mode = "auto";
+  try {
+    mode = normalizeWorkerTaskMode(body?.mode || body?.deliveryMode || "auto");
+  } catch (err) {
+    return badRequest(res, err?.message || String(err));
+  }
+
+  try {
+    const request = createWorkerTaskRequest(workersDir, {
+      from,
+      to,
+      task,
+      project: String(body?.project || "factory-task").trim() || "factory-task",
+      cwd: body?.cwd == null ? "" : String(body.cwd).trim(),
+      mode,
+      source: "web",
+    });
+    return jsonResponse(res, 202, {
+      ok: true,
+      request: {
+        id: request.id,
+        status: request.status,
+        from: request.from,
+        to: request.to,
+        task: request.task,
+        project: request.project,
+        mode: request.mode,
+        createdAt: request.createdAt,
+      },
+      note: "员工派活请求已提交，等待 Pi 主进程检查 work:assign 权限并接管调度；目标忙碌时会按 mode 排队/steer。",
+    });
+  } catch (err) {
+    return errorResponse(res, 500, "创建员工派活请求失败", String(err?.message || err));
+  }
+}
+
+async function handleWorkerTaskRequestMutation(workersDir, res, pathname, method, body) {
+  const cancelSuffix = "/cancel";
+  const isCancel = method === "POST" && pathname.endsWith(cancelSuffix);
+  const rawId = isCancel
+    ? pathname.slice("/api/task-requests/".length, -cancelSuffix.length)
+    : pathname.slice("/api/task-requests/".length);
+  const id = decodeURIComponent(rawId || "");
+  if (!id) return badRequest(res, "request id required");
+  const request = getWorkerTaskRequest(workersDir, id);
+  if (!request) return notFound(res, `task request not found: ${id}`);
+
+  if (method === "PATCH" && !isCancel) {
+    if (request.status === "pending") {
+      try {
+        const edited = editWorkerTaskRequest(workersDir, {
+          requestId: id,
+          task: body?.task || body?.message,
+          project: body?.project,
+          cwd: body?.cwd,
+          mode: body?.mode || body?.deliveryMode,
+          from: String(body?.from || "web").trim() || "web",
+        });
+        return jsonResponse(res, 200, { ok: true, request: edited });
+      } catch (err) {
+        return badRequest(res, err?.message || String(err));
+      }
+    }
+    if (request.status === "accepted" && request.jobId) {
+      const message = String(body?.task ?? body?.message ?? "").trim();
+      if (!message) return badRequest(res, "task/message 不能为空");
+      const control = createWebTalkJobControlRequest(workersDir, {
+        action: "edit",
+        jobId: request.jobId,
+        worker: request.to,
+        message,
+        from: String(body?.from || "web").trim() || "web",
+      });
+      return jsonResponse(res, 202, {
+        ok: true,
+        control,
+        note: "编辑请求已提交，只有仍在 Pi 主进程内存队列中的 job 可以改写。",
+      });
+    }
+    return badRequest(res, `只能编辑 pending 或 accepted+jobId 请求，当前状态 ${request.status}`);
+  }
+
+  if (isCancel) {
+    if (request.status === "pending") {
+      const cancelled = cancelWorkerTaskRequest(workersDir, {
+        requestId: id,
+        reason: body?.reason || "用户取消员工派活请求",
+        from: String(body?.from || "web").trim() || "web",
+      });
+      return jsonResponse(res, 200, { ok: true, request: cancelled });
+    }
+    if (request.status === "accepted" && request.jobId) {
+      const control = createWebTalkJobControlRequest(workersDir, {
+        action: "cancel",
+        jobId: request.jobId,
+        worker: request.to,
+        reason: body?.reason || "用户取消已接入的员工派活 job",
+        from: String(body?.from || "web").trim() || "web",
+      });
+      return jsonResponse(res, 202, {
+        ok: true,
+        control,
+        note: "取消请求已提交，等待 Pi 主进程用当前 job controller/queue 处理。",
+      });
+    }
+    return badRequest(res, `当前状态 ${request.status} 不能取消或找不到 jobId`);
+  }
+
+  return badRequest(res, `不支持的 task request 操作: ${method} ${pathname}`);
+}
+
+async function handleWorkerTaskRequestStatus(workersDir, res, pathname, url) {
+  const prefix = "/api/task-requests/";
+  if (pathname.startsWith(prefix)) {
+    const id = decodeURIComponent(pathname.slice(prefix.length));
+    if (!id) return badRequest(res, "request id required");
+    const request = getWorkerTaskRequest(workersDir, id);
+    if (!request) return notFound(res, `task request not found: ${id}`);
+    return jsonResponse(res, 200, { generatedAt: new Date().toISOString(), request });
+  }
+  const from = url.searchParams.get("from") || undefined;
+  const to = url.searchParams.get("to") || url.searchParams.get("worker") || undefined;
+  const limit = Math.min(200, Math.max(1, Number(url.searchParams.get("limit")) || 50));
+  const requests = listWorkerTaskRequests(workersDir, { from, to, limit }).reverse();
+  return jsonResponse(res, 200, {
+    generatedAt: new Date().toISOString(),
+    from: from || null,
+    to: to || null,
+    total: requests.length,
+    requests,
+  });
+}
+
+async function handleTalkRequestMutation(workersDir, res, pathname, method, body) {
+  const cancelSuffix = "/cancel";
+  const isCancel = method === "POST" && pathname.endsWith(cancelSuffix);
+  const rawId = isCancel
+    ? pathname.slice("/api/talk-requests/".length, -cancelSuffix.length)
+    : pathname.slice("/api/talk-requests/".length);
+  const id = decodeURIComponent(rawId || "");
+  if (!id) return badRequest(res, "request id required");
+  const request = getWebTalkRequest(workersDir, id);
+  if (!request) return notFound(res, `talk request not found: ${id}`);
+
+  if (method === "PATCH" && !isCancel) {
+    if (request.status !== "pending") return badRequest(res, `只能编辑 pending 请求，当前状态 ${request.status}`);
+    try {
+      const edited = editWebTalkRequest(workersDir, {
+        requestId: id,
+        message: body?.message,
+        mode: body?.mode || body?.deliveryMode,
+        from: String(body?.from || "web").trim() || "web",
+      });
+      return jsonResponse(res, 200, { ok: true, request: edited });
+    } catch (err) {
+      return badRequest(res, err?.message || String(err));
+    }
+  }
+
+  if (isCancel) {
+    if (request.status === "pending") {
+      const cancelled = cancelWebTalkRequest(workersDir, {
+        requestId: id,
+        reason: body?.reason || "用户取消 web talk 请求",
+        from: String(body?.from || "web").trim() || "web",
+      });
+      return jsonResponse(res, 200, { ok: true, request: cancelled });
+    }
+    if (request.status === "accepted" && request.jobId) {
+      const control = createWebTalkJobControlRequest(workersDir, {
+        action: "cancel",
+        jobId: request.jobId,
+        worker: request.worker,
+        reason: body?.reason || "用户取消已接入的 web talk job",
+        from: String(body?.from || "web").trim() || "web",
+      });
+      return jsonResponse(res, 202, {
+        ok: true,
+        control,
+        note: "取消请求已提交，等待 Pi 主进程用当前 job controller/queue 处理。",
+      });
+    }
+    return badRequest(res, `当前状态 ${request.status} 不能取消或找不到 jobId`);
+  }
+
+  return badRequest(res, `不支持的 talk request 操作: ${method} ${pathname}`);
+}
+
+async function handleJobMutation(workersDir, res, pathname, method, body) {
+  const match = pathname.match(/^\/api\/jobs\/([^/]+)(?:\/(read|cancel))?$/);
+  if (!match) return notFound(res, "路径格式错误");
+  const id = decodeURIComponent(match[1]);
+  const action = match[2] || (method === "PATCH" ? "edit" : "");
+  const jobFile = join(workersDir, "jobs", `${id}.json`);
+  if (!existsSync(jobFile)) return notFound(res, `job ${id} not found`);
+  const job = readJob(jobFile);
+
+  if (action === "read") {
+    const read = markWebJobRead(workersDir, job, { readBy: String(body?.from || "web").trim() || "web" });
+    return jsonResponse(res, 200, { ok: true, read });
+  }
+
+  if (action === "cancel") {
+    const control = createWebTalkJobControlRequest(workersDir, {
+      action: "cancel",
+      jobId: job.id,
+      worker: job.worker,
+      reason: body?.reason || "用户通过 Web 取消 job",
+      from: String(body?.from || "web").trim() || "web",
+    });
+    return jsonResponse(res, 202, {
+      ok: true,
+      control,
+      note: "取消请求已提交，等待 Pi 主进程处理；运行中 job 会尝试 abort，队列中 job 会移出队列。",
+    });
+  }
+
+  if (action === "edit") {
+    const message = String(body?.message ?? body?.task ?? "").trim();
+    if (!message) return badRequest(res, "message/task 不能为空");
+    const control = createWebTalkJobControlRequest(workersDir, {
+      action: "edit",
+      jobId: job.id,
+      worker: job.worker,
+      message,
+      from: String(body?.from || "web").trim() || "web",
+    });
+    return jsonResponse(res, 202, {
+      ok: true,
+      control,
+      note: "编辑请求已提交，只有仍在 Pi 主进程内存队列中的 job 可以改写；运行中 job 不会被编辑。",
+    });
+  }
+
+  return badRequest(res, `不支持的 job 操作: ${method} ${pathname}`);
 }
 
 async function handleTalkRequestStatus(workersDir, res, pathname, url) {
@@ -1166,6 +1759,153 @@ async function handleTalkRequestStatus(workersDir, res, pathname, url) {
     worker: worker || null,
     total: requests.length,
     requests,
+  });
+}
+
+async function handleJobControlStatus(workersDir, res, pathname, url) {
+  const prefix = "/api/job-controls/";
+  if (pathname.startsWith(prefix)) {
+    const id = decodeURIComponent(pathname.slice(prefix.length));
+    if (!id) return badRequest(res, "control id required");
+    const control = getWebTalkJobControlRequest(workersDir, id);
+    if (!control) return notFound(res, `job control not found: ${id}`);
+    return jsonResponse(res, 200, { generatedAt: new Date().toISOString(), control });
+  }
+  const worker = url.searchParams.get("worker") || undefined;
+  const jobId = url.searchParams.get("jobId") || undefined;
+  const limit = Math.min(200, Math.max(1, Number(url.searchParams.get("limit")) || 50));
+  const controls = listWebTalkJobControlRequests(workersDir, { worker, jobId, limit }).reverse();
+  return jsonResponse(res, 200, {
+    generatedAt: new Date().toISOString(),
+    worker: worker || null,
+    jobId: jobId || null,
+    total: controls.length,
+    controls,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Main Agent · Web 版秘书对话 intent + 主 session 只读 transcript
+// ---------------------------------------------------------------------------
+async function handleMainAgentTalkMessage(workersDir, res, body) {
+  const message = String(body?.message ?? "").trim();
+  if (!message) return badRequest(res, "message 不能为空");
+  if (message.length > 16000) return badRequest(res, "message 过长 (>16000)");
+
+  try {
+    const request = createMainAgentTalkRequest(workersDir, {
+      message,
+      from: String(body?.from || "web").trim() || "web",
+    });
+    return jsonResponse(res, 202, {
+      ok: true,
+      request: {
+        id: request.id,
+        status: request.status,
+        target: request.target,
+        message: request.message,
+        createdAt: request.createdAt,
+      },
+      note: "主 agent Web 消息已提交。Pi 主进程会在秘书空闲且未处于 /talk 员工模式时投递，避免打断控制台体验。",
+    });
+  } catch (err) {
+    return errorResponse(res, 500, "创建主 agent talk 请求失败", String(err?.message || err));
+  }
+}
+
+async function handleMainAgentTalkRequestStatus(workersDir, res, pathname, url) {
+  const prefix = "/api/main-agent/talk-requests/";
+  if (pathname.startsWith(prefix)) {
+    const id = decodeURIComponent(pathname.slice(prefix.length));
+    if (!id) return badRequest(res, "request id required");
+    const request = getMainAgentTalkRequest(workersDir, id);
+    if (!request) return notFound(res, `main agent talk request not found: ${id}`);
+    return jsonResponse(res, 200, { generatedAt: new Date().toISOString(), request });
+  }
+  const limit = Math.min(200, Math.max(1, Number(url.searchParams.get("limit")) || 50));
+  const requests = listMainAgentTalkRequests(workersDir, { limit }).reverse();
+  return jsonResponse(res, 200, {
+    generatedAt: new Date().toISOString(),
+    total: requests.length,
+    requests,
+  });
+}
+
+function extractMessageText(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) {
+    if (content && typeof content === "object") {
+      if (typeof content.text === "string") return content.text;
+      if (typeof content.content === "string") return content.content;
+    }
+    return "";
+  }
+  return content
+    .map((part) => {
+      if (!part) return "";
+      if (typeof part === "string") return part;
+      if (typeof part.text === "string") return part.text;
+      if (part.type === "text" && typeof part.content === "string") return part.content;
+      if (part.type === "toolCall") return `[tool_call ${part.name || part.toolName || ""}]`;
+      if (part.type === "toolResult") return `[tool_result ${part.toolName || part.name || ""}]`;
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function compactTranscriptText(text, maxChars) {
+  const s = String(text || "");
+  if (s.length <= maxChars) return { text: s, truncated: false };
+  return { text: s.slice(0, maxChars), truncated: true };
+}
+
+async function handleMainAgentTranscript(workersDir, res, url) {
+  const sessionFile = findMainSessionFile(workersDir);
+  if (!sessionFile) return notFound(res, "未找到主 agent session 文件");
+  const limit = Math.min(300, Math.max(1, Number(url.searchParams.get("limit")) || 80));
+  const maxChars = Math.min(50_000, Math.max(500, Number(url.searchParams.get("maxChars")) || 8000));
+  const includeCustom = url.searchParams.get("includeCustom") === "1";
+  const messages = [];
+  const lines = readFileSync(sessionFile, "utf8").split("\n");
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    let entry;
+    try { entry = JSON.parse(line); } catch { continue; }
+    if (entry.type === "message") {
+      const role = entry.message?.role || entry.role || null;
+      if (!["user", "assistant"].includes(role)) continue;
+      const extracted = compactTranscriptText(extractMessageText(entry.message?.content ?? entry.content), maxChars);
+      if (!extracted.text.trim()) continue;
+      messages.push({
+        id: entry.id || null,
+        parentId: entry.parentId || null,
+        type: "message",
+        role,
+        timestamp: entry.timestamp || null,
+        text: extracted.text,
+        truncated: extracted.truncated,
+      });
+    } else if (includeCustom && entry.type === "custom" && entry.content) {
+      const extracted = compactTranscriptText(entry.content, maxChars);
+      messages.push({
+        id: entry.id || null,
+        parentId: entry.parentId || null,
+        type: "custom",
+        role: "system",
+        customType: entry.customType || null,
+        timestamp: entry.timestamp || null,
+        text: extracted.text,
+        truncated: extracted.truncated,
+      });
+    }
+  }
+  return jsonResponse(res, 200, {
+    generatedAt: new Date().toISOString(),
+    sessionFile,
+    total: messages.length,
+    messages: messages.slice(-limit),
+    note: "只读主 agent transcript；默认只返回 user/assistant 消息，避免工具和 custom message 噪声污染页面。",
   });
 }
 
@@ -1375,6 +2115,195 @@ async function handleProjectDoc(workersDir, res, url) {
 }
 
 // ---------------------------------------------------------------------------
+// Outsource run 序列化（可测试的纯函数）
+// ---------------------------------------------------------------------------
+
+/**
+ * 把 outsource run 对象序列化为 API 响应字段。
+ * 纯函数：只依赖输入 run 对象，不读文件、不碰网络。
+ * 可靠时间字段：finishedAt 走 computeReliableFinishedAt；elapsedMs 走 computeReliableElapsedMs。
+ * @param {object} run - 从 getOutsourceRun / listOutsourceRuns 拿到的 run 对象
+ * @param {object} [opts]
+ * @param {boolean} [opts.includeFullOutput] - 是否包含 fullOutput（列表默认 false，详情默认 true）
+ * @returns {object}
+ */
+export function serializeOutsourceRun(run, opts = {}) {
+  if (!run || typeof run !== "object") return null;
+  const includeFullOutput = opts.includeFullOutput !== false; // 默认 true
+  const reliableFinishedAt = computeReliableFinishedAt(run);
+  const reliableElapsedMs = computeReliableElapsedMs(run, { finishedAt: reliableFinishedAt });
+  const taskText = String(run.task || run.summary || "");
+  const serialized = {
+    runId: run.id || run.runId || null,
+    profile: run.profile || run.profileName || "",
+    groupId: run.groupId || null,
+    requestedBy: run.requestedBy || "",
+    project: run.project || "",
+    status: run.status || "pending",
+    taskPreview: taskText.slice(0, 200),
+    taskLength: Array.from(taskText).length,
+    summary: run.summary || "",
+    model: run.model || "",
+    jobId: run.jobId || null,
+    createdAt: run.createdAt || null,
+    updatedAt: run.updatedAt || null,
+    startedAt: run.startedAt || null,
+    finishedAt: reliableFinishedAt,
+    elapsedMs: reliableElapsedMs,
+    error: run.error || "",
+    terminal: OUTSOURCE_TERMINAL_STATUSES.has(run.status),
+  };
+  if (includeFullOutput) {
+    serialized.fullOutput = run.fullOutput || run.fullReply || "";
+  }
+  return serialized;
+}
+
+// ---------------------------------------------------------------------------
+// Outsource / Subagent — read-oriented routes only
+// ---------------------------------------------------------------------------
+async function handleOutsourceProfiles(workersDir, res) {
+  const profiles = listOutsourceProfiles(workersDir) || [];
+  return jsonResponse(res, 200, {
+    generatedAt: new Date().toISOString(),
+    total: profiles.length,
+    profiles: profiles.map((p) => ({
+      name: p.name,
+      description: p.description || "",
+      backend: p.backend || "pi",
+      model: p.model || "",
+      thinking: p.thinking || "",
+      tools: p.tools || [],
+      skills: Boolean(p.skills),
+      maxTurns: Number(p.maxTurns || 0),
+      defaultWait: Boolean(p.defaultWait),
+      timeoutMs: Number(p.timeoutMs || 0),
+      createdAt: p.createdAt,
+      updatedAt: p.updatedAt,
+    })),
+  });
+}
+
+async function handleOutsourceProfile(workersDir, res, name) {
+  if (!name) return badRequest(res, "profile name required");
+  const p = getOutsourceProfile(workersDir, name);
+  if (!p) return jsonResponse(res, 404, { ok: false, detail: `profile ${name} not found` });
+  return jsonResponse(res, 200, {
+    name: p.name,
+    description: p.description || "",
+    backend: p.backend || "pi",
+    model: p.model || "",
+    thinking: p.thinking || "",
+    tools: p.tools || [],
+    skills: Boolean(p.skills),
+    maxTurns: Number(p.maxTurns || 0),
+    defaultWait: Boolean(p.defaultWait),
+    timeoutMs: Number(p.timeoutMs || 0),
+    createdAt: p.createdAt,
+    updatedAt: p.updatedAt,
+  });
+}
+
+async function handleOutsourceRuns(workersDir, res, url) {
+  const runId = url.searchParams.get("runId") || null;
+  const groupId = url.searchParams.get("groupId") || null;
+  const profile = url.searchParams.get("profile") || null;
+  const status = url.searchParams.get("status") || null;
+  const requestedBy = url.searchParams.get("requestedBy") || null;
+  const limit = Math.min(500, Math.max(1, Number(url.searchParams.get("limit")) || 100));
+  const runs = listOutsourceRuns(workersDir, { runId, groupId, profile, status, requestedBy, limit }) || [];
+  return jsonResponse(res, 200, {
+    generatedAt: new Date().toISOString(),
+    total: runs.length,
+    filters: { runId, groupId, profile, status, requestedBy, limit },
+    runs: runs.map((r) => serializeOutsourceRun(r, { includeFullOutput: false })),
+  });
+}
+
+async function handleOutsourceRun(workersDir, res, runId) {
+  if (!runId) return badRequest(res, "runId required");
+  const r = getOutsourceRun(workersDir, runId);
+  if (!r) return jsonResponse(res, 404, { ok: false, detail: `run ${runId} not found` });
+  const serialized = serializeOutsourceRun(r, { includeFullOutput: true });
+  return jsonResponse(res, 200, {
+    ...serialized,
+    name: r.name || r.id,
+    task: r.task || "",
+    result: r.result || null,
+    usage: r.usage || null,
+    events: Array.isArray(r.events) ? r.events : [],
+  });
+}
+
+// POST /api/outsource/runs — 从 web 侧直接启动白纸外包 agent。
+// 默认后台运行并返回 run/job id；传 wait=true 时等待本次 run 完成后返回。
+async function handleOutsourceRunCreate(workersDir, res, body) {
+  const profileName = String(body?.profile || "").trim();
+  const task = String(body?.task || "").trim();
+  if (!profileName) return badRequest(res, "profile required");
+  if (!task) return badRequest(res, "task required");
+  if (task.length > 16000) return badRequest(res, "task 过长 (>16000)");
+
+  const profile = getOutsourceProfile(workersDir, profileName);
+  if (!profile) {
+    return badRequest(res, `未找到外包 profile: ${profileName}。先用 factory_outsource_profiles 创建。`);
+  }
+
+  try {
+    const shouldWait = normalizeOutsourceWait({
+      wait: body?.wait === true ? true : undefined,
+      background: body?.background === false ? false : true,
+    }, profile);
+
+    const { run, job, promise } = startOutsourceRunJob({
+      workersDir,
+      profile,
+      task,
+      project: String(body?.project || "outsource").trim() || "outsource",
+      cwd: body?.cwd || process.cwd(),
+      requestedBy: String(body?.requestedBy || "web").trim() || "web",
+      groupId: body?.groupId || undefined,
+      wait: shouldWait,
+      background: !shouldWait,
+      detached: !shouldWait,
+    });
+
+    let current = run;
+    if (shouldWait) {
+      await promise;
+      current = getOutsourceRun(workersDir, run.id) || run;
+    }
+
+    return jsonResponse(res, 200, {
+      ok: true,
+      run: {
+        runId: current.id,
+        profile: current.profile || current.profileName,
+        groupId: current.groupId || null,
+        requestedBy: current.requestedBy || "",
+        project: current.project || "",
+        status: current.status || "pending",
+        task: current.task || "",
+        summary: current.summary || "",
+        error: current.error || "",
+        createdAt: current.createdAt,
+        startedAt: current.startedAt || null,
+        finishedAt: current.finishedAt || null,
+      },
+      job: {
+        id: job.id,
+        status: shouldWait ? (current.status || "done") : "running",
+      },
+      note: shouldWait
+        ? "外包 run 已执行完成；可用 GET /api/outsource/runs/<id> 查看完整事件。"
+        : "外包 run 已后台启动；可用 GET /api/outsource/runs/<id> 轮询 status 变化。",
+    });
+  } catch (err) {
+    return errorResponse(res, 500, "启动外包 run 失败", String(err?.message || err));
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Schedules (queue.jsonl runner/cron 流水)
 // ---------------------------------------------------------------------------
 async function handleSchedules(workersDir, res, url) {
@@ -1444,10 +2373,30 @@ const MIME = {
   ".json": "application/json; charset=utf-8",
   ".svg": "image/svg+xml",
   ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+  ".gif": "image/gif",
   ".ico": "image/x-icon",
   ".txt": "text/plain; charset=utf-8",
   ".md": "text/markdown; charset=utf-8",
 };
+
+async function handleAvatarAsset(res, pathname) {
+  let name = "";
+  try {
+    name = decodeURIComponent(pathname.slice("/api/avatars/".length));
+  } catch {
+    return notFound(res, "Invalid avatar path");
+  }
+  if (!name || name.includes("/") || name.includes("\\") || name === "." || name === "..") {
+    return notFound(res, "Invalid avatar path");
+  }
+  const filePath = resolve(AVATAR_DIR, name);
+  if (!filePath.startsWith(`${AVATAR_DIR}${sep}`)) return notFound(res, "Invalid avatar path");
+  if (!existsSync(filePath) || !statSync(filePath).isFile()) return notFound(res, "Avatar not found");
+  return serveFile(res, filePath);
+}
 
 async function serveStatic(res, pathname) {
   if (pathname === "/") pathname = "/index.html";

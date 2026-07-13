@@ -7,7 +7,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 
-const BUILTIN_ADMINS = new Set(["秘书", "主agent", "主Agent", "user", "用户", "secretary", "派派"]);
+const DEFAULT_BUILTIN_ADMINS = new Set(["秘书", "主agent", "主Agent", "user", "用户", "secretary"]);
 const KNOWN_ACTIONS = new Set([
   "*",
   "message:send",
@@ -42,6 +42,10 @@ export function messagesFile(workersDir) {
   return join(workersDir, "messages.jsonl");
 }
 
+export function localAdminsFile(workersDir) {
+  return join(workersDir, "local-admins.json");
+}
+
 function normalizeList(value, fallback = []) {
   if (value == null) return fallback;
   const list = Array.isArray(value) ? value : [value];
@@ -70,6 +74,31 @@ function readJsonFile(file, fallback) {
   } catch {
     return fallback;
   }
+}
+
+function parseAdminList(value) {
+  if (value == null) return [];
+  if (Array.isArray(value)) return normalizeList(value);
+  return String(value)
+    .split(/[,\n]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function readLocalAdmins(workersDir) {
+  if (!workersDir) return [];
+  const config = readJsonFile(localAdminsFile(workersDir), null);
+  if (!config) return [];
+  if (Array.isArray(config)) return parseAdminList(config);
+  return parseAdminList(config.admins);
+}
+
+export function factoryAdmins(workersDir) {
+  return new Set([
+    ...DEFAULT_BUILTIN_ADMINS,
+    ...parseAdminList(process.env.OX_FACTORY_ADMINS),
+    ...readLocalAdmins(workersDir),
+  ]);
 }
 
 function writeJsonFile(file, data) {
@@ -113,8 +142,8 @@ function writePermissions(workersDir, state) {
   writeJsonFile(permissionsFile(workersDir), state);
 }
 
-function isBuiltinAdmin(subject) {
-  return BUILTIN_ADMINS.has(String(subject || "").trim());
+export function isFactoryAdmin(workersDir, subject) {
+  return factoryAdmins(workersDir).has(String(subject || "").trim());
 }
 
 function grantMatches(grant, { subject, action, target }) {
@@ -130,7 +159,7 @@ function grantMatches(grant, { subject, action, target }) {
 export function hasPermission(workersDir, { subject, action, target }) {
   const normalizedSubject = String(subject || "").trim();
   if (!normalizedSubject) return false;
-  if (isBuiltinAdmin(normalizedSubject)) return true;
+  if (isFactoryAdmin(workersDir, normalizedSubject)) return true;
   if (!KNOWN_ACTIONS.has(action)) return false;
   const normalizedTarget = String(target || "").trim();
   if (!normalizedTarget) return false;
@@ -240,6 +269,36 @@ export function sendAuthorizedMessage(workersDir, input) {
   return message;
 }
 
+export function sendTaskResultMessage(workersDir, input) {
+  const from = String(input.from || "").trim();
+  const to = String(input.to || "").trim();
+  const content = String(input.content || "").trim();
+  const jobId = String(input.jobId || "").trim();
+  const taskRequestId = String(input.taskRequestId || "").trim();
+  const resultStatus = String(input.resultStatus || "done").trim() || "done";
+  if (!from) throw new Error("from 不能为空");
+  if (!to) throw new Error("to 不能为空");
+  if (!content) throw new Error("content 不能为空");
+  if (!jobId) throw new Error("jobId 不能为空");
+  if (!taskRequestId) throw new Error("taskRequestId 不能为空");
+
+  const message = {
+    type: "message",
+    kind: "task_result",
+    source: "worker-task",
+    id: randomId("msg"),
+    from,
+    to,
+    content,
+    jobId,
+    taskRequestId,
+    resultStatus,
+    createdAt: nowIso(),
+  };
+  appendJsonl(messagesFile(workersDir), message);
+  return message;
+}
+
 function messageVisibleTo(message, worker, includeSent) {
   if (message.type !== "message") return false;
   if (message.to === "*" || message.to === worker) return true;
@@ -279,6 +338,26 @@ export function markMessageRead(workersDir, { messageId, worker }) {
   };
   appendJsonl(messagesFile(workersDir), event);
   return event;
+}
+
+export function markWorkerMessagesRead(workersDir, { worker, limit = 100000 } = {}) {
+  const name = String(worker || "").trim();
+  if (!name) throw new Error("worker 不能为空");
+  const unreadIncoming = listMessages(workersDir, {
+    worker: name,
+    unreadOnly: true,
+    includeSent: false,
+    limit,
+  }).filter((message) => message.from !== name && (message.to === name || message.to === "*"));
+  const reads = unreadIncoming.map((message) => markMessageRead(workersDir, {
+    messageId: message.id,
+    worker: name,
+  }));
+  return {
+    worker: name,
+    count: reads.length,
+    reads,
+  };
 }
 
 export function formatPermissions(grants) {

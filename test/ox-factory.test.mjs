@@ -8,6 +8,7 @@ import test from "node:test";
 
 import {
   appendJobEvent,
+  compactJobTimelineEvents,
   createJob,
   formatJobDetails,
   formatJobEvent,
@@ -58,12 +59,51 @@ import {
 import {
   grantPermission,
   hasPermission,
+  localAdminsFile,
   listMessages,
   listPermissions,
   markMessageRead,
+  markWorkerMessagesRead,
   revokePermission,
   sendAuthorizedMessage,
+  sendTaskResultMessage,
 } from "../comm.mjs";
+import {
+  acceptWorkerTaskRequest,
+  cancelWorkerTaskRequest,
+  claimWorkerTaskRequest,
+  createWorkerTaskRequest,
+  editWorkerTaskRequest,
+  failWorkerTaskRequest,
+  getWorkerTaskRequest,
+  listPendingWorkerTaskRequests,
+  listWorkerTaskRequests,
+  reportWorkerTaskResult,
+  recoverStaleWorkerTaskRequests,
+  workerTaskRequestsFile,
+} from "../task-requests.mjs";
+import {
+  completeOutsourceRun,
+  createOutsourceRun,
+  getOutsourceProfile,
+  getOutsourceRun,
+  listOutsourceProfiles,
+  listOutsourceRuns,
+  markOutsourceRunRunning,
+  OUTSOURCE_TERMINAL_STATUSES,
+  normalizeOutsourceProfile,
+  outsourceProfilesFile,
+  outsourceRunsFile,
+  upsertOutsourceProfile,
+} from "../outsource-agents.mjs";
+import {
+  buildOutsourcePiArgs,
+  getPiInvocation,
+} from "../outsource-runner.mjs";
+import {
+  renderOutsourceWaitResult,
+  startOutsourceRunJob,
+} from "../outsource-dispatcher.mjs";
 import {
   listWorkerResponsibilities,
   removeWorkerResponsibility,
@@ -87,13 +127,26 @@ import {
   createCodexTokenUsageTracker,
   extractCodexTokenUsage,
   extractCodexThreadTokenUsage,
+  assertCodexThreadBinding,
+  reconcileCodexThreadId,
+  assertWorkerThinkingSupported,
   normalizeCodexEffort,
   normalizeCodexModel,
   subtractCodexTokenUsage,
 } from "../codex-backend.mjs";
 import {
+  selectCanonicalCodexThread,
+} from "../codex-thread-audit.mjs";
+import {
   buildFactoryWorkerHandbook,
 } from "../factory-handbook.mjs";
+import {
+  buildWorkerSystemPrompt,
+  buildWorkerTaskPrompt,
+} from "../worker-prompts.mjs";
+import {
+  markdownPreviewText,
+} from "../markdown-preview.mjs";
 import {
   parseCodexRolloutLines,
   repairCodexJobTokenMetadata,
@@ -101,15 +154,52 @@ import {
 } from "../codex-rollout-token-report.mjs";
 import { selectNextPending, shouldRunInProcess } from "../queue-utils.mjs";
 import { repairToolResultParents } from "../session-repair.mjs";
-import { resolveProjectMarkdownDocRef } from "../web-server.mjs";
+import {
+  resolveProjectMarkdownDocRef,
+  isOutsourceJob,
+  isOutsourceWorkerName,
+  uniqueWorkers,
+  buildWorkersView,
+  buildProjectStrips,
+  computeReliableFinishedAt,
+  computeReliableElapsedMs,
+  serializeOutsourceRun,
+} from "../web-server.mjs";
 import {
   acceptWebTalkRequest,
+  acceptWebTalkJobControlRequest,
+  cancelWebTalkRequest,
+  claimWebTalkRequest,
   createWebTalkRequest,
+  createWebTalkJobControlRequest,
+  editWebTalkRequest,
   failWebTalkRequest,
+  failWebTalkJobControlRequest,
   getWebTalkRequest,
+  getWebTalkJobControlRequest,
+  listPendingWebTalkJobControlRequests,
   listPendingWebTalkRequests,
+  listWebTalkJobControlRequests,
   listWebTalkRequests,
+  webTalkRequestsFile,
 } from "../web-talk.mjs";
+import {
+  buildWorkerJobUnreadSummary,
+  markWorkerJobsRead,
+  markWebJobRead,
+} from "../web-job-read.mjs";
+import {
+  acceptMainAgentTalkRequest,
+  claimMainAgentTalkRequest,
+  createMainAgentTalkRequest,
+  failMainAgentTalkRequest,
+  getMainAgentTalkRequest,
+  listMainAgentTalkRequests,
+  listPendingMainAgentTalkRequests,
+} from "../main-agent-talk.mjs";
+import {
+  scanWorkerEntries,
+} from "../worker-registry-snapshot.mjs";
 
 const testDir = dirname(fileURLToPath(import.meta.url));
 
@@ -172,7 +262,7 @@ test("pickUnreadJob selects terminal unread jobs and persists read state", () =>
   try {
     const oldJob = createJob(workersDir, {
       kind: "talk",
-      worker: "东子",
+      worker: "DeveloperA",
       project: "showcase",
       task: "旧结果",
     });
@@ -181,7 +271,7 @@ test("pickUnreadJob selects terminal unread jobs and persists read state", () =>
 
     const newJob = createJob(workersDir, {
       kind: "talk",
-      worker: "步美",
+      worker: "ReviewerA",
       project: "pi",
       task: "新结果",
     });
@@ -212,14 +302,14 @@ test("parsePickCommandArgs supports peek without marking read", () => {
     markRead: false,
     peek: true,
   });
-  assert.deepEqual(parsePickCommandArgs("步美 --peek"), {
-    worker: "步美",
+  assert.deepEqual(parsePickCommandArgs("ReviewerA --peek"), {
+    worker: "ReviewerA",
     mode: "random",
     markRead: false,
     peek: true,
   });
-  assert.deepEqual(parsePickCommandArgs("--latest 东子"), {
-    worker: "东子",
+  assert.deepEqual(parsePickCommandArgs("--latest DeveloperA"), {
+    worker: "DeveloperA",
     mode: "latest",
     markRead: true,
     peek: false,
@@ -302,12 +392,59 @@ test("formatJobEvent renders streaming tool output chunks", () => {
   );
 });
 
+test("compactJobTimelineEvents merges streamed text and tool chunks for web display", () => {
+  const compacted = compactJobTimelineEvents([
+    { time: "2026-07-08T00:00:00.000Z", type: "text", text: "你好，" },
+    { time: "2026-07-08T00:00:00.100Z", type: "text", text: "我开始处理。" },
+    { time: "2026-07-08T00:00:01.000Z", type: "tool_start", name: "bash", args: { command: "pnpm test" } },
+    { time: "2026-07-08T00:00:01.100Z", type: "tool_output", name: "bash", text: "PASS " },
+    { time: "2026-07-08T00:00:01.200Z", type: "tool_output", name: "bash", text: "82 tests\n" },
+    {
+      time: "2026-07-08T00:00:02.000Z",
+      type: "tool_end",
+      name: "bash",
+      isError: false,
+      result: { output: "PASS 82 tests\n", exitCode: 0 },
+    },
+    { time: "2026-07-08T00:00:03.000Z", type: "done", turns: 1, inputTokens: 10, outputTokens: 20, text: "最终回复全文" },
+  ]);
+
+  assert.equal(compacted.length, 3);
+  assert.deepEqual(compacted[0], {
+    time: "2026-07-08T00:00:00.000Z",
+    type: "text",
+    text: "你好，我开始处理。",
+  });
+  assert.equal(compacted[1].type, "tool");
+  assert.equal(compacted[1].name, "bash");
+  assert.equal(compacted[1].output, "PASS 82 tests\n");
+  assert.equal(
+    formatJobEvent(compacted[1]),
+    "[tool] bash: pnpm test | output: PASS 82 tests",
+  );
+  assert.equal(compacted[2].type, "done");
+  assert.equal(compacted[2].text, "");
+  assert.equal(formatJobEvent(compacted[2]), "[done] 1 rounds, input 10, output 20");
+});
+
 test("codex backend maps worker thinking levels to Codex reasoning effort", () => {
   assert.equal(normalizeCodexEffort("off"), "none");
   assert.equal(normalizeCodexEffort("minimal"), "low");
   assert.equal(normalizeCodexEffort("high"), "high");
   assert.equal(normalizeCodexEffort("xhigh"), "xhigh");
+  assert.equal(normalizeCodexEffort("max"), "max");
+  assert.equal(normalizeCodexEffort("ultra"), "ultra");
   assert.equal(normalizeCodexEffort(undefined), undefined);
+});
+
+test("max and ultra thinking are accepted for Codex/Claude workers but rejected for Pi workers", () => {
+  assert.equal(assertWorkerThinkingSupported("codex", "max"), "max");
+  assert.equal(assertWorkerThinkingSupported("codex", "ultra"), "ultra");
+  assert.equal(assertWorkerThinkingSupported("claude", "max"), "max");
+  assert.equal(assertWorkerThinkingSupported("claude", "ultra"), "ultra");
+  assert.equal(assertWorkerThinkingSupported("pi", "xhigh"), "xhigh");
+  assert.throws(() => assertWorkerThinkingSupported("pi", "max"), /not supported by Pi|Codex\/Claude/i);
+  assert.throws(() => assertWorkerThinkingSupported("pi", "ultra"), /not supported by Pi|Codex\/Claude/i);
 });
 
 test("codex backend normalizes conversational model aliases", () => {
@@ -317,6 +454,68 @@ test("codex backend normalizes conversational model aliases", () => {
   assert.equal(normalizeCodexModel("Codex-5.5"), "gpt-5.5");
   assert.equal(normalizeCodexModel("gpt-5.5"), "gpt-5.5");
   assert.equal(normalizeCodexModel(undefined), undefined);
+});
+
+test("codex backend refuses to run workers without a persisted thread binding", () => {
+  assert.equal(
+    assertCodexThreadBinding({ id: "LocalAdmin", codexThreadId: "thread-1" }),
+    "thread-1",
+  );
+
+  assert.throws(
+    () => assertCodexThreadBinding({ id: "WorkerJ", codexThreadId: "" }),
+    /missing codexThreadId|refuse/i,
+  );
+  assert.throws(
+    () => assertCodexThreadBinding({ id: "WorkerK" }),
+    /missing codexThreadId|refuse/i,
+  );
+});
+
+test("codex backend persists the actual resumed thread id when app-server canonicalizes it", () => {
+  const patches = [];
+  const worker = {
+    id: "WorkerJ",
+    model: "gpt-5.5",
+    codexThreadId: "seed-thread",
+    codexServerUrl: "ws://127.0.0.1:48177",
+  };
+
+  const threadId = reconcileCodexThreadId(worker, "actual-thread", (patch) => patches.push(patch));
+
+  assert.equal(threadId, "actual-thread");
+  assert.equal(worker.codexThreadId, "actual-thread");
+  assert.deepEqual(patches, [{
+    codexThreadId: "actual-thread",
+    codexServerUrl: "ws://127.0.0.1:48177",
+    model: "gpt-5.5",
+  }]);
+});
+
+test("codex thread audit selects the long-running rollout when registry points at a seed thread", () => {
+  const selected = selectCanonicalCodexThread({
+    worker: { id: "WorkerJ", codexThreadId: "seed-thread" },
+    rollouts: [
+      { threadId: "latest-short", turns: 1, lastAt: "2026-07-08T06:00:00.000Z" },
+      { threadId: "long-mainline", turns: 33, lastAt: "2026-07-07T08:00:00.000Z" },
+    ],
+  });
+
+  assert.equal(selected.threadId, "long-mainline");
+  assert.equal(selected.reason, "registry-missing-use-observed-mainline");
+});
+
+test("codex thread audit keeps an existing registry thread when it has rollout evidence", () => {
+  const selected = selectCanonicalCodexThread({
+    worker: { id: "LocalAdmin", codexThreadId: "registry-thread" },
+    rollouts: [
+      { threadId: "registry-thread", turns: 10, lastAt: "2026-07-07T08:00:00.000Z" },
+      { threadId: "older-thread", turns: 50, lastAt: "2026-07-01T08:00:00.000Z" },
+    ],
+  });
+
+  assert.equal(selected.threadId, "registry-thread");
+  assert.equal(selected.reason, "registry-has-rollout-evidence");
 });
 
 test("codex backend converts app-server notifications into worker stream events", () => {
@@ -529,7 +728,7 @@ test("report context treats jobs as primary daily activity beyond queue entries"
   try {
     const dongziJob = createJob(workersDir, {
       kind: "talk",
-      worker: "东子",
+      worker: "DeveloperA",
       project: "落地页",
       task: "迭代展示页",
     });
@@ -557,14 +756,14 @@ test("report context treats jobs as primary daily activity beyond queue entries"
     const context = buildFactoryReportContext({
       workersDir,
       date: "2026-06-30",
-      workers: [{ id: "东子", role: "programmer", status: "idle", projects: [], promotions: [], responsibilities: [] }],
+      workers: [{ id: "DeveloperA", role: "programmer", status: "idle", projects: [], promotions: [], responsibilities: [] }],
     });
 
     assert.equal(context.totals.jobs, 1);
     assert.equal(context.totals.queueEntries, 1);
     assert.equal(context.queue.statusCounts.done, 1);
 
-    const dongzi = context.workers.find((worker) => worker.worker === "东子");
+    const dongzi = context.workers.find((worker) => worker.worker === "DeveloperA");
     assert.equal(dongzi.jobs.done, 1);
     assert.equal(dongzi.queue.done ?? 0, 0);
     assert.match(dongzi.highlights[0], /展示页/);
@@ -576,7 +775,7 @@ test("report context treats jobs as primary daily activity beyond queue entries"
 
     const markdown = formatFactoryReportContext(context);
     assert.match(markdown, /全员产出表/);
-    assert.match(markdown, /东子/);
+    assert.match(markdown, /DeveloperA/);
     assert.match(markdown, /小绿/);
     assert.match(markdown, /禁止只凭 queue/);
   } finally {
@@ -590,7 +789,7 @@ test("report context summarizes worker sessions and main-session management even
     const sessionsDir = join(workersDir, "sessions");
     mkdirSync(sessionsDir, { recursive: true });
     writeFileSync(
-      join(sessionsDir, "派派.jsonl"),
+      join(sessionsDir, "LocalAdmin.jsonl"),
       [
         JSON.stringify({
           type: "message",
@@ -620,12 +819,12 @@ test("report context summarizes worker sessions and main-session management even
           type: "custom",
           customType: "ox-worker-promote",
           timestamp: "2026-06-30T04:00:00.000Z",
-          data: { workerId: "布朗尼", from: "programmer", to: "foreman", date: "2026-06-30" },
+          data: { workerId: "Foreman", from: "programmer", to: "foreman", date: "2026-06-30" },
         },
       ],
     });
 
-    const paipai = context.workers.find((worker) => worker.worker === "派派");
+    const paipai = context.workers.find((worker) => worker.worker === "LocalAdmin");
     assert.equal(paipai.session.assistantMessages, 1);
     assert.equal(paipai.session.toolCalls.bash, 1);
     assert.equal(paipai.session.inputTokens, 1200);
@@ -643,7 +842,7 @@ test("report-sources CLI prints the same multi-source daily context for workers"
   try {
     const job = createJob(workersDir, {
       kind: "talk",
-      worker: "布朗尼",
+      worker: "Foreman",
       project: "工厂日报",
       task: "生成日报",
     });
@@ -663,7 +862,7 @@ test("report-sources CLI prints the same multi-source daily context for workers"
     ], { encoding: "utf8" });
 
     assert.match(output, /工厂日报上下文/);
-    assert.match(output, /布朗尼/);
+    assert.match(output, /Foreman/);
     assert.match(output, /禁止只凭 queue/);
   } finally {
     rmSync(workersDir, { recursive: true, force: true });
@@ -673,54 +872,56 @@ test("report-sources CLI prints the same multi-source daily context for workers"
 test("authorized communication denies ungranted workers and allows explicit grants", () => {
   const workersDir = mkdtempSync(join(tmpdir(), "ox-comm-auth-test-"));
   try {
-    assert.equal(hasPermission(workersDir, { subject: "美伢", action: "message:send", target: "东子" }), false);
+    assert.equal(hasPermission(workersDir, { subject: "ReviewerC", action: "message:send", target: "DeveloperA" }), false);
 
     assert.throws(
-      () => sendAuthorizedMessage(workersDir, { from: "美伢", to: "东子", content: "你那边进展如何？" }),
+      () => sendAuthorizedMessage(workersDir, { from: "ReviewerC", to: "DeveloperA", content: "你那边进展如何？" }),
       /没有权限/,
     );
 
     const grant = grantPermission(workersDir, {
-      subject: "美伢",
+      subject: "ReviewerC",
       actions: ["message:send"],
-      targets: ["东子"],
+      targets: ["DeveloperA"],
       grantedBy: "秘书",
-      note: "允许美伢联系东子做开发协作",
+      note: "允许ReviewerC联系DeveloperA做开发协作",
     });
 
-    assert.equal(grant.subject, "美伢");
-    assert.equal(hasPermission(workersDir, { subject: "美伢", action: "message:send", target: "东子" }), true);
+    assert.equal(grant.subject, "ReviewerC");
+    assert.equal(hasPermission(workersDir, { subject: "ReviewerC", action: "message:send", target: "DeveloperA" }), true);
 
-    const sent = sendAuthorizedMessage(workersDir, { from: "美伢", to: "东子", content: "你那边进展如何？" });
-    assert.equal(sent.from, "美伢");
-    assert.equal(sent.to, "东子");
+    const sent = sendAuthorizedMessage(workersDir, { from: "ReviewerC", to: "DeveloperA", content: "你那边进展如何？" });
+    assert.equal(sent.from, "ReviewerC");
+    assert.equal(sent.to, "DeveloperA");
 
-    const inbox = listMessages(workersDir, { worker: "东子" });
+    const inbox = listMessages(workersDir, { worker: "DeveloperA" });
     assert.equal(inbox.length, 1);
     assert.equal(inbox[0].content, "你那边进展如何？");
     assert.equal(inbox[0].read, false);
 
-    markMessageRead(workersDir, { messageId: sent.id, worker: "东子" });
-    assert.equal(listMessages(workersDir, { worker: "东子", unreadOnly: true }).length, 0);
+    markMessageRead(workersDir, { messageId: sent.id, worker: "DeveloperA" });
+    assert.equal(listMessages(workersDir, { worker: "DeveloperA", unreadOnly: true }).length, 0);
 
     revokePermission(workersDir, {
-      subject: "美伢",
+      subject: "ReviewerC",
       actions: ["message:send"],
-      targets: ["东子"],
+      targets: ["DeveloperA"],
       revokedBy: "秘书",
     });
-    assert.equal(hasPermission(workersDir, { subject: "美伢", action: "message:send", target: "东子" }), false);
+    assert.equal(hasPermission(workersDir, { subject: "ReviewerC", action: "message:send", target: "DeveloperA" }), false);
   } finally {
     rmSync(workersDir, { recursive: true, force: true });
   }
 });
 
-test("paipai is a builtin factory admin with worker fire permission", () => {
-  const workersDir = mkdtempSync(join(tmpdir(), "ox-paipai-admin-test-"));
+test("local admin config grants factory admin permissions without hardcoded worker names", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-local-admin-test-"));
   try {
-    assert.equal(hasPermission(workersDir, { subject: "派派", action: "permission:manage", target: "步美" }), true);
-    assert.equal(hasPermission(workersDir, { subject: "派派", action: "worker:fire", target: "步美" }), true);
-    assert.equal(hasPermission(workersDir, { subject: "美伢", action: "worker:fire", target: "步美" }), false);
+    writeFileSync(localAdminsFile(workersDir), JSON.stringify({ admins: ["LocalAdmin"] }, null, 2));
+
+    assert.equal(hasPermission(workersDir, { subject: "LocalAdmin", action: "permission:manage", target: "ReviewerA" }), true);
+    assert.equal(hasPermission(workersDir, { subject: "LocalAdmin", action: "worker:fire", target: "ReviewerA" }), true);
+    assert.equal(hasPermission(workersDir, { subject: "ReviewerC", action: "worker:fire", target: "ReviewerA" }), false);
 
     const indexSource = readFileSync(join(testDir, "../index.ts"), "utf8");
     const fireToolSource = indexSource.slice(
@@ -739,22 +940,51 @@ test("secretary can communicate by default and explicit broadcast grants use mes
   try {
     assert.equal(hasPermission(workersDir, { subject: "秘书", action: "message:broadcast", target: "*" }), true);
     sendAuthorizedMessage(workersDir, { from: "秘书", to: "*", content: "今天日报先看 factory_report_context。" });
-    assert.equal(listMessages(workersDir, { worker: "东子" }).length, 1);
+    assert.equal(listMessages(workersDir, { worker: "DeveloperA" }).length, 1);
 
     assert.throws(
-      () => sendAuthorizedMessage(workersDir, { from: "布朗尼", to: "*", content: "大家都来开会。" }),
+      () => sendAuthorizedMessage(workersDir, { from: "Foreman", to: "*", content: "大家都来开会。" }),
       /没有权限/,
     );
 
     grantPermission(workersDir, {
-      subject: "布朗尼",
+      subject: "Foreman",
       actions: ["message:broadcast"],
       targets: ["*"],
       grantedBy: "秘书",
     });
-    sendAuthorizedMessage(workersDir, { from: "布朗尼", to: "*", content: "请各位同步今日进展。" });
-    assert.equal(listPermissions(workersDir, { subject: "布朗尼" }).length, 1);
-    assert.equal(listMessages(workersDir, { worker: "美伢" }).length, 2);
+    sendAuthorizedMessage(workersDir, { from: "Foreman", to: "*", content: "请各位同步今日进展。" });
+    assert.equal(listPermissions(workersDir, { subject: "Foreman" }).length, 1);
+    assert.equal(listMessages(workersDir, { worker: "ReviewerC" }).length, 2);
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("worker messages can be bulk-marked read when opening worker detail", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-comm-bulk-read-test-"));
+  try {
+    const direct = sendAuthorizedMessage(workersDir, { from: "秘书", to: "DeveloperA", content: "直接消息" });
+    const broadcast = sendAuthorizedMessage(workersDir, { from: "秘书", to: "*", content: "广播消息" });
+    grantPermission(workersDir, {
+      subject: "DeveloperA",
+      actions: ["message:broadcast"],
+      targets: ["*"],
+      grantedBy: "秘书",
+    });
+    const ownBroadcast = sendAuthorizedMessage(workersDir, { from: "DeveloperA", to: "*", content: "DeveloperA自己的广播" });
+
+    assert.equal(listMessages(workersDir, { worker: "DeveloperA", unreadOnly: true }).length, 3);
+
+    const read = markWorkerMessagesRead(workersDir, { worker: "DeveloperA" });
+    assert.equal(read.count, 2);
+    assert.deepEqual(read.reads.map((entry) => entry.messageId).sort(), [broadcast.id, direct.id].sort());
+    assert.equal(listMessages(workersDir, { worker: "DeveloperA" }).find((m) => m.id === direct.id).read, true);
+    assert.equal(listMessages(workersDir, { worker: "DeveloperA" }).find((m) => m.id === broadcast.id).read, true);
+    assert.equal(listMessages(workersDir, { worker: "DeveloperA" }).find((m) => m.id === ownBroadcast.id).read, false);
+
+    const again = markWorkerMessagesRead(workersDir, { worker: "DeveloperA" });
+    assert.equal(again.count, 0);
   } finally {
     rmSync(workersDir, { recursive: true, force: true });
   }
@@ -764,9 +994,9 @@ test("comm CLI lets authorized worker subprocesses send and read messages", () =
   const workersDir = mkdtempSync(join(tmpdir(), "ox-comm-cli-test-"));
   try {
     grantPermission(workersDir, {
-      subject: "派派",
+      subject: "LocalAdmin",
       actions: ["message:send"],
-      targets: ["东子"],
+      targets: ["DeveloperA"],
       grantedBy: "秘书",
     });
 
@@ -777,9 +1007,9 @@ test("comm CLI lets authorized worker subprocesses send and read messages", () =
       "--workers-dir",
       workersDir,
       "--from",
-      "派派",
+      "LocalAdmin",
       "--to",
-      "东子",
+      "DeveloperA",
       "--content",
       "CLI 授权消息",
     ], { encoding: "utf8" });
@@ -791,7 +1021,7 @@ test("comm CLI lets authorized worker subprocesses send and read messages", () =
       "--workers-dir",
       workersDir,
       "--worker",
-      "东子",
+      "DeveloperA",
     ], { encoding: "utf8" });
     assert.match(inbox, /CLI 授权消息/);
 
@@ -804,7 +1034,7 @@ test("comm CLI lets authorized worker subprocesses send and read messages", () =
         "--from",
         "广志",
         "--to",
-        "东子",
+        "DeveloperA",
         "--content",
         "未授权消息",
       ], { encoding: "utf8", stdio: "pipe" }),
@@ -815,54 +1045,707 @@ test("comm CLI lets authorized worker subprocesses send and read messages", () =
   }
 });
 
+test("worker task requests are event-sourced for authorized subagent delegation", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-worker-task-test-"));
+  try {
+    const request = createWorkerTaskRequest(workersDir, {
+      from: "WorkerL",
+      to: "WorkerB",
+      task: "请调研 subagent 派活接口",
+      project: "talk",
+      cwd: "/repo",
+      mode: "steer",
+      source: "worker",
+    });
+    assert.equal(request.status, "pending");
+    assert.equal(request.from, "WorkerL");
+    assert.equal(request.to, "WorkerB");
+    assert.equal(request.mode, "steer");
+    assert.equal(listPendingWorkerTaskRequests(workersDir).length, 1);
+    const rawRequestEvent = JSON.parse(readFileSync(workerTaskRequestsFile(workersDir), "utf8").trim().split("\n")[0]);
+    assert.equal(rawRequestEvent.type, "request");
+    assert.equal(rawRequestEvent.permissionAction, "work:assign");
+
+    const claimed = claimWorkerTaskRequest(workersDir, {
+      requestId: request.id,
+      claimedBy: "poller-a",
+    });
+    assert.equal(claimed.status, "processing");
+    assert.equal(claimed.claimedBy, "poller-a");
+    assert.equal(listPendingWorkerTaskRequests(workersDir).length, 0);
+
+    const duplicateClaim = claimWorkerTaskRequest(workersDir, {
+      requestId: request.id,
+      claimedBy: "poller-b",
+    });
+    assert.equal(duplicateClaim, null);
+
+    const accepted = acceptWorkerTaskRequest(workersDir, {
+      requestId: request.id,
+      jobId: "job-1",
+      deliveryMode: "queue",
+      placement: "已排队",
+    });
+    assert.equal(accepted.status, "accepted");
+    assert.equal(accepted.jobId, "job-1");
+
+    const reported = reportWorkerTaskResult(workersDir, {
+      requestId: request.id,
+      jobId: "job-1",
+      messageId: "msg-1",
+      resultStatus: "done",
+      summary: "已经完成",
+    });
+    assert.equal(reported.status, "reported");
+    assert.equal(reported.resultStatus, "done");
+    assert.equal(reported.resultMessageId, "msg-1");
+
+    const failedRequest = createWorkerTaskRequest(workersDir, {
+      from: "WorkerL",
+      to: "WorkerB",
+      task: "第二个任务",
+    });
+    const failed = failWorkerTaskRequest(workersDir, {
+      requestId: failedRequest.id,
+      error: "WorkerL 没有权限对 WorkerB 执行 work:assign",
+    });
+    assert.equal(failed.status, "failed");
+    assert.equal(failed.error, "WorkerL 没有权限对 WorkerB 执行 work:assign");
+    assert.equal(listWorkerTaskRequests(workersDir).length, 2);
+    assert.equal(getWorkerTaskRequest(workersDir, request.id).status, "reported");
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("worker task requests support pending edit and cancel", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-worker-task-edit-test-"));
+  try {
+    const request = createWorkerTaskRequest(workersDir, {
+      from: "WorkerL",
+      to: "WorkerB",
+      task: "先看一下",
+      mode: "auto",
+    });
+
+    const edited = editWorkerTaskRequest(workersDir, {
+      requestId: request.id,
+      task: "改成排队执行",
+      project: "talk",
+      mode: "queue",
+      from: "WorkerL",
+    });
+    assert.equal(edited.status, "pending");
+    assert.equal(edited.task, "改成排队执行");
+    assert.equal(edited.mode, "queue");
+    assert.equal(edited.project, "talk");
+    assert.equal(listPendingWorkerTaskRequests(workersDir)[0].task, "改成排队执行");
+
+    const cancelled = cancelWorkerTaskRequest(workersDir, {
+      requestId: request.id,
+      reason: "派活者撤回",
+      from: "WorkerL",
+    });
+    assert.equal(cancelled.status, "cancelled");
+    assert.equal(cancelled.cancelReason, "派活者撤回");
+    assert.equal(listPendingWorkerTaskRequests(workersDir).length, 0);
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("worker task processing claims recover after timeout", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-worker-task-recover-test-"));
+  try {
+    const request = createWorkerTaskRequest(workersDir, {
+      from: "WorkerL",
+      to: "WorkerB",
+      task: "可能会卡在 processing 的任务",
+    });
+
+    const claimed = claimWorkerTaskRequest(workersDir, {
+      requestId: request.id,
+      claimedBy: "pi:old",
+    });
+    assert.equal(claimed.status, "processing");
+    assert.equal(getWorkerTaskRequest(workersDir, request.id).status, "processing");
+    assert.equal(listPendingWorkerTaskRequests(workersDir).length, 0);
+
+    const recovered = recoverStaleWorkerTaskRequests(workersDir, {
+      now: new Date(Date.parse(claimed.claimedAt) + 180_000),
+      timeoutMs: 60_000,
+      recoveredBy: "pi:new",
+    });
+    assert.equal(recovered.length, 1);
+    assert.equal(recovered[0].id, request.id);
+    assert.equal(recovered[0].status, "pending");
+    assert.equal(recovered[0].recoveredBy, "pi:new");
+    assert.equal(listPendingWorkerTaskRequests(workersDir).length, 1);
+
+    const reclaimed = claimWorkerTaskRequest(workersDir, {
+      requestId: request.id,
+      claimedBy: "pi:new",
+    });
+    assert.equal(reclaimed.status, "processing");
+    assert.equal(reclaimed.claimedBy, "pi:new");
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("task result messages return to assigner without reverse message grant", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-task-result-message-test-"));
+  try {
+    assert.equal(hasPermission(workersDir, { subject: "WorkerB", action: "message:send", target: "WorkerL" }), false);
+    const result = sendTaskResultMessage(workersDir, {
+      from: "WorkerB",
+      to: "WorkerL",
+      content: "派活任务已完成。",
+      jobId: "job-1",
+      taskRequestId: "task-1",
+      resultStatus: "done",
+    });
+    assert.equal(result.kind, "task_result");
+    assert.equal(result.from, "WorkerB");
+    assert.equal(result.to, "WorkerL");
+    assert.equal(result.jobId, "job-1");
+    assert.equal(result.taskRequestId, "task-1");
+    const inbox = listMessages(workersDir, { worker: "WorkerL" });
+    assert.equal(inbox.length, 1);
+    assert.equal(inbox[0].read, false);
+    assert.equal(inbox[0].kind, "task_result");
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("comm CLI lets authorized workers assign task requests", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-task-cli-test-"));
+  try {
+    grantPermission(workersDir, {
+      subject: "WorkerL",
+      actions: ["work:assign"],
+      targets: ["WorkerB"],
+      grantedBy: "秘书",
+    });
+
+    const cli = join(testDir, "../comm-cli.mjs");
+    const output = execFileSync(process.execPath, [
+      cli,
+      "assign",
+      "--workers-dir",
+      workersDir,
+      "--from",
+      "WorkerL",
+      "--to",
+      "WorkerB",
+      "--task",
+      "请调研派活接口",
+      "--project",
+      "talk",
+      "--mode",
+      "queue",
+    ], { encoding: "utf8" });
+    assert.match(output, /assigned/);
+    const requests = listWorkerTaskRequests(workersDir);
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].from, "WorkerL");
+    assert.equal(requests[0].to, "WorkerB");
+    assert.equal(requests[0].source, "cli");
+    assert.equal(requests[0].mode, "queue");
+
+    assert.throws(
+      () => execFileSync(process.execPath, [
+        cli,
+        "assign",
+        "--workers-dir",
+        workersDir,
+        "--from",
+        "WorkerL",
+        "--to",
+        "DesignerA",
+        "--task",
+        "未授权派活",
+      ], { encoding: "utf8", stdio: "pipe" }),
+      /没有权限|Command failed/,
+    );
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("agent assigned jobs skip user emotion scoring", () => {
+  const spawnerSource = readFileSync(join(testDir, "..", "spawner.ts"), "utf8");
+
+  assert.match(spawnerSource, /function shouldSkipUserEmotionScore/);
+  assert.match(spawnerSource, /kind === "assigned-task"/);
+  assert.match(spawnerSource, /kind === "inbox"/);
+  assert.match(spawnerSource, /job\?\.source === "factory_command"/);
+  assert.match(spawnerSource, /sourceTaskRequestId/);
+  assert.match(spawnerSource, /sourceMessageId/);
+  assert.match(spawnerSource, /job\?\.assignedBy/);
+  assert.match(spawnerSource, /job\?\.returnTo/);
+  assert.match(spawnerSource, /recordQualityEmotionAsync\(job,\s*""\)/);
+  assert.doesNotMatch(spawnerSource, /recordQualityEmotionAsync\(finishedJob/);
+});
+
+test("factory command is recorded as talk with assigner metadata", () => {
+  const indexSource = readFileSync(join(testDir, "../index.ts"), "utf8");
+  const webServerSource = readFileSync(join(testDir, "../web-server.mjs"), "utf8");
+  const webAppSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
+
+  assert.match(indexSource, /assignedBy:\s*Type\.Optional/);
+  assert.match(indexSource, /source:\s*"factory_command"/);
+  assert.match(indexSource, /displayChannel:\s*"talk"/);
+  assert.match(indexSource, /assignedBy:\s*params\.assignedBy \|\| "主agent"/);
+  assert.match(indexSource, /kind:\s*"talk"/);
+  assert.match(webServerSource, /kind:\s*job\.kind \|\| ""/);
+  assert.match(webServerSource, /displayChannel:\s*job\.displayChannel \|\| ""/);
+  assert.match(webServerSource, /assignedBy:\s*job\.assignedBy \|\| ""/);
+  assert.match(webAppSource, /j\.project === "talk" \|\| j\.kind === "talk" \|\| j\.displayChannel === "talk"/);
+});
+
+test("worker task assignment is exposed as factory tool and Pi drain", () => {
+  const indexSource = readFileSync(join(testDir, "../index.ts"), "utf8");
+
+  assert.match(indexSource, /listPendingWorkerTaskRequests/);
+  assert.match(indexSource, /claimWorkerTaskRequest/);
+  assert.match(indexSource, /recoverStaleWorkerTaskRequests/);
+  assert.match(indexSource, /acceptWorkerTaskRequest/);
+  assert.match(indexSource, /failWorkerTaskRequest/);
+  assert.match(indexSource, /reportWorkerTaskResult/);
+  assert.match(indexSource, /sendTaskResultMessage/);
+  assert.match(indexSource, /ensureWorkerTaskPoller/);
+  assert.match(indexSource, /name:\s*"factory_task_assign"/);
+  assert.match(indexSource, /name:\s*"factory_task_status"/);
+  assert.match(indexSource, /action:\s*"work:assign"/);
+  assert.match(indexSource, /kind:\s*"assigned-task"/);
+  assert.match(indexSource, /sourceTaskRequestId/);
+  assert.match(indexSource, /assignedBy/);
+});
+
+test("outsource profiles are configurable white-paper agent definitions", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-outsource-profile-test-"));
+  try {
+    const profile = upsertOutsourceProfile(workersDir, {
+      name: "codex-coder",
+      description: "匿名 Codex 写代码外包",
+      backend: "codex",
+      model: "5.5",
+      thinking: "high",
+      tools: ["read", "bash", "edit", "write"],
+      skills: false,
+      systemPrompt: "你是匿名外包程序员，只完成给定任务。",
+      maxTurns: 30,
+      defaultWait: true,
+    });
+
+    assert.equal(profile.name, "codex-coder");
+    assert.equal(profile.backend, "codex");
+    assert.equal(profile.skills, false);
+    assert.deepEqual(profile.tools, ["read", "bash", "edit", "write"]);
+    assert.equal(getOutsourceProfile(workersDir, "codex-coder").model, "5.5");
+    assert.equal(listOutsourceProfiles(workersDir).length, 1);
+    assert.ok(existsSync(outsourceProfilesFile(workersDir)));
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("outsource runs persist lifecycle events and derived results", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-outsource-run-test-"));
+  try {
+    upsertOutsourceProfile(workersDir, {
+      name: "pi-coder",
+      description: "匿名 Pi 写代码外包",
+      tools: ["read", "bash"],
+      skills: false,
+    });
+    const run = createOutsourceRun(workersDir, {
+      profile: "pi-coder",
+      task: "实现一个按钮",
+      project: "talk",
+      requestedBy: "WorkerL",
+      groupId: "ogroup_demo",
+      cwd: "/repo",
+    });
+    assert.equal(run.status, "queued");
+    assert.equal(run.profile, "pi-coder");
+
+    const running = markOutsourceRunRunning(workersDir, {
+      runId: run.id,
+      jobId: "job-1",
+      pid: 123,
+    });
+    assert.equal(running.status, "running");
+    assert.equal(running.jobId, "job-1");
+
+    const done = completeOutsourceRun(workersDir, {
+      runId: run.id,
+      status: "done",
+      summary: "完成按钮",
+      fullOutput: "完成按钮，测试通过。",
+      usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+    });
+    assert.equal(done.status, "done");
+    assert.equal(done.summary, "完成按钮");
+    assert.equal(done.fullOutput, "完成按钮，测试通过。");
+    assert.equal(done.inputTokens, 10);
+    assert.equal(getOutsourceRun(workersDir, run.id).status, "done");
+    assert.equal(listOutsourceRuns(workersDir, { groupId: "ogroup_demo" }).length, 1);
+    assert.ok(existsSync(outsourceRunsFile(workersDir)));
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("outsource runs mirror stale linked jobs during recovery", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-outsource-stale-test-"));
+  try {
+    const job = createJob(workersDir, {
+      kind: "outsource-run",
+      worker: "外包:whitepaper-a",
+      project: "talk",
+      task: "后台任务",
+    });
+    updateJob(job, { status: "running", startedAt: "2026-07-09T00:00:00.000Z" });
+    const run = createOutsourceRun(workersDir, {
+      profileName: "whitepaper-a",
+      task: "后台任务",
+      project: "talk",
+      requestedBy: "DesignerA",
+      jobId: job.id,
+    });
+    markOutsourceRunRunning(workersDir, {
+      runId: run.id,
+      jobId: job.id,
+      pid: 99999999,
+      startedAt: "2026-07-09T00:00:00.000Z",
+    });
+
+    const summary = recoverOpenJobsOnStartup(workersDir, "previous Pi process exited", {
+      now: new Date("2026-07-09T00:01:00.000Z"),
+      checkOwnerPid: false,
+    });
+
+    assert.equal(summary.stale, 1);
+    const staleRun = getOutsourceRun(workersDir, run.id);
+    assert.equal(readJob(job.jobFile).status, "stale");
+    assert.equal(staleRun.status, "stale");
+    assert.equal(staleRun.error, "previous Pi process exited");
+    assert.equal(staleRun.events.some((event) => event.type === "stale"), true);
+    assert.equal(OUTSOURCE_TERMINAL_STATUSES.has("stale"), true);
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("outsource Pi runner does not recursively spawn outsource CLI with Pi flags", () => {
+  const piArgs = ["--mode", "json", "-p", "--no-session", "Task: 搜索功能"];
+  const invocation = getPiInvocation(piArgs, {
+    currentScript: "/tmp/ox-factory-host/.pi/extensions/ox-factory/outsource-cli.mjs",
+    execPath: "/usr/local/bin/node",
+    exists: () => true,
+  });
+
+  assert.equal(invocation.command, "pi");
+  assert.deepEqual(invocation.args, piArgs);
+  assert.notEqual(invocation.args[0], "/tmp/ox-factory-host/.pi/extensions/ox-factory/outsource-cli.mjs");
+});
+
+test("outsource worker does not recursively spawn itself with Pi flags", () => {
+  const piArgs = ["--mode", "json", "-p", "--no-session", "Task: 删除左导航"];
+  const invocation = getPiInvocation(piArgs, {
+    currentScript: "/tmp/ox-factory-host/.pi/extensions/ox-factory/outsource-worker.mjs",
+    execPath: "/usr/local/bin/node",
+    exists: () => true,
+  });
+
+  assert.equal(invocation.command, "pi");
+  assert.deepEqual(invocation.args, piArgs);
+  assert.notEqual(invocation.args[0], "/tmp/ox-factory-host/.pi/extensions/ox-factory/outsource-worker.mjs");
+});
+
+test("outsource Pi runner builds memoryless white-paper child process arguments", () => {
+  const built = buildOutsourcePiArgs({
+    profile: {
+      name: "pi-coder",
+      backend: "pi",
+      model: "doubao-seed-code",
+      thinking: "medium",
+      tools: ["read", "bash", "edit", "write"],
+      skills: false,
+    },
+    task: "实现一个函数",
+    systemPromptPath: "/tmp/outsourcing.md",
+  });
+
+  assert.deepEqual(built.args.slice(0, 4), ["--mode", "json", "-p", "--no-session"]);
+  assert.ok(built.args.includes("--no-skills"));
+  assert.ok(built.args.includes("--system-prompt"));
+  assert.ok(built.args.includes("/tmp/outsourcing.md"));
+  assert.ok(built.args.includes("--tools"));
+  assert.ok(built.args.includes("read,bash,edit,write"));
+  assert.ok(built.args.includes("--model"));
+  assert.ok(built.args.includes("doubao-seed-code"));
+  assert.ok(built.args.at(-1).includes("Task: 实现一个函数"));
+});
+
+test("outsource dispatcher starts a runnable job and completes the same run", async () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-outsource-dispatch-test-"));
+  try {
+    const profile = upsertOutsourceProfile(workersDir, {
+      name: "whitepaper-a",
+      backend: "pi",
+      model: "model_api/experimental_0630",
+      tools: ["read", "bash"],
+      skills: false,
+    });
+
+    const { run, job, promise } = startOutsourceRunJob({
+      workersDir,
+      profile,
+      task: "只回复 ok",
+      project: "talk",
+      cwd: workersDir,
+      requestedBy: "DesignerA",
+      runner: async (_input, onEvent) => {
+        onEvent({ type: "text", text: "ok" });
+        return {
+          exitCode: 0,
+          output: "ok",
+          stderr: "",
+          turns: 1,
+          inputTokens: 3,
+          cachedInputTokens: 0,
+          outputTokens: 1,
+          reasoningOutputTokens: 0,
+          totalTokens: 4,
+          model: "fake-model",
+        };
+      },
+    });
+
+    assert.equal(run.status, "running");
+    assert.equal(run.jobId, job.id);
+    assert.equal(job.worker, "外包:whitepaper-a");
+
+    const result = await promise;
+    assert.equal(result.output, "ok");
+
+    const done = getOutsourceRun(workersDir, run.id);
+    assert.equal(done.status, "done");
+    assert.equal(done.summary, "ok");
+    assert.equal(done.jobId, job.id);
+    assert.equal(done.requestedBy, "DesignerA");
+    assert.equal(readJob(job.jobFile).status, "done");
+    assert.match(renderOutsourceWaitResult({ status: "completed", mode: "all", runs: [done] }), /外包执行完成/);
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("outsource dispatcher detaches background runs from the calling process", async () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-outsource-detach-test-"));
+  try {
+    const profile = upsertOutsourceProfile(workersDir, {
+      name: "whitepaper-a",
+      backend: "pi",
+      model: "model_api/experimental_0630",
+      tools: ["read", "bash"],
+      skills: false,
+    });
+
+    let runnerCalled = false;
+    let spawned = null;
+    const { run, job, promise } = startOutsourceRunJob({
+      workersDir,
+      profile,
+      task: "后台跑，不要依赖父进程",
+      project: "talk",
+      cwd: workersDir,
+      requestedBy: "DesignerA",
+      detached: true,
+      spawnDetached: (input) => {
+        spawned = input;
+        return { pid: 12345 };
+      },
+      runner: async () => {
+        runnerCalled = true;
+        return { exitCode: 0, output: "should not run in parent" };
+      },
+    });
+
+    assert.equal(runnerCalled, false);
+    assert.equal(spawned?.run?.id, run.id);
+    assert.equal(spawned?.job?.id, job.id);
+    assert.equal(readJob(job.jobFile).status, "running");
+    assert.equal(readJob(job.jobFile).ownerPid, 12345);
+    assert.equal(getOutsourceRun(workersDir, run.id).status, "running");
+
+    const result = await promise;
+    assert.equal(result.detached, true);
+    assert.equal(result.pid, 12345);
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("outsource CLI is documented for workers and uses the shared dispatcher", () => {
+  const packageJson = readFileSync(join(testDir, "../package.json"), "utf8");
+  const handbook = readFileSync(join(testDir, "../factory-handbook.mjs"), "utf8");
+  const cli = readFileSync(join(testDir, "../outsource-cli.mjs"), "utf8");
+  const indexSource = readFileSync(join(testDir, "../index.ts"), "utf8");
+
+  assert.match(packageJson, /outsource-dispatcher\.mjs/);
+  assert.match(packageJson, /outsource-cli\.mjs/);
+  assert.match(handbook, /outsource-cli\.mjs/);
+  assert.match(handbook, /--from/);
+  assert.match(handbook, /--profile/);
+  assert.match(cli, /startOutsourceRunJob/);
+  assert.match(cli, /command === "run"/);
+  assert.match(cli, /--task-file/);
+  assert.match(indexSource, /from "\.\/outsource-dispatcher\.mjs"/);
+});
+
+test("web outsource run API starts the shared dispatcher instead of creating orphan queued runs", () => {
+  const webServerSource = readFileSync(join(testDir, "../web-server.mjs"), "utf8");
+
+  assert.match(webServerSource, /startOutsourceRunJob/);
+  assert.match(webServerSource, /from "\.\/outsource-dispatcher\.mjs"/);
+  assert.doesNotMatch(webServerSource, /createOutsourceRun/);
+  assert.doesNotMatch(webServerSource, /sendAuthorizedMessage/);
+  assert.doesNotMatch(webServerSource, /真正调度需要 Pi 主 agent/);
+});
+
+test("outsource mode is exposed as factory tools without replacing worker delegation", () => {
+  const indexSource = readFileSync(join(testDir, "../index.ts"), "utf8");
+  const dispatcherSource = readFileSync(join(testDir, "../outsource-dispatcher.mjs"), "utf8");
+  const packageJson = readFileSync(join(testDir, "../package.json"), "utf8");
+
+  assert.match(indexSource, /name:\s*"factory_outsource_profiles"/);
+  assert.match(indexSource, /name:\s*"factory_outsource_run"/);
+  assert.match(indexSource, /name:\s*"factory_outsource_status"/);
+  assert.match(indexSource, /name:\s*"factory_outsource_wait"/);
+  assert.match(indexSource, /name:\s*"factory_outsource_result"/);
+  assert.match(indexSource, /startOutsourceRunJob/);
+  assert.match(indexSource, /waitForOutsourceRuns/);
+  assert.match(dispatcherSource, /runOutsourceAgentStreaming/);
+  assert.match(dispatcherSource, /kind:\s*"outsource-run"/);
+  assert.match(dispatcherSource, /background/);
+  assert.match(packageJson, /outsource-agents\.mjs/);
+  assert.match(packageJson, /outsource-runner\.mjs/);
+  assert.match(packageJson, /outsource-dispatcher\.mjs/);
+});
+
+test("codex worker and outsource execution have no default wall-clock timeout", () => {
+  const codexBackendSource = readFileSync(join(testDir, "../codex-backend.mjs"), "utf8");
+  const outsourceRunnerSource = readFileSync(join(testDir, "../outsource-runner.mjs"), "utf8");
+  const outsourceAgentsSource = readFileSync(join(testDir, "../outsource-agents.mjs"), "utf8");
+  const outsourceCliSource = readFileSync(join(testDir, "../outsource-cli.mjs"), "utf8");
+  const indexSource = readFileSync(join(testDir, "../index.ts"), "utf8");
+  const profile = normalizeOutsourceProfile({ name: "whitepaper-a", backend: "codex" });
+
+  assert.equal(profile.timeoutMs, 0);
+  assert.doesNotMatch(codexBackendSource, /Timed out waiting for Codex turn completion/);
+  assert.doesNotMatch(outsourceRunnerSource, /Timed out waiting for Codex outsource turn completion/);
+  assert.match(outsourceAgentsSource, /timeoutMs\s*=\s*0/);
+  assert.match(outsourceAgentsSource, /Number\(timeoutMs\)\s*>\s*0/);
+  assert.doesNotMatch(outsourceCliSource, /30 \* 60 \* 1000/);
+  assert.doesNotMatch(indexSource, /profile\.timeoutMs \|\| 30 \* 60 \* 1000/);
+  assert.doesNotMatch(indexSource, /params\.timeoutMs \|\| 30 \* 60 \* 1000/);
+  assert.match(indexSource, /不填\/0=不超时/);
+});
+
+test("outsource mode is tracked in quality checklist and market report", () => {
+  const checklist = readFileSync(join(testDir, "../docs/ox-factory-quality-checklist.md"), "utf8");
+  const tracker = readFileSync(join(testDir, "../docs/ox-factory-improvement-tracker.md"), "utf8");
+  const report = readFileSync(join(testDir, "../docs/ox-factory-subagent-market-report.md"), "utf8");
+
+  assert.match(checklist, /OF-037/);
+  assert.match(checklist, /外包模式/);
+  assert.match(checklist, /白纸/);
+  assert.match(tracker, /OF-037/);
+  assert.match(report, /OutsourceAgentProfile|外包模式/);
+});
+
+test("web task requests are event-sourced for dashboard delegation", () => {
+  const webServerSource = readFileSync(join(testDir, "../web-server.mjs"), "utf8");
+
+  assert.match(webServerSource, /createWorkerTaskRequest/);
+  assert.match(webServerSource, /listWorkerTaskRequests/);
+  assert.match(webServerSource, /getWorkerTaskRequest/);
+  assert.match(webServerSource, /POST \/api\/task-requests/);
+  assert.match(webServerSource, /handleWorkerTaskRequestCreate/);
+  assert.match(webServerSource, /handleWorkerTaskRequestStatus/);
+  assert.doesNotMatch(webServerSource, /createJob\(workersDir,\s*\{\s*kind:\s*"assigned-task"/);
+});
+
+test("web dashboard keeps worker task delegation route while hiding nav entry", () => {
+  const html = readFileSync(join(testDir, "../web/index.html"), "utf8");
+  const webAppSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
+  const styleSource = readFileSync(join(testDir, "../web/styles.css"), "utf8");
+
+  assert.doesNotMatch(html, /data-route="tasks"/);
+  assert.doesNotMatch(html, /data-i18n="nav\.tasks"/);
+  assert.match(webAppSource, /"nav\.tasks":\s*"派活"/);
+  assert.match(webAppSource, /async function renderTaskRequests/);
+  assert.match(webAppSource, /api\("\/api\/task-requests/);
+  assert.match(webAppSource, /route === "tasks"/);
+  assert.match(webAppSource, /renderTaskRequests\(\)/);
+  assert.match(webAppSource, /openTaskRequestDrawer/);
+  assert.match(styleSource, /\.task-grid/);
+  assert.match(styleSource, /\.task-request-card/);
+});
+
 test("worker responsibilities are append-only, upserted, and removable", () => {
   const workersDir = mkdtempSync(join(tmpdir(), "ox-responsibility-test-"));
   try {
     setWorkerResponsibility(workersDir, {
-      worker: "东子",
+      worker: "DeveloperA",
       project: "牛马工厂 Web 大盘",
       relation: "lead",
       scope: "负责本地 Web 的前端体验、项目态势和视觉 polish",
       updatedBy: "主agent",
     });
     setWorkerResponsibility(workersDir, {
-      worker: "东子",
+      worker: "DeveloperA",
       project: "牛马工厂 Web 大盘",
       relation: "lead",
       scope: "负责 Overview 大盘、项目态势和 War Room 视觉",
-      updatedBy: "派派",
+      updatedBy: "LocalAdmin",
     });
     setWorkerResponsibility(workersDir, {
-      worker: "布朗尼",
+      worker: "Foreman",
       project: "工厂日报",
       relation: "owner",
       scope: "负责日报上下文核对和每日归档",
     });
 
-    const dongzi = listWorkerResponsibilities(workersDir, { worker: "东子" });
+    const dongzi = listWorkerResponsibilities(workersDir, { worker: "DeveloperA" });
     assert.equal(dongzi.length, 1);
-    assert.equal(dongzi[0].worker, "东子");
+    assert.equal(dongzi[0].worker, "DeveloperA");
     assert.equal(dongzi[0].project, "牛马工厂 Web 大盘");
     assert.equal(dongzi[0].relation, "lead");
     assert.equal(dongzi[0].scope, "负责 Overview 大盘、项目态势和 War Room 视觉");
     assert.equal(dongzi[0].status, "active");
-    assert.equal(dongzi[0].updatedBy, "派派");
+    assert.equal(dongzi[0].updatedBy, "LocalAdmin");
 
     const all = listWorkerResponsibilities(workersDir);
     assert.deepEqual(
       new Set(all.map((r) => r.worker)),
-      new Set(["东子", "布朗尼"]),
+      new Set(["DeveloperA", "Foreman"]),
     );
 
     removeWorkerResponsibility(workersDir, {
-      worker: "东子",
+      worker: "DeveloperA",
       project: "牛马工厂 Web 大盘",
       relation: "lead",
       updatedBy: "主agent",
     });
 
-    assert.equal(listWorkerResponsibilities(workersDir, { worker: "东子" }).length, 0);
-    const inactive = listWorkerResponsibilities(workersDir, { worker: "东子", includeInactive: true });
+    assert.equal(listWorkerResponsibilities(workersDir, { worker: "DeveloperA" }).length, 0);
+    const inactive = listWorkerResponsibilities(workersDir, { worker: "DeveloperA", includeInactive: true });
     assert.equal(inactive.length, 1);
     assert.equal(inactive[0].status, "removed");
   } finally {
@@ -884,7 +1767,7 @@ test("project store records lightweight project metadata and operational state",
       truthType: "markdown",
       truthNote: "项目 checklist 以此文档为准",
       dashboardUrl: "http://127.0.0.1:8787",
-      updatedBy: "派派",
+      updatedBy: "LocalAdmin",
     });
     assert.equal(created.id, "ox-factory-web");
     assert.equal(created.name, "牛马工厂 Web 大盘");
@@ -902,7 +1785,7 @@ test("project store records lightweight project metadata and operational state",
     });
     setProjectMember(workersDir, {
       project: "工厂大盘",
-      worker: "八村",
+      worker: "DesignerA",
       relation: "designer",
       note: "负责 Web 视觉和交互",
     });
@@ -911,7 +1794,7 @@ test("project store records lightweight project metadata and operational state",
       todoId: "project-page",
       title: "新增项目视角页面",
       status: "todo",
-      owner: "八村",
+      owner: "DesignerA",
       evidence: "docs/ox-factory-project-entity-design.md",
     });
     setProjectWorktree(workersDir, {
@@ -919,14 +1802,14 @@ test("project store records lightweight project metadata and operational state",
       worktreeId: "hachimura-ui",
       path: ".pi/workers/worktrees/ox-factory-web/hachimura-ui",
       branch: "feat/project-view",
-      worker: "八村",
+      worker: "DesignerA",
       status: "active",
     });
     addProjectProgress(workersDir, {
       project: "factory-dashboard",
       text: "Project Entity MVP 进入实现阶段",
       status: "doing",
-      owner: "派派",
+      owner: "LocalAdmin",
       evidence: "projects.jsonl",
     });
 
@@ -935,7 +1818,7 @@ test("project store records lightweight project metadata and operational state",
     assert.match(project.summary, /token/);
     assert.deepEqual(new Set(project.aliases), new Set(["web-dashboard", "工厂大盘", "factory-dashboard", "大盘"]));
     assert.equal(project.members.length, 1);
-    assert.equal(project.members[0].worker, "八村");
+    assert.equal(project.members[0].worker, "DesignerA");
     assert.equal(project.todos.length, 1);
     assert.equal(project.todos[0].id, "project-page");
     assert.equal(project.worktrees.length, 1);
@@ -992,7 +1875,7 @@ test("token report prefers session usage and uses job tokens only as fallback", 
     const sessionsDir = join(workersDir, "sessions");
     mkdirSync(sessionsDir, { recursive: true });
     writeFileSync(
-      join(sessionsDir, "派派.jsonl"),
+      join(sessionsDir, "LocalAdmin.jsonl"),
       [
         JSON.stringify({
           type: "message",
@@ -1009,7 +1892,7 @@ test("token report prefers session usage and uses job tokens only as fallback", 
 
     const paipaiJob = createJob(workersDir, {
       kind: "talk",
-      worker: "派派",
+      worker: "LocalAdmin",
       project: "talk",
       task: "同一天同一个员工的 job token 不应和 session 重复相加",
     });
@@ -1040,7 +1923,7 @@ test("token report prefers session usage and uses job tokens only as fallback", 
     });
 
     const report = buildFactoryTokenReport({ workersDir, date: "2026-06-30" });
-    const paipai = report.workers.find((worker) => worker.worker === "派派");
+    const paipai = report.workers.find((worker) => worker.worker === "LocalAdmin");
     assert.equal(paipai.reported.inputTokens, 1000);
     assert.equal(paipai.reported.outputTokens, 200);
     assert.equal(paipai.reported.totalTokens, 1200);
@@ -1165,7 +2048,7 @@ test("codex rollout token repair can patch matched done job metadata", () => {
   try {
     const job = createJob(workersDir, {
       kind: "talk",
-      worker: "光彦",
+      worker: "DeveloperB",
       project: "talk",
       task: "发布 showcase",
     });
@@ -1181,13 +2064,13 @@ test("codex rollout token repair can patch matched done job metadata", () => {
     const report = {
       date: "2026-07-06",
       timezoneOffset: "+08:00",
-      worker: "光彦",
+      worker: "DeveloperB",
       threadId: "thread-1",
       rolloutFile: "/tmp/rollout.jsonl",
       segments: [{
         startAt: "2026-07-06T01:00:01.000Z",
         endAt: "2026-07-06T01:05:00.000Z",
-        prompt: "你的名字叫 **光彦**。\n## 任务\n发布 showcase",
+        prompt: "你的名字叫 **DeveloperB**。\n## 任务\n发布 showcase",
         usage: {
           inputTokens: 100,
           cachedInputTokens: 80,
@@ -1224,7 +2107,7 @@ test("token trend aggregates multiple days from one token index", () => {
     const sessionsDir = join(workersDir, "sessions");
     mkdirSync(sessionsDir, { recursive: true });
     writeFileSync(
-      join(sessionsDir, "派派.jsonl"),
+      join(sessionsDir, "LocalAdmin.jsonl"),
       [
         JSON.stringify({
           type: "message",
@@ -1278,7 +2161,7 @@ test("token report CLI prints token-only output", () => {
   try {
     const job = createJob(workersDir, {
       kind: "talk",
-      worker: "东子",
+      worker: "DeveloperA",
       project: "token",
       task: "token smoke",
     });
@@ -1302,7 +2185,7 @@ test("token report CLI prints token-only output", () => {
     ], { encoding: "utf8" });
 
     assert.match(output, /工厂 Token 报告/);
-    assert.match(output, /东子/);
+    assert.match(output, /DeveloperA/);
     assert.match(output, /1\.74M/);
     assert.match(output, /9\.50M/);
     assert.match(output, /360K/);
@@ -1323,7 +2206,7 @@ test("token report CLI prints token-only output", () => {
       "--json",
     ], { encoding: "utf8" });
     const jsonReport = JSON.parse(jsonOutput);
-    const dongzi = jsonReport.workers.find((worker) => worker.worker === "东子");
+    const dongzi = jsonReport.workers.find((worker) => worker.worker === "DeveloperA");
     assert.equal(dongzi.reported.inputTokens, 1738735);
     assert.equal(dongzi.reported.cachedInputTokens, 9500000);
     assert.equal(dongzi.reported.outputTokens, 360000);
@@ -1380,6 +2263,7 @@ test("worker vacation status and job cancellation are exposed", () => {
   const registrySource = readFileSync(join(testDir, "../registry.ts"), "utf8");
   const typesSource = readFileSync(join(testDir, "../types.ts"), "utf8");
   const webServerSource = readFileSync(join(testDir, "../web-server.mjs"), "utf8");
+  const workerRegistrySnapshotSource = readFileSync(join(testDir, "../worker-registry-snapshot.mjs"), "utf8");
 
   assert.match(typesSource, /WorkerStatus = "idle" \| "working" \| "vacation" \| "fired"/);
   assert.match(typesSource, /STATUS: "ox-worker-status"/);
@@ -1394,7 +2278,7 @@ test("worker vacation status and job cancellation are exposed", () => {
   assert.match(indexSource, /Codex 后端.*当前 turn/);
   assert.match(indexSource, /Pi 后端.*当前 job 后优先执行/);
   assert.match(indexSource, /canSteerActiveCodexTurn/);
-  assert.match(webServerSource, /ox-worker-status/);
+  assert.match(workerRegistrySnapshotSource, /ox-worker-status/);
   assert.match(webServerSource, /regInfo\.status === "vacation"/);
 });
 
@@ -1404,6 +2288,11 @@ test("ox web command starts and opens the local dashboard", () => {
   assert.match(indexSource, /registerCommand\("ox-web"/);
   assert.match(indexSource, /ensureOxWebDashboard/);
   assert.match(indexSource, /isOxWebDashboardHealthy/);
+  assert.match(indexSource, /checkOxWebDashboard/);
+  assert.match(indexSource, /\/api\/task-requests\?limit=1/);
+  assert.match(indexSource, /stopOxWebDashboardOnPort/);
+  assert.match(indexSource, /listeningPidForPort/);
+  assert.match(indexSource, /检测到旧版牛马工厂 Web 服务/);
   assert.match(indexSource, /web-server\.mjs/);
   assert.match(indexSource, /openExternalUrl/);
   assert.match(indexSource, /127\.0\.0\.1/);
@@ -1411,16 +2300,40 @@ test("ox web command starts and opens the local dashboard", () => {
   assert.match(indexSource, /--no-open/);
 });
 
+test("web health advertises feature flags used by ox-web stale detection", () => {
+  const webServerSource = readFileSync(join(testDir, "../web-server.mjs"), "utf8");
+
+  assert.match(webServerSource, /features:\s*\{/);
+  assert.match(webServerSource, /taskRequests:\s*true/);
+  assert.match(webServerSource, /compactJobTimeline:\s*true/);
+});
+
 test("web talk requests are event-sourced and do not create jobs in web-server", () => {
   const workersDir = mkdtempSync(join(tmpdir(), "ox-web-talk-test-"));
   try {
     const request = createWebTalkRequest(workersDir, {
-      worker: "八村",
+      worker: "DesignerA",
       message: "你好",
       from: "web",
     });
     assert.equal(request.status, "pending");
     assert.equal(listPendingWebTalkRequests(workersDir).length, 1);
+    const rawRequestEvent = JSON.parse(readFileSync(webTalkRequestsFile(workersDir), "utf8").trim().split("\n")[0]);
+    assert.equal(rawRequestEvent.type, "request_v2");
+
+    const claimed = claimWebTalkRequest(workersDir, {
+      requestId: request.id,
+      claimedBy: "poller-a",
+    });
+    assert.equal(claimed.status, "processing");
+    assert.equal(claimed.claimedBy, "poller-a");
+    assert.equal(listPendingWebTalkRequests(workersDir).length, 0);
+
+    const duplicateClaim = claimWebTalkRequest(workersDir, {
+      requestId: request.id,
+      claimedBy: "poller-b",
+    });
+    assert.equal(duplicateClaim, null);
 
     const accepted = acceptWebTalkRequest(workersDir, {
       requestId: request.id,
@@ -1434,7 +2347,7 @@ test("web talk requests are event-sourced and do not create jobs in web-server",
     assert.equal(getWebTalkRequest(workersDir, request.id).status, "accepted");
 
     const failedRequest = createWebTalkRequest(workersDir, {
-      worker: "八村",
+      worker: "DesignerA",
       message: "第二条",
     });
     const failed = failWebTalkRequest(workersDir, {
@@ -1453,7 +2366,9 @@ test("web talk requests are event-sourced and do not create jobs in web-server",
     assert.doesNotMatch(webServerSource, /sessions\/ 下找不到对应 session/);
     assert.doesNotMatch(webServerSource, /createJob\(workersDir,\s*\{\s*kind:\s*"talk"/);
     assert.match(indexSource, /listPendingWebTalkRequests/);
-    assert.match(indexSource, /startTalkMessage\(w!, message, ctx, undefined, \{ attach: false, notify: false \}\)/);
+    assert.match(indexSource, /claimWebTalkRequest/);
+    assert.match(indexSource, /const requestedMode = request\.mode === "queue" \|\| request\.mode === "steer" \? request\.mode : undefined/);
+    assert.match(indexSource, /startTalkMessage\(w!, message, ctx, requestedMode, \{ attach: false, notify: false \}\)/);
     assert.match(indexSource, /options:\s*\{ attach\?: boolean; notify\?: boolean \}/);
     assert.match(indexSource, /const notifyConsole = options\.notify !== false/);
     assert.match(indexSource, /if \(notifyConsole\) ctx\?\.ui\?\.notify/);
@@ -1462,17 +2377,527 @@ test("web talk requests are event-sourced and do not create jobs in web-server",
   }
 });
 
+test("web talk requests preserve delivery mode and support pending edit/cancel", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-web-talk-mode-test-"));
+  try {
+    const request = createWebTalkRequest(workersDir, {
+      worker: "DesignerA",
+      message: "先看看",
+      from: "web",
+      mode: "steer",
+    });
+    assert.equal(request.mode, "steer");
+
+    const edited = editWebTalkRequest(workersDir, {
+      requestId: request.id,
+      message: "改成排队执行",
+      mode: "queue",
+      from: "web",
+    });
+    assert.equal(edited.status, "pending");
+    assert.equal(edited.message, "改成排队执行");
+    assert.equal(edited.mode, "queue");
+    assert.equal(listPendingWebTalkRequests(workersDir)[0].message, "改成排队执行");
+
+    const cancelled = cancelWebTalkRequest(workersDir, {
+      requestId: request.id,
+      reason: "用户撤回",
+      from: "web",
+    });
+    assert.equal(cancelled.status, "cancelled");
+    assert.equal(cancelled.cancelReason, "用户撤回");
+    assert.equal(listPendingWebTalkRequests(workersDir).length, 0);
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("web job control requests are event-sourced for accepted job cancel/edit", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-web-job-control-test-"));
+  try {
+    const cancel = createWebTalkJobControlRequest(workersDir, {
+      action: "cancel",
+      jobId: "job-1",
+      worker: "DesignerA",
+      reason: "用户取消",
+      from: "web",
+    });
+    assert.equal(cancel.status, "pending");
+    assert.equal(cancel.action, "cancel");
+    assert.equal(listPendingWebTalkJobControlRequests(workersDir).length, 1);
+
+    const accepted = acceptWebTalkJobControlRequest(workersDir, {
+      requestId: cancel.id,
+      status: "aborting",
+      message: "已请求中止运行中的 job",
+    });
+    assert.equal(accepted.status, "accepted");
+    assert.equal(accepted.resultStatus, "aborting");
+    assert.equal(getWebTalkJobControlRequest(workersDir, cancel.id).status, "accepted");
+
+    const edit = createWebTalkJobControlRequest(workersDir, {
+      action: "edit",
+      jobId: "job-2",
+      worker: "DesignerA",
+      message: "改后的队列任务",
+      from: "web",
+    });
+    const failed = failWebTalkJobControlRequest(workersDir, {
+      requestId: edit.id,
+      error: "job 已运行，不能编辑",
+    });
+    assert.equal(failed.status, "failed");
+    assert.equal(listWebTalkJobControlRequests(workersDir).length, 2);
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("web job unread summary marks workers unread until job detail is read", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-web-unread-test-"));
+  try {
+    const job = createJob(workersDir, {
+      kind: "talk",
+      worker: "DesignerA",
+      project: "talk",
+      task: "做页面",
+    });
+    appendJobEvent(job, { type: "text", text: "第一段进度" });
+    updateJob(job, { status: "running" });
+
+    const before = buildWorkerJobUnreadSummary(workersDir, [readJob(job.jobFile)]);
+    assert.equal(before.byWorker.get("DesignerA").unreadJobs, 1);
+    assert.equal(before.byWorker.get("DesignerA").unreadEvents, 1);
+
+    const read = markWebJobRead(workersDir, readJob(job.jobFile), { readBy: "web" });
+    assert.equal(read.jobId, job.id);
+    const afterRead = buildWorkerJobUnreadSummary(workersDir, [readJob(job.jobFile)]);
+    assert.equal(afterRead.byWorker.get("DesignerA").unreadJobs, 0);
+
+    appendJobEvent(job, { type: "text", text: "第二段进度" });
+    updateJob(job, { status: "running" });
+    const afterUpdate = buildWorkerJobUnreadSummary(workersDir, [readJob(job.jobFile)]);
+    assert.equal(afterUpdate.byWorker.get("DesignerA").unreadJobs, 1);
+    assert.equal(afterUpdate.byWorker.get("DesignerA").unreadEvents, 1);
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("worker jobs can be bulk-marked read when opening worker detail", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-web-worker-job-read-test-"));
+  try {
+    const job = createJob(workersDir, {
+      kind: "talk",
+      worker: "DesignerA",
+      project: "talk",
+      task: "做页面",
+    });
+    appendJobEvent(job, { type: "text", text: "第一段进度" });
+    updateJob(job, { status: "running" });
+
+    const before = buildWorkerJobUnreadSummary(workersDir, [readJob(job.jobFile)]);
+    assert.equal(before.byWorker.get("DesignerA").unreadJobs, 1);
+
+    const read = markWorkerJobsRead(workersDir, [readJob(job.jobFile)], { readBy: "web" });
+    assert.equal(read.count, 1);
+    assert.equal(read.unreadEvents, 1);
+
+    const after = buildWorkerJobUnreadSummary(workersDir, [readJob(job.jobFile)]);
+    assert.equal(after.byWorker.get("DesignerA").unreadJobs, 0);
+
+    const again = markWorkerJobsRead(workersDir, [readJob(job.jobFile)], { readBy: "web" });
+    assert.equal(again.count, 0);
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("web inbox messages can be marked read from the UI", () => {
+  const webServerSource = readFileSync(join(testDir, "../web-server.mjs"), "utf8");
+  const appSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
+
+  assert.match(webServerSource, /POST \/api\/messages\/\*\/read/);
+  assert.match(webServerSource, /handleMessageMutation/);
+  assert.match(webServerSource, /markMessageRead/);
+  assert.match(webServerSource, /handleWorkerMessagesRead/);
+  assert.match(webServerSource, /markWorkerMessagesRead/);
+  assert.match(webServerSource, /handleWorkerRead/);
+  assert.match(webServerSource, /markWorkerJobsRead/);
+  assert.match(webServerSource, /unreadMessages/);
+  assert.match(webServerSource, /unreadJobUpdates/);
+  assert.match(webServerSource, /lastInteractionAt/);
+  assert.match(webServerSource, /listWebTalkRequests/);
+
+  assert.match(appSource, /markMessageReadFromUi/);
+  assert.match(appSource, /markWorkerReadFromUi/);
+  assert.match(appSource, /api\/workers\/\$\{encodeURIComponent\(worker\)\}\/read/);
+  assert.match(appSource, /api\/messages\/\$\{encodeURIComponent\(message\.id\)\}\/read/);
+  assert.match(appSource, /msg-list__item--unread/);
+  assert.match(appSource, /refreshWorkerUnreadBadges/);
+  assert.match(appSource, /clearWorkerCardUnreadLocally/);
+  assert.match(appSource, /worker-card__talk-preview/);
+  assert.match(appSource, /syncWorkerCardTalkPreview/);
+  assert.doesNotMatch(appSource, /cssEscape/);
+  assert.match(appSource, /lastInteractionAt/);
+  assert.match(appSource, /最近交互靠前/);
+});
+
+test("worker list search is debounced name-only filtering without empty-state block", () => {
+  const appSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
+  const styleSource = readFileSync(join(testDir, "../web/styles.css"), "utf8");
+
+  assert.match(appSource, /function scheduleWorkerCardsFilter/);
+  assert.match(appSource, /setTimeout\(\(\) => \{/);
+  assert.match(appSource, /name\.includes\(q\)/);
+  assert.doesNotMatch(appSource, /role\.includes\(q\)/);
+  assert.doesNotMatch(appSource, /workerSearchEmpty/);
+  assert.doesNotMatch(appSource, /没有匹配的员工/);
+  assert.doesNotMatch(styleSource, /\.workers__search-empty/);
+  assert.match(styleSource, /\.worker-card\[hidden\]\s*\{[^}]*display:\s*none\s*!important/s);
+});
+
+test("web navigation omits internal rollout priority labels", () => {
+  const indexSource = readFileSync(join(testDir, "../web/index.html"), "utf8");
+  const appSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
+  const styleSource = readFileSync(join(testDir, "../web/styles.css"), "utf8");
+
+  assert.doesNotMatch(indexSource, /sidenav__pill/);
+  assert.doesNotMatch(indexSource, /sidenav__foot/);
+  assert.doesNotMatch(indexSource, /Phase 1/);
+  assert.doesNotMatch(appSource, /"nav\.(?:phase|readonly)"/);
+  assert.doesNotMatch(styleSource, /\.sidenav__(?:pill|foot|hint)/);
+});
+
+test("worker list keeps IM metadata and unread controls in stable card regions", () => {
+  const appSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
+  const styleSource = readFileSync(join(testDir, "../web/styles.css"), "utf8");
+
+  assert.match(appSource, /worker-card__headline/);
+  assert.match(appSource, /worker-card__aside/);
+  assert.match(appSource, /aside\.appendChild\(badge\)/);
+  assert.match(styleSource, /\.worker-card\s*\{[^}]*grid-template-columns:/s);
+  assert.match(styleSource, /\.worker-card__talk-preview\s*\{[^}]*-webkit-line-clamp:\s*1/s);
+});
+
+test("worker cards are compact one-line talk entries with avatar and status dot only", () => {
+  const appSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
+  const styleSource = readFileSync(join(testDir, "../web/styles.css"), "utf8");
+
+  assert.match(appSource, /function workerAvatarNode/);
+  assert.match(appSource, /worker-card__status-dot/);
+  assert.match(appSource, /worker\?\.avatar/);
+  assert.doesNotMatch(appSource, /worker-card__role/);
+  assert.doesNotMatch(appSource, /worker-card__meta/);
+  assert.match(styleSource, /\.worker-card__talk-preview\s*\{[^}]*-webkit-line-clamp:\s*1/s);
+});
+
+test("overview worker preview list uses configured worker avatars", () => {
+  const appSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
+  const previewBlock = appSource.match(/function workerPreview\(workers\) \{[\s\S]*?\n  \}/)?.[0] || "";
+
+  assert.match(previewBlock, /workerAvatarNode\(w\)/);
+  assert.doesNotMatch(previewBlock, /avatar__char[^]*\(w\.name \|\| "\?"\)\.slice\(0,\s*1\)/);
+});
+
+test("worker detail uses preloaded jobs for initial talk history", () => {
+  const appSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
+
+  assert.match(appSource, /buildTalkPanel\(name,\s*d,\s*d\.jobs\s*\|\|\s*\[\]\)/);
+  assert.match(appSource, /renderTalkHistory\(worker,\s*initialJobs,\s*d\.talkRequests\s*\|\|\s*\[\]\)/);
+});
+
+test("workers view includes latest talk reply preview for worker cards", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-worker-talk-preview-"));
+  try {
+    mkdirSync(join(workersDir, "sessions"), { recursive: true });
+    writeFileSync(join(workersDir, "sessions", "DesignerA.jsonl"), "", "utf8");
+    sendTaskResultMessage(workersDir, {
+      from: "DesignerA",
+      to: "LocalAdmin",
+      content: "这条来自消息盒子，不应该展示在员工卡片。",
+      jobId: "mail-1",
+      taskRequestId: "task-1",
+    });
+    const job = createJob(workersDir, {
+      kind: "talk",
+      worker: "DesignerA",
+      project: "talk",
+      task: "改员工卡片摘要",
+      cwd: "/repo",
+    });
+    updateJob(job, {
+      status: "done",
+      summary: "我已经完成员工列表改造，可以显示最近 talk 返回摘要。",
+      fullOutput: "我已经完成员工列表改造，可以显示最近 talk 返回摘要。",
+    });
+
+    const workers = buildWorkersView(workersDir, [readJob(job.jobFile)], { workers: [] }, []);
+    const hachimon = workers.find((worker) => worker.name === "DesignerA");
+    assert.ok(hachimon);
+    assert.equal(hachimon.lastMessage, undefined);
+    assert.equal(hachimon.lastTalkReply.jobId, job.id);
+    assert.equal(hachimon.lastTalkReply.contentPreview, "我已经完成员工列表改造，可以显示最近 talk 返回摘要。");
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("markdownPreviewText strips markdown syntax for worker card snippets", () => {
+  assert.equal(markdownPreviewText("## 完成情况\n\n- 已完成"), "完成情况 已完成");
+  assert.equal(markdownPreviewText("| 文件 | 状态 |\n| --- | --- |\n| a | done |"), "[表格]");
+  assert.equal(markdownPreviewText("![截图](./done.png)\n后续说明"), "[图片]");
+  assert.equal(markdownPreviewText("> **结论**：[可以合入](https://example.com)。"), "结论：可以合入。");
+  assert.equal(markdownPreviewText("```js\nconsole.log(1)\n```"), "[代码]");
+});
+
+test("workers view normalizes markdown in latest talk reply preview", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-worker-markdown-talk-preview-"));
+  try {
+    mkdirSync(join(workersDir, "sessions"), { recursive: true });
+    writeFileSync(join(workersDir, "sessions", "WorkerB.jsonl"), "", "utf8");
+    const job = createJob(workersDir, {
+      kind: "talk",
+      worker: "WorkerB",
+      project: "talk",
+      task: "汇报页面修复",
+      cwd: "/repo",
+    });
+    updateJob(job, {
+      status: "done",
+      fullOutput: "## 完成情况\n\n- 已修复按钮展示\n- 已跑 smoke",
+    });
+
+    const workers = buildWorkersView(workersDir, [readJob(job.jobFile)], { workers: [] }, []);
+    const baobao = workers.find((worker) => worker.name === "WorkerB");
+    assert.ok(baobao);
+    assert.equal(baobao.lastTalkReply.contentPreview, "完成情况 已修复按钮展示 已跑 smoke");
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("worker list cards show talk reply preview instead of jobs and token chips", () => {
+  const appSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
+  const styleSource = readFileSync(join(testDir, "../web/styles.css"), "utf8");
+
+  assert.match(appSource, /worker-card__talk-preview/);
+  assert.match(appSource, /workerCardTalkPreviewText/);
+  assert.match(styleSource, /worker-card__talk-preview/);
+  assert.doesNotMatch(appSource, /worker-card__message-preview/);
+  assert.doesNotMatch(appSource, /workerCardMessagePreviewText/);
+  assert.doesNotMatch(appSource, /worker-card__stat--jobs/);
+  assert.doesNotMatch(appSource, /worker-card__stat--tokens/);
+});
+
+test("worker avatar can be configured and is exposed to web views", () => {
+  const typesSource = readFileSync(join(testDir, "../types.ts"), "utf8");
+  const registrySource = readFileSync(join(testDir, "../registry.ts"), "utf8");
+  const snapshotSource = readFileSync(join(testDir, "../worker-registry-snapshot.mjs"), "utf8");
+  const indexSource = readFileSync(join(testDir, "../index.ts"), "utf8");
+  const webServerSource = readFileSync(join(testDir, "../web-server.mjs"), "utf8");
+  const appSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
+
+  assert.match(typesSource, /avatar\?:\s*string\s*\|\s*null/);
+  assert.match(registrySource, /"avatar"/);
+  assert.match(snapshotSource, /"avatar"/);
+  assert.match(indexSource, /avatar:\s*Type\.Optional/);
+  assert.match(indexSource, /patch\.avatar/);
+  assert.match(webServerSource, /avatar:\s*regInfo\.avatar/);
+  assert.match(webServerSource, /\/api\/avatars\//);
+  assert.match(webServerSource, /OX_FACTORY_AVATAR_DIR/);
+  assert.match(appSource, /api\\\/avatars/);
+});
+
+test("web server imports filesystem helpers used by worker views", () => {
+  const webServerSource = readFileSync(join(testDir, "../web-server.mjs"), "utf8");
+
+  assert.match(webServerSource, /import \{[^}]*readdirSync[^}]*\} from "node:fs"/s);
+  assert.match(webServerSource, /function listSessionWorkers/);
+});
+
+test("worker registry snapshot keeps codex workers after fire and re-hire", () => {
+  const entries = [
+    {
+      type: "custom",
+      customType: "ox-worker-hire",
+      data: {
+        workerId: "ReviewerA",
+        role: "programmer",
+        backend: "codex",
+        model: "gpt-5.5",
+        thinking: "xhigh",
+        codexThreadId: "old-thread",
+        sessionFile: "/tmp/workers/sessions/ReviewerA.jsonl",
+      },
+    },
+    { type: "custom", customType: "ox-worker-fire", data: { workerId: "ReviewerA" } },
+    {
+      type: "custom",
+      customType: "ox-worker-hire",
+      data: {
+        workerId: "ReviewerA",
+        role: "programmer",
+        backend: "codex",
+        model: "gpt-5.5",
+        thinking: "xhigh",
+        codexThreadId: "new-thread",
+        codexSandbox: "danger-full-access",
+        sessionFile: "/tmp/workers/sessions/ReviewerA.jsonl",
+      },
+    },
+    {
+      type: "custom",
+      customType: "ox-worker-config",
+      data: {
+        workerId: "ReviewerA",
+        codexApprovalPolicy: "never",
+      },
+    },
+  ];
+
+  const registry = scanWorkerEntries(entries);
+  const bumei = registry.get("ReviewerA");
+  assert.equal(bumei?.backend, "codex");
+  assert.equal(bumei?.status, "idle");
+  assert.equal(bumei?.codexThreadId, "new-thread");
+  assert.equal(bumei?.codexSandbox, "danger-full-access");
+  assert.equal(bumei?.codexApprovalPolicy, "never");
+});
+
+test("main agent talk requests are event-sourced", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-main-agent-talk-test-"));
+  try {
+    const request = createMainAgentTalkRequest(workersDir, {
+      message: "秘书，帮我看一下状态",
+      from: "web",
+    });
+    assert.equal(request.status, "pending");
+    assert.equal(listPendingMainAgentTalkRequests(workersDir).length, 1);
+
+    const claimed = claimMainAgentTalkRequest(workersDir, {
+      requestId: request.id,
+      claimedBy: "poller-a",
+    });
+    assert.equal(claimed.status, "processing");
+    assert.equal(claimed.claimedBy, "poller-a");
+    assert.equal(listPendingMainAgentTalkRequests(workersDir).length, 0);
+
+    const duplicateClaim = claimMainAgentTalkRequest(workersDir, {
+      requestId: request.id,
+      claimedBy: "poller-b",
+    });
+    assert.equal(duplicateClaim, null);
+
+    const accepted = acceptMainAgentTalkRequest(workersDir, {
+      requestId: request.id,
+      deliveryMode: "idle",
+      placement: "主 agent 空闲，已投递",
+    });
+    assert.equal(accepted.status, "accepted");
+    assert.equal(accepted.deliveryMode, "idle");
+    assert.equal(listPendingMainAgentTalkRequests(workersDir).length, 0);
+    assert.equal(getMainAgentTalkRequest(workersDir, request.id).status, "accepted");
+
+    const failedRequest = createMainAgentTalkRequest(workersDir, {
+      message: "第二条",
+    });
+    const failed = failMainAgentTalkRequest(workersDir, {
+      requestId: failedRequest.id,
+      error: "主 agent 当前不可接入",
+    });
+    assert.equal(failed.status, "failed");
+    assert.equal(failed.error, "主 agent 当前不可接入");
+    assert.equal(listMainAgentTalkRequests(workersDir).length, 2);
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("main agent web bridge is exposed without stealing active talk mode", () => {
+  const webServerSource = readFileSync(join(testDir, "../web-server.mjs"), "utf8");
+  const indexSource = readFileSync(join(testDir, "../index.ts"), "utf8");
+
+  assert.match(webServerSource, /POST \/api\/main-agent\/talk/);
+  assert.match(webServerSource, /handleMainAgentTranscript/);
+  assert.match(webServerSource, /createMainAgentTalkRequest/);
+  assert.match(indexSource, /listPendingMainAgentTalkRequests/);
+  assert.match(indexSource, /claimMainAgentTalkRequest/);
+  assert.match(indexSource, /ensureMainAgentTalkPoller/);
+  assert.match(indexSource, /mainAgentActive \|\| talkTarget/);
+  assert.match(indexSource, /pi\.sendUserMessage\(message\)/);
+});
+
+test("web talk drain can recover codex workers from full main-session registry", () => {
+  const indexSource = readFileSync(join(testDir, "../index.ts"), "utf8");
+
+  assert.match(indexSource, /recoverWorkerFromRegistrySnapshot/);
+  assert.match(indexSource, /getWorkerRegistrySnapshot\(getWorkersDir\(\)\)/);
+  assert.match(indexSource, /const w = recoverWorkerFromRegistrySnapshot\(workerId\)/);
+  assert.match(indexSource, /缺少 Codex thread 绑定/);
+});
+
 test("web job detail exposes full worker reply instead of summary-only truncation", () => {
   const webServerSource = readFileSync(join(testDir, "../web-server.mjs"), "utf8");
   const webAppSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
+  const webStyleSource = readFileSync(join(testDir, "../web/styles.css"), "utf8");
 
   assert.match(webServerSource, /JOB_DETAIL_REPLY_MAX_CHARS\s*=\s*200_000/);
   assert.match(webServerSource, /fullReply:\s*fullReply\.text \|\| null/);
   assert.match(webServerSource, /fullReplyTruncated:\s*fullReply\.truncated/);
   assert.match(webServerSource, /job\.fullOutput \|\| latestReply \|\| job\.summary/);
+  assert.match(webServerSource, /compactJobTimelineEvents/);
+  assert.match(webServerSource, /jobDetailEventDisplayText/);
   assert.match(webAppSource, /const replyText = d\.fullReply \|\| d\.latestReply \|\| d\.summary \|\| ""/);
   assert.match(webAppSource, /text:\s*"AI 响应"/);
   assert.match(webAppSource, /响应过长，已展示前/);
+  assert.match(webAppSource, /function renderJobEventItem/);
+  assert.match(webAppSource, /text:\s*`执行过程 \(\$\{d\.events\.length\}\)`/);
+  assert.match(webAppSource, /timeline__item--assistant/);
+  assert.match(webAppSource, /timeline__tool-card/);
+  assert.match(webStyleSource, /\.timeline__content/);
+  assert.match(webStyleSource, /\.timeline__text--assistant/);
+  assert.match(webStyleSource, /\.timeline__tool-card/);
+});
+
+test("web job detail exposes stop action for active jobs", () => {
+  const webAppSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
+  const webStyleSource = readFileSync(join(testDir, "../web/styles.css"), "utf8");
+
+  assert.match(webAppSource, /function isCancellableJob/);
+  assert.match(webAppSource, /function cancelJobFromDrawer/);
+  assert.match(webAppSource, /\/api\/jobs\/\$\{encodeURIComponent\(jobId\)\}\/cancel/);
+  assert.match(webAppSource, /停止 job/);
+  assert.match(webStyleSource, /\.btn--danger/);
+  assert.match(webStyleSource, /\.drawer__actions/);
+});
+
+test("worker talk list exposes request edit cancel and active job stop controls", () => {
+  const webServerSource = readFileSync(join(testDir, "../web-server.mjs"), "utf8");
+  const webAppSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
+  const webStyleSource = readFileSync(join(testDir, "../web/styles.css"), "utf8");
+
+  assert.match(webServerSource, /talkRequests:\s*talkRequests\.map/);
+  assert.match(webServerSource, /listWebTalkRequests\(workersDir,\s*\{\s*worker:\s*name/);
+
+  assert.match(webAppSource, /function renderTalkRequestItem/);
+  assert.match(webAppSource, /function editTalkRequestFromList/);
+  assert.match(webAppSource, /function cancelTalkRequestFromList/);
+  assert.match(webAppSource, /function editQueuedTalkJobFromList/);
+  assert.match(webAppSource, /function stopTalkJobFromList/);
+  assert.match(webAppSource, /renderTalkHistory\(worker,\s*initialJobs,\s*d\.talkRequests\s*\|\|\s*\[\]\)/);
+  assert.match(webAppSource, /api\/talk-requests\?worker=\$\{encodeURIComponent\(worker\)\}/);
+  assert.match(webAppSource, /api\/talk-requests\/\$\{encodeURIComponent\(request\.id\)\}/);
+  assert.match(webAppSource, /api\/talk-requests\/\$\{encodeURIComponent\(request\.id\)\}\/cancel/);
+  assert.match(webAppSource, /api\/jobs\/\$\{encodeURIComponent\(jobId\)\}\/cancel/);
+  assert.match(webAppSource, /api\/jobs\/\$\{encodeURIComponent\(job\.id\)\}/);
+  assert.match(webAppSource, /method:\s*"PATCH"/);
+  assert.match(webAppSource, /text:\s*queued\s*\?\s*"取消"\s*:\s*"停止"/);
+  assert.match(webAppSource, /text:\s*"编辑"/);
+  assert.match(webAppSource, /text:\s*"取消"/);
+
+  assert.match(webStyleSource, /\.talk-list__actions/);
+  assert.match(webStyleSource, /\.talk-list__item--request/);
 });
 
 test("talk live output does not persist custom messages by default", () => {
@@ -1520,6 +2945,35 @@ test("tokens page route-refreshes when date or trend filters change", () => {
   assert.match(webAppSource, /void route\(\)/);
   assert.doesNotMatch(webAppSource, /STATE\.tokensDate\s*=\s*e\.target\.value;\s*renderTokens\(\);/);
   assert.doesNotMatch(webAppSource, /STATE\.tokensTrendDays\s*=\s*Number\(e\.target\.value\);\s*renderTokens\(\);/);
+});
+
+test("quality emotion chart filters out zero scores", () => {
+  const webAppSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
+  const chartLineBlock = webAppSource.match(/function chartLine\([\s\S]*?\n  function showChartTip/)?.[0] || "";
+
+  assert.match(webAppSource, /function isValidEmotionScore/);
+  assert.match(webAppSource, /const emotionTurns = turns\.filter\(\(t\) => isValidEmotionScore\(t\.emotionScore\)\)/);
+  assert.match(webAppSource, /chartLine\("情绪评分（情绪旁路开启时）",\s*emotionTurns,/);
+  assert.doesNotMatch(chartLineBlock, /s\.key === "emotionScore"/);
+});
+
+test("quality metric tables expose sortable numeric columns", () => {
+  const webAppSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
+  const styleSource = readFileSync(join(testDir, "../web/styles.css"), "utf8");
+
+  assert.match(webAppSource, /function sortableNumericTh/);
+  assert.match(webAppSource, /function sortTableByHeader/);
+  assert.match(webAppSource, /data:\s*\{\s*sortValue:/);
+  assert.match(webAppSource, /sortableNumericTh\("会话轮次"\)/);
+  assert.match(webAppSource, /sortableNumericTh\("上下文估算"\)/);
+  assert.match(webAppSource, /sortableNumericTh\("压缩"\)/);
+  assert.match(webAppSource, /sortableNumericTh\("平均耗时"\)/);
+  assert.match(webAppSource, /sortableNumericTh\("情绪"\)/);
+  assert.match(webAppSource, /sortableNumericTh\("输入"\)/);
+  assert.match(webAppSource, /sortableNumericTh\("输出"\)/);
+  assert.match(webAppSource, /sortableNumericTh\("上下文"\)/);
+  assert.match(styleSource, /\.table__sort-btn/);
+  assert.match(styleSource, /\.table__sort-indicator/);
 });
 
 test("one-click installer installs the Pi extension and configures DeepSeek defaults", () => {
@@ -1575,7 +3029,7 @@ test("codex hires default to full access unless sandbox is explicitly provided",
 
 test("codex base instructions include reset handoff once a thread is reset", () => {
   const instructions = buildCodexBaseInstructions({
-    id: "步美",
+    id: "ReviewerA",
     role: "programmer",
     codexThreadHandoff: "旧 thread: abc\n最近 job: touch 失败，需要 full access",
   }, "", { workersDir: "/tmp/ox-workers" });
@@ -1585,34 +3039,74 @@ test("codex base instructions include reset handoff once a thread is reset", () 
   assert.match(instructions, /touch 失败/);
   assert.match(instructions, /牛马工厂工作手册/);
   assert.match(instructions, /comm-cli\.mjs send/);
+  assert.match(instructions, /comm-cli\.mjs assign/);
 });
 
 test("factory worker handbook documents authorized comm cli for every backend", () => {
   const handbook = buildFactoryWorkerHandbook({
-    id: "乔治",
+    id: "WorkerG",
     role: "programmer",
   }, { workersDir: "/tmp/ox-workers", backend: "codex" });
 
   assert.match(handbook, /牛马工厂工作手册/);
   assert.match(handbook, /授权式通信/);
-  assert.match(handbook, /comm-cli\.mjs check --workers-dir \/tmp\/ox-workers --subject "乔治" --action message:send --target 对方员工/);
-  assert.match(handbook, /comm-cli\.mjs send --workers-dir \/tmp\/ox-workers --from "乔治" --to 对方员工 --content "消息内容"/);
-  assert.match(handbook, /comm-cli\.mjs inbox --workers-dir \/tmp\/ox-workers --worker "乔治"/);
+  assert.match(handbook, /comm-cli\.mjs check --workers-dir \/tmp\/ox-workers --subject "WorkerG" --action message:send --target 对方员工/);
+  assert.match(handbook, /comm-cli\.mjs send --workers-dir \/tmp\/ox-workers --from "WorkerG" --to 对方员工 --content "消息内容"/);
+  assert.match(handbook, /comm-cli\.mjs assign --workers-dir \/tmp\/ox-workers --from "WorkerG" --to 对方员工 --task "任务内容"/);
+  assert.match(handbook, /--action work:assign/);
+  assert.match(handbook, /comm-cli\.mjs inbox --workers-dir \/tmp\/ox-workers --worker "WorkerG"/);
   assert.match(handbook, /留言不是派活/);
 });
 
-test("codex task content repeats factory handbook so existing threads learn comm tools", () => {
+test("worker system prompt carries stable identity, handbook, and role definition", () => {
+  const systemPrompt = buildWorkerSystemPrompt({
+    id: "WorkerB",
+    role: "programmer",
+    backend: "pi",
+  }, {
+    workersDir: "/tmp/ox-workers",
+    backend: "pi",
+    agentDef: "你是测试角色定义。",
+  });
+
+  assert.match(systemPrompt, /你的名字叫 \*\*WorkerB\*\*，职位是 programmer。/);
+  assert.match(systemPrompt, /牛马工厂工作手册/);
+  assert.match(systemPrompt, /当前后端：pi/);
+  assert.match(systemPrompt, /comm-cli\.mjs send --workers-dir \/tmp\/ox-workers --from "WorkerB" --to 对方员工/);
+  assert.match(systemPrompt, /你是测试角色定义。/);
+});
+
+test("worker task prompt contains only per-turn project, task, and context", () => {
+  const content = buildWorkerTaskPrompt({
+    project: "talk",
+    task: "修一下按钮",
+    additionalContext: "用户看到空白按钮",
+  });
+
+  assert.match(content, /## 项目: talk/);
+  assert.match(content, /## 任务\n修一下按钮/);
+  assert.match(content, /## 附加上下文\n用户看到空白按钮/);
+  assert.doesNotMatch(content, /你的名字叫/);
+  assert.doesNotMatch(content, /职位是 programmer/);
+  assert.doesNotMatch(content, /牛马工厂工作手册/);
+  assert.doesNotMatch(content, /comm-cli\.mjs/);
+  assert.doesNotMatch(content, /不要直接改 messages\/permissions 文件/);
+});
+
+test("codex task content keeps stable worker context out of user prompt", () => {
   const content = buildCodexTaskContent({
-    worker: { id: "乔治", role: "programmer" },
-    task: "给光彦发一条消息问进展",
+    worker: { id: "WorkerG", role: "programmer" },
+    task: "给DeveloperB发一条消息问进展",
     project: "talk",
     workersDir: "/tmp/ox-workers",
   });
 
-  assert.match(content, /## 任务\n给光彦发一条消息问进展/);
-  assert.match(content, /牛马工厂工作手册/);
-  assert.match(content, /comm-cli\.mjs send --workers-dir \/tmp\/ox-workers --from "乔治" --to 对方员工/);
-  assert.match(content, /不要直接改 messages\/permissions 文件/);
+  assert.match(content, /## 项目: talk/);
+  assert.match(content, /## 任务\n给DeveloperB发一条消息问进展/);
+  assert.doesNotMatch(content, /你的名字叫/);
+  assert.doesNotMatch(content, /牛马工厂工作手册/);
+  assert.doesNotMatch(content, /comm-cli\.mjs send --workers-dir \/tmp\/ox-workers --from "WorkerG" --to 对方员工/);
+  assert.doesNotMatch(content, /不要直接改 messages\/permissions 文件/);
 });
 
 test("codex token usage extractor supports common app-server usage shapes", () => {
@@ -1702,7 +3196,7 @@ test("factory compaction prompt keeps worker state and truncates large tool outp
   assert.match(serialized, /\[\.\.\. \d+ more characters truncated\]/);
 
   const request = buildFactoryCompactionRequest({
-    worker: { id: "派派", role: "programmer" },
+    worker: { id: "LocalAdmin", role: "programmer" },
     reason: "manual",
     preparation: {
       messagesToSummarize: messages,
@@ -1719,7 +3213,7 @@ test("factory compaction prompt keeps worker state and truncates large tool outp
   assert.equal(request.firstKeptEntryId, "keep-1");
   assert.equal(request.tokensBefore, 123456);
   assert.match(request.prompt, /你是牛马工厂的上下文压缩员/);
-  assert.match(request.prompt, /员工：派派/);
+  assert.match(request.prompt, /员工：LocalAdmin/);
   assert.match(request.prompt, /之前已经完成日报数据源修复/);
   assert.match(request.prompt, /## Worker State/);
   assert.match(request.prompt, /## Next Turn Instructions/);
@@ -1757,7 +3251,7 @@ test("prepareSessionCompactionFixture builds a safe compaction sample from a cop
 test("shadow compaction runs Codex side channel and records comparison without replacing Pi compaction", async () => {
   const workersDir = mkdtempSync(join(tmpdir(), "ox-compaction-shadow-test-"));
   try {
-    const sessionFile = join(workersDir, "sessions", "派派.jsonl");
+    const sessionFile = join(workersDir, "sessions", "LocalAdmin.jsonl");
     mkdirSync(dirname(sessionFile), { recursive: true });
     writeFileSync(sessionFile, "", "utf8");
 
@@ -1784,11 +3278,11 @@ test("shadow compaction runs Codex side channel and records comparison without r
       mode: "shadow",
       scope: "all",
       workersDir,
-      workers: ["派派"],
+      workers: ["LocalAdmin"],
       runCodexCompactionFn: async () => {
         codexCalls += 1;
         return {
-          summary: "## Worker State\n派派\n\n## Next Turn Instructions\n1. 继续 shadow 对比\n\n## Factory Context\n保留工厂语义。",
+          summary: "## Worker State\nLocalAdmin\n\n## Next Turn Instructions\n1. 继续 shadow 对比\n\n## Factory Context\n保留工厂语义。",
           firstKeptEntryId: "keep-1",
           tokensBefore: 4096,
           estimatedTokensAfter: 42,
@@ -1817,7 +3311,7 @@ test("shadow compaction runs Codex side channel and records comparison without r
     });
 
     assert.equal(record.decision, "pi_used_codex_shadow_only");
-    assert.equal(record.worker, "派派");
+    assert.equal(record.worker, "LocalAdmin");
     assert.equal(record.pi.summaryChars, "## Goal\n默认 Pi 摘要\n\n## Next Steps\n1. 继续".length);
     assert.equal(record.codex.status, "done");
     assert.equal(record.codex.hasFactoryContext, true);
@@ -1833,7 +3327,7 @@ test("shadow compaction runs Codex side channel and records comparison without r
     assert.equal(report.records.length, 1);
     const markdown = formatFactoryCompactionReport(report);
     assert.match(markdown, /压缩对比报告/);
-    assert.match(markdown, /派派/);
+    assert.match(markdown, /LocalAdmin/);
     assert.match(markdown, /shadow/);
   } finally {
     rmSync(workersDir, { recursive: true, force: true });
@@ -1843,7 +3337,7 @@ test("shadow compaction runs Codex side channel and records comparison without r
 test("shadow compaction respects worker graylist and off mode", async () => {
   const workersDir = mkdtempSync(join(tmpdir(), "ox-compaction-gray-test-"));
   try {
-    const sessionFile = join(workersDir, "sessions", "东子.jsonl");
+    const sessionFile = join(workersDir, "sessions", "DeveloperA.jsonl");
     mkdirSync(dirname(sessionFile), { recursive: true });
     let calls = 0;
     const event = {
@@ -1860,7 +3354,7 @@ test("shadow compaction respects worker graylist and off mode", async () => {
       mode: "shadow",
       scope: "all",
       workersDir,
-      workers: ["派派"],
+      workers: ["LocalAdmin"],
       runCodexCompactionFn: async () => {
         calls += 1;
         return { summary: "unused", firstKeptEntryId: "keep-2", tokensBefore: 100, details: {} };
@@ -1874,7 +3368,7 @@ test("shadow compaction respects worker graylist and off mode", async () => {
       mode: "off",
       scope: "all",
       workersDir,
-      workers: ["东子"],
+      workers: ["DeveloperA"],
       runCodexCompactionFn: async () => {
         calls += 1;
         return { summary: "unused", firstKeptEntryId: "keep-2", tokensBefore: 100, details: {} };
@@ -1904,7 +3398,7 @@ test("main agent shadow compaction is evaluation-only and records target separat
       },
     };
     const ctx = {
-      cwd: "/Users/bytedance/Code/alpha_mind",
+      cwd: "/tmp/ox-factory-host",
       sessionManager: { getSessionFile: () => sessionFile },
       ui: { notify() {} },
     };
@@ -2035,7 +3529,7 @@ test("worker shadow compaction is enabled by default without env flags", async (
   delete process.env.OX_FACTORY_CODEX_COMPACTION_WORKERS;
   delete process.env.OX_FACTORY_CODEX_COMPACTION;
   try {
-    const sessionFile = join(workersDir, "sessions", "包包.jsonl");
+    const sessionFile = join(workersDir, "sessions", "WorkerB.jsonl");
     mkdirSync(dirname(sessionFile), { recursive: true });
     let calls = 0;
     const event = {
@@ -2043,7 +3537,7 @@ test("worker shadow compaction is enabled by default without env flags", async (
       preparation: {
         firstKeptEntryId: "worker-default-keep",
         tokensBefore: 111740,
-        messagesToSummarize: [{ role: "user", content: "包包默认 worker shadow 压缩评估" }],
+        messagesToSummarize: [{ role: "user", content: "WorkerB默认 worker shadow 压缩评估" }],
         turnPrefixMessages: [],
       },
     };
@@ -2057,10 +3551,10 @@ test("worker shadow compaction is enabled by default without env flags", async (
       workersDir,
       runCodexCompactionFn: async ({ worker }) => {
         calls += 1;
-        assert.equal(worker.id, "包包");
+        assert.equal(worker.id, "WorkerB");
         assert.equal(worker.targetType, "worker");
         return {
-          summary: "## Worker State\n包包默认开启 shadow。\n\n## Factory Context\n牛马工厂。\n\n## Next Turn Instructions\n1. 继续。",
+          summary: "## Worker State\nWorkerB默认开启 shadow。\n\n## Factory Context\n牛马工厂。\n\n## Next Turn Instructions\n1. 继续。",
           firstKeptEntryId: "worker-default-keep",
           tokensBefore: 111740,
           details: { model: "gpt-5.5" },
@@ -2084,7 +3578,7 @@ test("worker shadow compaction is enabled by default without env flags", async (
     });
 
     assert.equal(record.targetType, "worker");
-    assert.equal(record.worker, "包包");
+    assert.equal(record.worker, "WorkerB");
     assert.equal(record.decision, "pi_used_codex_shadow_only");
   } finally {
     if (previousMode === undefined) delete process.env.OX_FACTORY_CODEX_COMPACTION_MODE;
@@ -2148,7 +3642,7 @@ test("compaction report CLI prints shadow comparison records", () => {
       `${JSON.stringify({
         id: "cmp_shadow_cli",
         time: "2026-07-02T01:00:00.000Z",
-        worker: "东子",
+        worker: "DeveloperA",
         decision: "pi_used_codex_shadow_only",
         pi: { summaryChars: 1000, estimatedTokens: 250, summaryFile: "compactions/cmp.pi.md" },
         codex: {
@@ -2174,7 +3668,7 @@ test("compaction report CLI prints shadow comparison records", () => {
     ], { encoding: "utf8" });
 
     assert.match(output, /压缩对比报告/);
-    assert.match(output, /东子/);
+    assert.match(output, /DeveloperA/);
     assert.match(output, /pi_used_codex_shadow_only/);
 
     const jsonOutput = execFileSync(process.execPath, [
@@ -2184,7 +3678,7 @@ test("compaction report CLI prints shadow comparison records", () => {
       "--json",
     ], { encoding: "utf8" });
     const report = JSON.parse(jsonOutput);
-    assert.equal(report.records[0].worker, "东子");
+    assert.equal(report.records[0].worker, "DeveloperA");
   } finally {
     rmSync(workersDir, { recursive: true, force: true });
   }
@@ -2194,11 +3688,11 @@ test("quality report correlates context, compactions, input/output, latency and 
   const workersDir = mkdtempSync(join(tmpdir(), "ox-quality-report-test-"));
   try {
     const job = createJob(workersDir, {
-      worker: "包包",
+      worker: "WorkerB",
       project: "talk",
       task: "这个回复不太行，你重新检查一下页面报错。",
       cwd: "/repo",
-      sessionFile: join(workersDir, "sessions", "包包.jsonl"),
+      sessionFile: join(workersDir, "sessions", "WorkerB.jsonl"),
     });
     appendJobEvent(job, { type: "started", message: "start" });
     appendJobEvent(job, { type: "tool_start", name: "bash", args: { command: "node --check web/app.js" } });
@@ -2221,7 +3715,7 @@ test("quality report correlates context, compactions, input/output, latency and 
     });
 
     mkdirSync(join(workersDir, "sessions"), { recursive: true });
-    writeFileSync(join(workersDir, "sessions", "包包.jsonl"), [
+    writeFileSync(join(workersDir, "sessions", "WorkerB.jsonl"), [
       JSON.stringify({ type: "message", id: "u1", timestamp: "2026-07-07T09:00:00Z", message: { role: "user", content: "早期输入" } }),
       JSON.stringify({ type: "message", id: "a1", timestamp: "2026-07-07T09:00:02Z", message: { role: "assistant", content: [{ type: "text", text: "早期输出" }] } }),
       JSON.stringify({ type: "compaction", id: "cmp1", timestamp: "2026-07-07T09:30:00Z", summary: "压缩摘要", tokensBefore: 8888, firstKeptEntryId: "u1" }),
@@ -2230,7 +3724,7 @@ test("quality report correlates context, compactions, input/output, latency and 
     const report = buildFactoryQualityReport({ workersDir, date: "2026-07-07", limit: 20 });
     assert.equal(report.config.enabled, false);
     assert.equal(report.workers.length, 1);
-    assert.equal(report.workers[0].worker, "包包");
+    assert.equal(report.workers[0].worker, "WorkerB");
     assert.equal(report.workers[0].session.compactionCount, 1);
     assert.equal(report.workers[0].session.messageCount, 2);
     assert.ok(report.workers[0].session.estimatedContextTokens > 0);
@@ -2246,7 +3740,7 @@ test("quality report correlates context, compactions, input/output, latency and 
     assert.equal(report.turns[0].reasoningOutputTokens, 5);
     assert.equal(report.turns[0].model, "MiniMax-M3");
     assert.equal(report.turns[0].emotionScore, null);
-    assert.match(formatFactoryQualityReport(report), /包包/);
+    assert.match(formatFactoryQualityReport(report), /WorkerB/);
     assert.match(formatFactoryQualityReport(report), /工具调用/);
   } finally {
     rmSync(workersDir, { recursive: true, force: true });
@@ -2257,7 +3751,7 @@ test("quality report backfills all usable history and drops inconsistent jobs", 
   const workersDir = mkdtempSync(join(tmpdir(), "ox-quality-history-test-"));
   try {
     mkdirSync(join(workersDir, "sessions"), { recursive: true });
-    writeFileSync(join(workersDir, "sessions", "包包.jsonl"), [
+    writeFileSync(join(workersDir, "sessions", "WorkerB.jsonl"), [
       JSON.stringify({ type: "message", id: "u1", timestamp: "2026-07-05T09:00:00Z", message: { role: "user", content: "历史输入" } }),
       JSON.stringify({ type: "message", id: "a1", timestamp: "2026-07-05T09:00:02Z", message: { role: "assistant", content: [{ type: "text", text: "历史输出" }] } }),
       JSON.stringify({ type: "compaction", id: "cmp1", timestamp: "2026-07-06T09:30:00Z", summary: "历史压缩", tokensBefore: 2000 }),
@@ -2265,11 +3759,11 @@ test("quality report backfills all usable history and drops inconsistent jobs", 
     ].join("\n") + "\n", "utf8");
 
     const oldJob = createJob(workersDir, {
-      worker: "包包",
+      worker: "WorkerB",
       project: "talk",
       task: "历史任务",
       cwd: "/repo",
-      sessionFile: join(workersDir, "sessions", "包包.jsonl"),
+      sessionFile: join(workersDir, "sessions", "WorkerB.jsonl"),
     });
     appendJobEvent(oldJob, { type: "tool_start", name: "bash", args: {} });
     appendJobEvent(oldJob, { type: "done", text: "历史完成" });
@@ -2283,11 +3777,11 @@ test("quality report backfills all usable history and drops inconsistent jobs", 
     });
 
     const todayJob = createJob(workersDir, {
-      worker: "包包",
+      worker: "WorkerB",
       project: "talk",
       task: "今天任务",
       cwd: "/repo",
-      sessionFile: join(workersDir, "sessions", "包包.jsonl"),
+      sessionFile: join(workersDir, "sessions", "WorkerB.jsonl"),
     });
     appendJobEvent(todayJob, { type: "done", text: "今天完成" });
     updateJob(todayJob, {
@@ -2299,13 +3793,13 @@ test("quality report backfills all usable history and drops inconsistent jobs", 
       fullOutput: "今天完成",
     });
 
-    const runningJob = createJob(workersDir, { worker: "包包", project: "talk", task: "还没完", cwd: "/repo" });
+    const runningJob = createJob(workersDir, { worker: "WorkerB", project: "talk", task: "还没完", cwd: "/repo" });
     updateJob(runningJob, { status: "running", createdAt: "2026-07-07T11:00:00.000Z" });
 
-    const badDateJob = createJob(workersDir, { worker: "包包", project: "talk", task: "坏时间", cwd: "/repo" });
+    const badDateJob = createJob(workersDir, { worker: "WorkerB", project: "talk", task: "坏时间", cwd: "/repo" });
     updateJob(badDateJob, { status: "done", createdAt: "not-a-date", fullOutput: "坏时间完成" });
 
-    const noOutputJob = createJob(workersDir, { worker: "包包", project: "talk", task: "无输出", cwd: "/repo" });
+    const noOutputJob = createJob(workersDir, { worker: "WorkerB", project: "talk", task: "无输出", cwd: "/repo" });
     updateJob(noOutputJob, { status: "done", createdAt: "2026-07-07T12:00:00.000Z" });
 
     const report = buildFactoryQualityReport({ workersDir, date: "all", limit: "all" });
@@ -2359,11 +3853,11 @@ test("quality emotion scorer writes bounded 1-5 scores when enabled", async () =
   try {
     process.env.DEEPSEEK_API_KEY = "test-key";
     const job = createJob(workersDir, {
-      worker: "包包",
+      worker: "WorkerB",
       project: "talk",
       task: "这次做得不错，继续。",
       cwd: "/repo",
-      sessionFile: join(workersDir, "sessions", "包包.jsonl"),
+      sessionFile: join(workersDir, "sessions", "WorkerB.jsonl"),
     });
     updateJob(job, { status: "done", summary: "收到，我继续。" });
     writeQualityMonitorConfig(workersDir, {
@@ -2398,6 +3892,381 @@ test("quality emotion scorer writes bounded 1-5 scores when enabled", async () =
   } finally {
     if (oldKey == null) delete process.env.DEEPSEEK_API_KEY;
     else process.env.DEEPSEEK_API_KEY = oldKey;
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 外包隔离：员工 tab 不应出现外包虚拟 worker
+// ---------------------------------------------------------------------------
+
+test("isOutsourceJob detects kind=outsource-run and defensive worker name", () => {
+  assert.equal(isOutsourceJob({ kind: "outsource-run" }), true);
+  assert.equal(isOutsourceJob({ kind: "OUTSOURCE-RUN" }), true);
+  assert.equal(isOutsourceJob({ kind: "talk" }), false);
+  assert.equal(isOutsourceJob({ kind: "assigned-task" }), false);
+  assert.equal(isOutsourceJob({ worker: "外包:whitepaper-a", kind: "talk" }), true);
+  assert.equal(isOutsourceJob({ worker: "DeveloperA", kind: "talk" }), false);
+  assert.equal(isOutsourceJob({}), false);
+});
+
+test("isOutsourceWorkerName detects 外包: prefix defensively", () => {
+  assert.equal(isOutsourceWorkerName("外包:whitepaper-a"), true);
+  assert.equal(isOutsourceWorkerName("外包:WorkerC"), true);
+  assert.equal(isOutsourceWorkerName("外包"), false);
+  assert.equal(isOutsourceWorkerName("DeveloperA"), false);
+  assert.equal(isOutsourceWorkerName(""), false);
+  assert.equal(isOutsourceWorkerName(null), false);
+  assert.equal(isOutsourceWorkerName(undefined), false);
+});
+
+test("uniqueEmployeeWorkers excludes outsource-run job workers but keeps real session workers", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-outsource-isolation-unique-"));
+  try {
+    // 真实员工 session 文件
+    const sessionsDir = join(workersDir, "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(join(sessionsDir, "DeveloperA.jsonl"), "", "utf8");
+    writeFileSync(join(sessionsDir, "LocalAdmin.jsonl"), "", "utf8");
+
+    // 正式 job
+    const normalJob = createJob(workersDir, {
+      kind: "talk",
+      worker: "DeveloperA",
+      project: "落地页",
+      task: "做个按钮",
+    });
+    updateJob(normalJob, { status: "done" });
+
+    // 只有 job 没有 session 的正式员工
+    const jobOnlyJob = createJob(workersDir, {
+      kind: "talk",
+      worker: "Foreman",
+      project: "工厂日报",
+      task: "生成日报",
+    });
+    updateJob(jobOnlyJob, { status: "done" });
+
+    // outsource-run job — 其 worker 不应进入员工列表
+    const outsourceJob = createJob(workersDir, {
+      kind: "outsource-run",
+      worker: "外包:whitepaper-a",
+      project: "后台任务",
+      task: "后台处理",
+    });
+    updateJob(outsourceJob, { status: "done" });
+
+    const result = uniqueWorkers(workersDir);
+
+    assert.ok(result.includes("DeveloperA"), "正式 session 员工应保留");
+    assert.ok(result.includes("LocalAdmin"), "正式 session 员工应保留");
+    assert.ok(result.includes("Foreman"), "正式 job-only 员工应保留");
+    assert.ok(!result.includes("外包:whitepaper-a"), "外包虚拟 worker 不应进入员工列表");
+    assert.ok(!result.some((w) => w.startsWith("外包:")), "不应有任何 外包: 前缀的 worker");
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("buildEmployeeWorkersView filters 外包: names from registry and sessions", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-outsource-isolation-view-"));
+  try {
+    const sessionsDir = join(workersDir, "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(join(sessionsDir, "DeveloperA.jsonl"), "", "utf8");
+    // 污染：外包 session 文件（历史数据/registry 污染）
+    writeFileSync(join(sessionsDir, "外包:WorkerC.jsonl"), "", "utf8");
+
+    const normalJob = createJob(workersDir, {
+      kind: "talk",
+      worker: "DeveloperA",
+      project: "落地页",
+      task: "做按钮",
+    });
+    updateJob(normalJob, { status: "done", summary: "按钮做好了" });
+
+    const outsourceJob = createJob(workersDir, {
+      kind: "outsource-run",
+      worker: "外包:whitepaper-a",
+      project: "后台任务",
+      task: "后台处理",
+    });
+    updateJob(outsourceJob, { status: "done", summary: "后台完成" });
+
+    // 模拟 registry 里有外包污染
+    const fakeRegistry = new Map();
+    fakeRegistry.set("DeveloperA", { role: "programmer", status: "idle" });
+    fakeRegistry.set("外包:污染", { role: "outsource", status: "idle" });
+
+    const jobs = [normalJob, outsourceJob];
+    const view = buildWorkersView(workersDir, jobs, { workers: [] }, [], fakeRegistry);
+
+    const names = view.map((w) => w.name);
+    assert.ok(names.includes("DeveloperA"), "正式员工应在视图中");
+    assert.ok(!names.some((n) => n.startsWith("外包:")), "外包: 前缀的 worker 应被过滤");
+    assert.ok(!names.includes("外包:WorkerC"), "外包 session 污染应被过滤");
+    assert.ok(!names.includes("外包:whitepaper-a"), "外包 job worker 应被过滤");
+    assert.ok(!names.includes("外包:污染"), "外包 registry 污染应被过滤");
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("buildProjectStripsForEmployees excludes outsource virtual workers from participants but keeps job count", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-outsource-project-strips-"));
+  try {
+    const sessionsDir = join(workersDir, "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(join(sessionsDir, "DeveloperA.jsonl"), "", "utf8");
+
+    // 正式员工的 job
+    const normalJob = createJob(workersDir, {
+      kind: "talk",
+      worker: "DeveloperA",
+      project: "落地页",
+      task: "做按钮",
+    });
+    updateJob(normalJob, { status: "done", summary: "按钮做好了" });
+
+    // 外包执行的 job（同一个项目）
+    const outsourceJob = createJob(workersDir, {
+      kind: "outsource-run",
+      worker: "外包:whitepaper-a",
+      project: "落地页",
+      task: "后台数据处理",
+    });
+    updateJob(outsourceJob, { status: "done", summary: "数据处理完成" });
+
+    const strips = buildProjectStrips(workersDir);
+    const project = strips.find((s) => s.name === "落地页");
+
+    assert.ok(project, "项目条应存在");
+    assert.equal(project.total, 2, "项目 job 计数应包含外包执行的 job");
+    assert.equal(project.byStatus.done, 2, "done 状态计数应包含外包 job");
+    assert.ok(project.participants.includes("DeveloperA"), "正式员工应在 participants 中");
+    assert.ok(!project.participants.includes("外包:whitepaper-a"), "外包虚拟 worker 不应在 participants 中");
+    assert.ok(!project.participants.some((p) => p.startsWith("外包:")), "participants 不应有 外包: 前缀");
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("computeReliableFinishedAt falls back through finishedAt/completedAt/cancelledAt/staleAt/updatedAt", () => {
+  assert.equal(computeReliableFinishedAt({ finishedAt: "2026-07-10T10:00:00Z" }), "2026-07-10T10:00:00Z");
+  assert.equal(computeReliableFinishedAt({ completedAt: "2026-07-10T11:00:00Z" }), "2026-07-10T11:00:00Z");
+  assert.equal(computeReliableFinishedAt({ cancelledAt: "2026-07-10T12:00:00Z" }), "2026-07-10T12:00:00Z");
+  assert.equal(computeReliableFinishedAt({ staleAt: "2026-07-10T13:00:00Z" }), "2026-07-10T13:00:00Z");
+  assert.equal(
+    computeReliableFinishedAt({ status: "done", updatedAt: "2026-07-10T14:00:00Z" }),
+    "2026-07-10T14:00:00Z",
+  );
+  assert.equal(
+    computeReliableFinishedAt({ status: "running", updatedAt: "2026-07-10T14:00:00Z" }),
+    null,
+    "运行中的 updatedAt 不是完成时间",
+  );
+  // 优先级：finishedAt > completedAt > cancelledAt > staleAt > updatedAt
+  assert.equal(
+    computeReliableFinishedAt({
+      finishedAt: "2026-07-10T10:00:00Z",
+      completedAt: "2026-07-10T11:00:00Z",
+      cancelledAt: "2026-07-10T12:00:00Z",
+      staleAt: "2026-07-10T13:00:00Z",
+      updatedAt: "2026-07-10T14:00:00Z",
+      status: "done",
+    }),
+    "2026-07-10T10:00:00Z",
+  );
+  assert.equal(computeReliableFinishedAt({}), null);
+  assert.equal(computeReliableFinishedAt(null), null);
+});
+
+test("computeReliableElapsedMs uses startedAt or createdAt to finishedAt when elapsedMs not persisted", () => {
+  // 有持久化 elapsedMs 时直接返回
+  assert.equal(
+    computeReliableElapsedMs({ elapsedMs: 5000 }, {}),
+    5000,
+  );
+  // 合法的 0ms 应被接受
+  assert.equal(
+    computeReliableElapsedMs({ elapsedMs: 0 }, {}),
+    0,
+    "elapsedMs=0 是合法值，应直接返回",
+  );
+  // 负数应被拒绝
+  assert.equal(
+    computeReliableElapsedMs({ elapsedMs: -100 }, {}),
+    null,
+    "负数 elapsedMs 应返回 null",
+  );
+  // 非有限数应被拒绝
+  assert.equal(
+    computeReliableElapsedMs({ elapsedMs: NaN }, {}),
+    null,
+    "NaN elapsedMs 应返回 null",
+  );
+  // 用 startedAt → finishedAt
+  assert.equal(
+    computeReliableElapsedMs(
+      { startedAt: "2026-07-10T10:00:00Z" },
+      { finishedAt: "2026-07-10T10:00:05Z" },
+    ),
+    5000,
+  );
+  // 用 createdAt → finishedAt (fallback)
+  assert.equal(
+    computeReliableElapsedMs(
+      { createdAt: "2026-07-10T10:00:00Z" },
+      { finishedAt: "2026-07-10T10:00:03Z" },
+    ),
+    3000,
+  );
+  // startedAt 优先于 createdAt
+  assert.equal(
+    computeReliableElapsedMs(
+      { startedAt: "2026-07-10T10:00:02Z", createdAt: "2026-07-10T10:00:00Z" },
+      { finishedAt: "2026-07-10T10:00:05Z" },
+    ),
+    3000,
+  );
+  // 无足够数据返回 null
+  assert.equal(computeReliableElapsedMs({}, {}), null);
+  assert.equal(computeReliableElapsedMs({ createdAt: "2026-07-10T10:00:00Z" }, {}), null);
+});
+
+test("serializeOutsourceRun includes fullOutput and reliable finishedAt/elapsedMs", () => {
+  const fullText = "这是完整的外包输出。".repeat(10);
+  const run = {
+    id: "run-1",
+    profileName: "whitepaper-a",
+    status: "done",
+    task: "实现一个功能",
+    summary: "完成了",
+    fullOutput: fullText,
+    startedAt: "2026-07-10T10:00:00.000Z",
+    finishedAt: "2026-07-10T10:00:05.000Z",
+    elapsedMs: 5000,
+  };
+  const detail = serializeOutsourceRun(run, { includeFullOutput: true });
+  assert.equal(detail.runId, "run-1");
+  assert.equal(detail.status, "done");
+  assert.equal(detail.fullOutput, fullText, "detail 应包含 fullOutput");
+  assert.equal(detail.finishedAt, "2026-07-10T10:00:05.000Z", "应使用可靠 finishedAt");
+  assert.equal(detail.elapsedMs, 5000, "应使用持久化 elapsedMs");
+  assert.equal(detail.taskLength, 6, "应暴露任务字符长度，便于观察输入规模");
+  assert.equal(detail.terminal, true);
+
+  // 列表视图不含 fullOutput
+  const listItem = serializeOutsourceRun(run, { includeFullOutput: false });
+  assert.equal(listItem.fullOutput, undefined, "列表不应包含 fullOutput");
+  assert.equal(listItem.elapsedMs, 5000);
+  assert.equal(listItem.finishedAt, "2026-07-10T10:00:05.000Z");
+  assert.equal(listItem.taskLength, 6);
+});
+
+test("outsource web UI exposes task length next to elapsed runtime", () => {
+  const appSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
+  assert.match(appSource, /任务长度/);
+  assert.match(appSource, /r\.taskLength/);
+  assert.match(appSource, /outsource-run__task-length/);
+});
+
+test("serializeOutsourceRun falls back through reliable time fields", () => {
+  // 没有 finishedAt / elapsedMs，只有 staleAt + startedAt
+  const run = {
+    id: "run-2",
+    profileName: "WorkerC",
+    status: "stale",
+    startedAt: "2026-07-10T09:00:00.000Z",
+    staleAt: "2026-07-10T09:30:00.000Z",
+  };
+  const s = serializeOutsourceRun(run, { includeFullOutput: true });
+  assert.equal(s.finishedAt, "2026-07-10T09:30:00.000Z", "finishedAt 应 fallback 到 staleAt");
+  assert.equal(s.elapsedMs, 30 * 60 * 1000, "elapsedMs 应从 startedAt→staleAt 计算");
+  assert.equal(s.terminal, true);
+});
+
+test("serializeOutsourceRun accepts elapsedMs=0", () => {
+  const run = {
+    id: "run-3",
+    status: "done",
+    startedAt: "2026-07-10T10:00:00.000Z",
+    finishedAt: "2026-07-10T10:00:00.000Z",
+    elapsedMs: 0,
+  };
+  const s = serializeOutsourceRun(run);
+  assert.equal(s.elapsedMs, 0, "合法的 0ms 应被接受，不应 fallback 到计算值");
+});
+
+test("serializeOutsourceRun keeps running updates separate from terminal timing", () => {
+  const run = {
+    id: "run-live",
+    status: "running",
+    startedAt: "2026-07-10T10:00:00.000Z",
+    updatedAt: "2026-07-10T10:05:00.000Z",
+  };
+  const serialized = serializeOutsourceRun(run);
+  assert.equal(serialized.updatedAt, run.updatedAt);
+  assert.equal(serialized.finishedAt, null);
+  assert.equal(serialized.elapsedMs, null);
+  assert.equal(serialized.terminal, false);
+});
+
+test("serializeOutsourceRun returns null elapsedMs for invalid dates", () => {
+  const run = {
+    id: "run-4",
+    status: "running",
+    startedAt: "not-a-date",
+    finishedAt: "also-bad",
+  };
+  const s = serializeOutsourceRun(run);
+  assert.equal(s.finishedAt, "also-bad");
+  assert.equal(s.elapsedMs, null, "无效日期应返回 null");
+});
+
+test("outsource run list/detail include fullOutput via serializeOutsourceRun", async () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-outsource-serialize-"));
+  try {
+    upsertOutsourceProfile(workersDir, {
+      name: "whitepaper-a",
+      backend: "pi",
+      tools: ["read", "bash"],
+      skills: false,
+    });
+    const run = createOutsourceRun(workersDir, {
+      profileName: "whitepaper-a",
+      task: "实现一个功能",
+      project: "test-project",
+      requestedBy: "WorkerL",
+    });
+    markOutsourceRunRunning(workersDir, {
+      runId: run.id,
+      jobId: "job-test-1",
+      startedAt: "2026-07-09T10:00:00.000Z",
+    });
+    const fullText = "这是完整的外包输出，包含详细的实现说明。".repeat(10);
+    completeOutsourceRun(workersDir, {
+      runId: run.id,
+      status: "done",
+      summary: "完成功能实现",
+      fullOutput: fullText,
+      usage: { inputTokens: 100, outputTokens: 200, totalTokens: 300 },
+    });
+
+    // 直接用 getOutsourceRun 拿到的对象走 serializeOutsourceRun（模拟 handler 行为）
+    const detailRun = getOutsourceRun(workersDir, run.id);
+    const detail = serializeOutsourceRun(detailRun, { includeFullOutput: true });
+    assert.ok(detail.fullOutput, "detail JSON 应包含 fullOutput");
+    assert.equal(detail.fullOutput.length, fullText.length);
+    assert.ok(detail.finishedAt, "detail 应有可靠 finishedAt");
+    assert.ok(detail.elapsedMs != null, "detail 应有可靠 elapsedMs");
+
+    // 列表视图不含 fullOutput
+    const listItem = serializeOutsourceRun(detailRun, { includeFullOutput: false });
+    assert.equal(listItem.fullOutput, undefined, "列表项不应包含 fullOutput");
+    assert.ok(listItem.finishedAt, "列表项应有可靠 finishedAt");
+    assert.ok(listItem.elapsedMs != null, "列表项应有可靠 elapsedMs");
+  } finally {
     rmSync(workersDir, { recursive: true, force: true });
   }
 });

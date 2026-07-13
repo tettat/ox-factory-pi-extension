@@ -20,7 +20,8 @@ import {
   updateJob,
 } from "./jobs.mjs";
 import { runCodexWorkerStreaming, steerCodexWorker } from "./codex-backend.mjs";
-import { buildFactoryWorkerHandbook } from "./factory-handbook.mjs";
+import { runClaudeWorkerStreaming } from "./claude-backend.mjs";
+import { buildWorkerSystemPrompt, buildWorkerTaskPrompt } from "./worker-prompts.mjs";
 import { scoreUserEmotion } from "./quality-metrics.mjs";
 
 const OWNER_INSTANCE_ID = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -116,6 +117,9 @@ export interface SpawnResult {
   stopReason?: string;
   errorMessage?: string;
   model?: string;
+  codexThreadId?: string;
+  codexTurnId?: string;
+  claudeSessionId?: string;
 }
 
 export interface SpawnOptions {
@@ -155,17 +159,28 @@ function addUsageToResult(result: SpawnResult, usage: any) {
   result.totalTokens += totalTokens;
 }
 
-function communicationInstructions(worker: Worker): string {
-  return buildFactoryWorkerHandbook(worker, {
+function workerSystemPrompt(worker: Worker): string {
+  return buildWorkerSystemPrompt(worker, {
     workersDir: getWorkersDir(),
     backend: worker.backend ?? "pi",
+    agentDef: getAgentDef(worker.role),
   });
+}
+
+function shouldSkipUserEmotionScore(job: any): boolean {
+  const kind = String(job?.kind || "");
+  if (job?.source === "factory_command") return true;
+  return kind === "assigned-task" ||
+    kind === "inbox" ||
+    kind === "command" ||
+    kind === "outsource-run" ||
+    Boolean(job?.sourceTaskRequestId || job?.sourceMessageId || job?.assignedBy || job?.returnTo);
 }
 
 export async function spawnWorker(options: SpawnOptions): Promise<SpawnResult> {
   const { worker, task, project, cwd, additionalContext, signal, onProgress } = options;
 
-  if ((worker.backend ?? "pi") === "codex") {
+  if ((worker.backend ?? "pi") === "codex" || (worker.backend ?? "pi") === "claude") {
     return spawnWorkerStreaming(options, (event) => {
       if (event.type === "text") onProgress?.(event.text.slice(0, 100));
     });
@@ -180,25 +195,20 @@ export async function spawnWorker(options: SpawnOptions): Promise<SpawnResult> {
     args.push("--thinking", worker.thinking);
   }
 
-  // 写入 agent 定义作为临时文件
-  const agentDef = getAgentDef(worker.role);
+  // 写入稳定 system prompt 作为临时文件：身份、角色定义、工厂手册都不再重复塞进每条 user prompt。
+  const systemPrompt = workerSystemPrompt(worker);
   let tmpDir: string | null = null;
   let tmpFilePath: string | null = null;
 
-  if (agentDef.trim()) {
+  if (systemPrompt.trim()) {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ox-factory-"));
     tmpFilePath = path.join(tmpDir, `agent-${worker.id}.md`);
-    fs.writeFileSync(tmpFilePath, agentDef, "utf-8");
+    fs.writeFileSync(tmpFilePath, systemPrompt, "utf-8");
     args.push("--append-system-prompt", tmpFilePath);
   }
 
   // 任务内容
-  let taskContent = `你的名字叫 **${worker.id}**，职位是 ${worker.role}。\n\n## 项目: ${project}\n\n## 任务\n${task}`;
-  if (additionalContext) {
-    taskContent += `\n\n## 附加上下文\n${additionalContext}`;
-  }
-  taskContent += `\n\n${communicationInstructions(worker)}`;
-  taskContent += `\n\n请开始工作。完成后按你的角色格式输出汇报。`;
+  const taskContent = buildWorkerTaskPrompt({ project, task, additionalContext });
   args.push(taskContent);
 
   const workCwd = cwd ?? process.cwd();
@@ -307,7 +317,9 @@ export type StreamEvent =
   | { type: "tool_start"; name: string; args: unknown }
   | { type: "tool_output"; name: string; text: string }
   | { type: "tool_end"; name: string; result?: unknown; isError?: boolean }
-  | { type: "done"; turns: number; inputTokens: number; cachedInputTokens?: number; outputTokens: number; reasoningOutputTokens?: number; totalTokens?: number; model?: string; exitCode?: number; stopReason?: string; text?: string }
+  | { type: "codex_thread"; threadId: string; text?: string }
+  | { type: "claude_session"; sessionId: string; text?: string }
+  | { type: "done"; turns: number; inputTokens: number; cachedInputTokens?: number; outputTokens: number; reasoningOutputTokens?: number; totalTokens?: number; model?: string; exitCode?: number; stopReason?: string; text?: string; codexThreadId?: string; codexTurnId?: string; claudeSessionId?: string }
   | { type: "error"; message: string };
 
 export async function spawnWorkerStreaming(
@@ -333,27 +345,40 @@ export async function spawnWorkerStreaming(
     ) as Promise<SpawnResult>;
   }
 
+  if ((worker.backend ?? "pi") === "claude") {
+    return runClaudeWorkerStreaming(
+      {
+        worker,
+        task,
+        project,
+        cwd,
+        additionalContext,
+        signal,
+        agentDef: getAgentDef(worker.role),
+        workersDir: getWorkersDir(),
+        onWorkerPatch: (patch: Partial<Worker>) => updateWorkerConfig(worker.id, patch),
+      },
+      onEvent,
+    ) as Promise<SpawnResult>;
+  }
+
   const args: string[] = ["--mode", "json", "-p", "--session", worker.sessionFile, "--name", `${worker.role}-${worker.id}`];
 
   if (worker.model) args.push("--model", worker.model);
   if (worker.thinking) args.push("--thinking", worker.thinking);
 
-  const agentDef = getAgentDef(worker.role);
+  const systemPrompt = workerSystemPrompt(worker);
   let tmpDir: string | null = null;
   let tmpFilePath: string | null = null;
 
-  if (agentDef.trim()) {
+  if (systemPrompt.trim()) {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ox-factory-talk-"));
     tmpFilePath = path.join(tmpDir, `agent-${worker.id}.md`);
-    fs.writeFileSync(tmpFilePath, agentDef, "utf-8");
+    fs.writeFileSync(tmpFilePath, systemPrompt, "utf-8");
     args.push("--append-system-prompt", tmpFilePath);
   }
 
-  let taskContent = `你的名字叫 **${worker.id}**，职位是 ${worker.role}。\n\n`;
-  if (project) taskContent += `## 项目: ${project}\n\n`;
-  taskContent += `## 任务\n${task}`;
-  if (additionalContext) taskContent += `\n\n## 附加上下文\n${additionalContext}`;
-  taskContent += `\n\n${communicationInstructions(worker)}`;
+  const taskContent = buildWorkerTaskPrompt({ project, task, additionalContext });
   args.push(taskContent);
 
   const workCwd = cwd ?? process.cwd();
@@ -541,17 +566,18 @@ export function startWorkerJob(
     return updated;
   };
 
-  const recordQualityEmotionAsync = (finishedJob: any, assistantText: string) => {
+  const recordQualityEmotionAsync = (scoredJob: any, assistantText: string) => {
+    if (shouldSkipUserEmotionScore(scoredJob)) return;
     const userText = options.task || "";
     if (!userText.trim()) return;
     void scoreUserEmotion({
       workersDir: getWorkersDir(),
-      job: finishedJob,
+      job: scoredJob,
       userText,
       assistantText,
     }).then((record: any) => {
       if (!record || record.status === "disabled") return;
-      appendJobEvent(finishedJob, {
+      appendJobEvent(scoredJob, {
         type: record.status === "scored" ? "quality_emotion" : "quality_emotion_status",
         status: record.status,
         score: record.score ?? null,
@@ -562,12 +588,14 @@ export function startWorkerJob(
         apiKeyEnv: record.apiKeyEnv || undefined,
       });
     }).catch((error: any) => {
-      appendJobEvent(finishedJob, {
+      appendJobEvent(scoredJob, {
         type: "quality_emotion_error",
         message: error?.message || String(error),
       });
     });
   };
+
+  recordQualityEmotionAsync(job, "");
 
   const startedMs = Date.now();
   const run = options.deliveryMode === "steer" && (options.worker.backend ?? "pi") === "codex" && options.worker.codexActiveTurnId
@@ -594,24 +622,25 @@ export function startWorkerJob(
       reasoningOutputTokens: result.reasoningOutputTokens,
       totalTokens: result.totalTokens,
       model: result.model,
+      codexThreadId: result.codexThreadId,
+      codexTurnId: result.codexTurnId,
+      claudeSessionId: result.claudeSessionId,
       summary: result.output ? result.output.slice(0, 1000) : "",
       fullOutput: result.output || "",
     };
     if (failed) patch.error = result.errorMessage || result.stderr || `worker exited with code ${result.exitCode}`;
-    const finishedJob = finishIfOpen(patch, { type: patch.status, text: patch.error || patch.summary || "" });
-    recordQualityEmotionAsync(finishedJob, result.output || patch.error || "");
+    finishIfOpen(patch, { type: patch.status, text: patch.error || patch.summary || "" });
     return result;
   }).catch((error: any) => {
     const elapsedSeconds = Math.max(0, Math.round((Date.now() - startedMs) / 1000));
     const message = error?.message || String(error);
-    const finishedJob = finishIfOpen({
+    finishIfOpen({
       status: "failed",
       finishedAt: new Date().toISOString(),
       elapsedSeconds,
       exitCode: 1,
       error: message,
     }, { type: "error", message });
-    recordQualityEmotionAsync(finishedJob, message);
     return {
       exitCode: 1,
       output: "",

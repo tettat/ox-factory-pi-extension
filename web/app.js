@@ -13,7 +13,7 @@
     zh: {
       "app.title": "牛马工厂 · 驾驶舱",
       "brand.title": "牛马工厂",
-      "brand.subtitle": "本地驾驶舱 · Phase 1 · 只读",
+      "brand.subtitle": "本地驾驶舱 · 只读",
       "health.loading": "加载中…",
       "metrics.workers": "员工",
       "metrics.jobs": "Jobs",
@@ -27,21 +27,21 @@
       "nav.projects": "项目",
       "nav.workers": "员工",
       "nav.jobs": "任务",
+      "nav.tasks": "派活",
       "nav.schedules": "定时任务",
       "nav.tokens": "Token",
       "nav.compactions": "压缩",
       "nav.messages": "消息",
       "nav.report": "日报",
       "nav.permissions": "权限",
-      "nav.phase": "Phase 1 · read-first",
-      "nav.readonly": "不写权限 / 不派活 / 不 apply 压缩",
+      "nav.outsource": "外包",
       "topbar.updatedAt": "更新于",
       "toast.refreshed": "已刷新",
     },
     en: {
       "app.title": "Ox Factory · Dashboard",
       "brand.title": "Ox Factory",
-      "brand.subtitle": "Local Dashboard · Phase 1 · Read-only",
+      "brand.subtitle": "Local Dashboard · Read-only",
       "health.loading": "Loading…",
       "metrics.workers": "Workers",
       "metrics.jobs": "Jobs",
@@ -55,14 +55,14 @@
       "nav.projects": "Projects",
       "nav.workers": "Workers",
       "nav.jobs": "Jobs",
+      "nav.tasks": "Tasks",
       "nav.schedules": "Schedules",
       "nav.tokens": "Tokens",
       "nav.compactions": "Compactions",
       "nav.messages": "Messages",
       "nav.report": "Report",
       "nav.permissions": "Permissions",
-      "nav.phase": "Phase 1 · read-first",
-      "nav.readonly": "No writes / no dispatch / no compaction apply",
+      "nav.outsource": "Outsource",
       "topbar.updatedAt": "Updated",
       "toast.refreshed": "Refreshed",
     },
@@ -71,6 +71,7 @@
     lastOverview: null,
     workers: [],
     jobs: [],
+    taskRequests: [],
     currentPage: "overview",
     drawerJob: null,
     tokensDate: null,
@@ -393,6 +394,78 @@
     return `${Math.round(v / 1000)}s`;
   }
 
+  function fmtTaskLength(value) {
+    const v = Number(value || 0);
+    if (!Number.isFinite(v) || v <= 0) return "—";
+    return `${fmtNumber(v)} 字`;
+  }
+
+  function sortableNumericTh(label) {
+    return el("th", {
+      class: "table__sort-th",
+      data: { sortType: "number" },
+      title: "点击按数值排序",
+    }, [
+      el("button", {
+        class: "table__sort-btn",
+        type: "button",
+        onclick: (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          sortTableByHeader(e.currentTarget.closest("th"));
+        },
+      }, [
+        el("span", { text: label }),
+        el("span", { class: "table__sort-indicator", text: "↕" }),
+      ]),
+    ]);
+  }
+
+  function sortableValue(value) {
+    if (value == null || value === "") return "";
+    const n = Number(value);
+    return Number.isFinite(n) ? String(n) : "";
+  }
+
+  function numericTd(value, text, className = "td--mono") {
+    return el("td", {
+      class: className,
+      data: { sortValue: sortableValue(value) },
+      text,
+    });
+  }
+
+  function sortTableByHeader(th) {
+    const table = th?.closest?.("table");
+    const tbody = table?.tBodies?.[0];
+    const headRow = th?.parentElement;
+    if (!table || !tbody || !headRow) return;
+    const headers = Array.from(headRow.children);
+    const columnIndex = headers.indexOf(th);
+    if (columnIndex < 0) return;
+    const nextDir = th.dataset.sortDir === "desc" ? "asc" : "desc";
+    for (const header of headers) {
+      delete header.dataset.sortDir;
+      header.removeAttribute("aria-sort");
+      header.querySelector(".table__sort-indicator")?.replaceChildren(document.createTextNode("↕"));
+    }
+    th.dataset.sortDir = nextDir;
+    th.setAttribute("aria-sort", nextDir === "asc" ? "ascending" : "descending");
+    th.querySelector(".table__sort-indicator")?.replaceChildren(document.createTextNode(nextDir === "asc" ? "↑" : "↓"));
+    const rows = Array.from(tbody.rows);
+    rows.sort((a, b) => {
+      const ar = a.cells[columnIndex]?.dataset.sortValue;
+      const br = b.cells[columnIndex]?.dataset.sortValue;
+      const av = ar === "" || ar == null ? Number.NEGATIVE_INFINITY : Number(ar);
+      const bv = br === "" || br == null ? Number.NEGATIVE_INFINITY : Number(br);
+      const an = Number.isFinite(av) ? av : Number.NEGATIVE_INFINITY;
+      const bn = Number.isFinite(bv) ? bv : Number.NEGATIVE_INFINITY;
+      if (an !== bn) return nextDir === "asc" ? an - bn : bn - an;
+      return String(a.textContent || "").localeCompare(String(b.textContent || ""), "zh-Hans-CN");
+    });
+    for (const row of rows) tbody.appendChild(row);
+  }
+
   function debounce(fn, ms) {
     let t;
     return (...args) => {
@@ -457,15 +530,45 @@
     failed: "失败",
     aborted: "中止",
     vacation: "休假",
+    pending: "待接管",
+    processing: "接管中",
+    accepted: "已接管",
+    reported: "已回传",
+    cancelled: "已取消",
   };
+  const JOB_TERMINAL_STATUSES = new Set(["done", "failed", "aborted", "stale", "cancelled"]);
 
   function statusPill(status) {
     const s = String(status || "idle");
     return el("span", { class: `pill pill--${s}`, text: STATUS_LABELS[s] || s });
   }
 
+  function isCancellableJob(job) {
+    return Boolean(job?.id) && !JOB_TERMINAL_STATUSES.has(String(job.status || ""));
+  }
+
   function workerStatusDot(status) {
     return el("span", { class: `dot dot--${status || "idle"}`, title: status || "idle" });
+  }
+
+  function normalizedAvatarStatus(status) {
+    const value = String(status || "idle");
+    return value === "working" ? "busy" : value;
+  }
+
+  function workerAvatarNode(worker, opts = {}) {
+    const name = typeof worker === "string" ? worker : (worker?.name || "");
+    const avatar = typeof worker === "object" ? String(worker?.avatar || "").trim() : "";
+    const status = normalizedAvatarStatus(typeof worker === "object" ? worker?.status : opts.status);
+    const className = `avatar${opts.large ? " avatar--lg" : ""} avatar--${status}`;
+    if (/^(https?:\/\/|data:image\/|\/api\/avatars\/)/i.test(avatar)) {
+      return el("div", { class: className }, [
+        el("img", { class: "avatar__img", src: avatar, alt: "" }),
+      ]);
+    }
+    return el("div", { class: className }, [
+      el("span", { class: "avatar__char", text: avatar || (name || "?").slice(0, 1) }),
+    ]);
   }
 
   // ---- Topbar ----
@@ -483,7 +586,7 @@
   }
 
   // ---- Overview 页面 ----
-  function renderOverview(overview) {
+  function renderOverview(overview, outsourceBundle) {
     const main = $("#main");
     main.innerHTML = "";
     const t = overview.totals || {};
@@ -509,6 +612,11 @@
       ]),
     ]);
     wrap.appendChild(hero);
+
+    // ①-b Subagent / 外包 KPI
+    if (outsourceBundle) {
+      wrap.appendChild(renderOverviewSubagentSection(outsourceBundle));
+    }
 
     // ② 项目态势：优先展示 Project Entity，派生 job.project 只作辅助
     const catalog = overview.projectCatalog || [];
@@ -620,6 +728,30 @@
     main.appendChild(wrap);
   }
 
+  function renderOverviewSubagentSection(bundle) {
+    const counts = computeOutsourceCounts(bundle.runs || []);
+    const profileCount = (bundle.profiles || []).length;
+    const section = el("section", { class: "section" }, [
+      cardHead("Subagent / 外包", `${profileCount} profiles · ${counts.total} runs · 数据: outsource-runs.jsonl`),
+      el("div", { class: "kpi-row" }, [
+        kpiCard("可用 Profiles", String(profileCount), "外包团队配置数"),
+        kpiCard("正在运行", String(counts.running + counts.queued), `运行 ${counts.running} · 排队 ${counts.queued}`),
+        kpiCard("今日完成", String(counts.doneToday), `本地时区 ${todayLocal()}`),
+        kpiCard("需关注", String(counts.needsAttention), "异常终态 + error"),
+      ]),
+      el("div", { class: "card__foot" }, [
+        el("a", { class: "link link--more", href: "#/outsource", text: "进入外包页面 →" }),
+      ]),
+    ]);
+    if (bundle.runsError) {
+      section.appendChild(errorBox("拉 runs 失败", bundle.runsError));
+    }
+    if (bundle.profilesError) {
+      section.appendChild(errorBox("拉 profiles 失败", bundle.profilesError));
+    }
+    return section;
+  }
+
   function kpiCard(label, value, sub) {
     return el("div", { class: "kpi" }, [
       el("div", { class: "kpi__label", text: label }),
@@ -637,6 +769,84 @@
 
   // 可折叠卡片（默认折叠；点击 header 展开/收起）
   // 避免一打开页面就看到一大坨长内容（消息、项目、风险等）
+  async function markMessageReadFromUi(message, root, worker) {
+    if (!message?.id || !worker) return;
+    root.dataset.readPending = "1";
+    const res = await api(`/api/messages/${encodeURIComponent(message.id)}/read`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ worker, from: "web" }),
+    });
+    delete root.dataset.readPending;
+    if (!res.ok) {
+      root.dataset.readFailed = "1";
+      return;
+    }
+    message.read = true;
+    root.classList.remove("msg-list__item--unread");
+    root.querySelector(".msg-preview__unread")?.remove();
+    void refreshWorkerUnreadBadges();
+  }
+
+  async function markWorkerReadFromUi(worker) {
+    if (!worker) return { ok: false, count: 0 };
+    const res = await api(`/api/workers/${encodeURIComponent(worker)}/read`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ from: "web" }),
+    });
+    return {
+      ok: res.ok,
+      count: Number(res.data?.count || 0),
+      messages: Number(res.data?.messages?.count || 0),
+      jobs: Number(res.data?.jobs?.count || 0),
+      jobEvents: Number(res.data?.jobs?.unreadEvents || 0),
+    };
+  }
+
+  function clearWorkerCardUnreadLocally(worker) {
+    const card = $$(".worker-card").find((item) => item.dataset.name === worker);
+    if (!card) return;
+    card.dataset.unread = "0";
+    card.classList.remove("worker-card--unread");
+    card.querySelector(".worker-card__badge--unread")?.remove();
+  }
+
+  function unreadBadgeTitle(worker) {
+    return `未读 job 更新 ${worker.unreadJobUpdates || 0} · 未读 event ${worker.unreadJobEvents || 0} · 最后未读 ${worker.lastUnreadAt ? fmtRelative(worker.lastUnreadAt) : "-"}`;
+  }
+
+  function workerCardTalkPreviewText(worker) {
+    return String(worker?.lastTalkReply?.contentPreview || "").trim();
+  }
+
+  function workerCardTalkPreviewNode(worker) {
+    const text = workerCardTalkPreviewText(worker);
+    if (!text) return null;
+    return el("div", {
+      class: "worker-card__talk-preview",
+      text,
+      title: text,
+    });
+  }
+
+  function syncWorkerCardTalkPreview(card, worker) {
+    const body = card?.querySelector(".worker-card__body");
+    if (!body) return;
+    const text = workerCardTalkPreviewText(worker);
+    const existing = card.querySelector(".worker-card__talk-preview");
+    if (!text) {
+      existing?.remove();
+      return;
+    }
+    if (existing) {
+      existing.textContent = text;
+      existing.title = text;
+      return;
+    }
+    body.appendChild(workerCardTalkPreviewNode(worker));
+  }
+
   function messageItem(m, opts = {}) {
     // m: { from, to, direction, createdAt, content, read }
     // opts: { defaultOpen, showDirection, showRead }
@@ -644,6 +854,8 @@
     const showRead = opts.showRead !== false;
     const defaultOpen = Boolean(opts.defaultOpen);
     const direction = m.direction || (m.to === (opts.worker || "") ? "in" : "out");
+    const worker = opts.worker || "";
+    const unreadIncoming = showRead && m.read === false && worker && m.from !== worker && (m.to === worker || m.to === "*");
 
     // 预览（第一行 plain text，折叠时可见）
     const preview = String(m.content || "").replace(/\s+/g, " ").trim().slice(0, 120);
@@ -654,14 +866,20 @@
     }
     headChildren.push(el("span", { class: "msg-list__peer", text: `${m.from} → ${m.to}` }));
     headChildren.push(el("span", { class: "msg-list__time", text: fmtRelative(m.createdAt) }));
-    if (showRead && m.read === false) {
+    if (unreadIncoming) {
       headChildren.push(el("span", { class: "msg-preview__unread", text: "未读" }));
     }
 
     // 详情项（原生 <details>，可折叠）
     const details = el("details", {
-      class: `msg-list__item msg-list__item--${direction} ${defaultOpen ? "msg-list__item--open" : ""}`,
+      class: `msg-list__item msg-list__item--${direction}${unreadIncoming ? " msg-list__item--unread" : ""} ${defaultOpen ? "msg-list__item--open" : ""}`,
     });
+    if (unreadIncoming) {
+      details.addEventListener("toggle", () => {
+        if (!details.open || m.read || details.dataset.readPending === "1") return;
+        void markMessageReadFromUi(m, details, worker);
+      });
+    }
     if (defaultOpen) details.open = true;
     const summary = el("summary", { class: "msg-list__head" });
     const left = el("div", { class: "msg-list__head-left" }, headChildren);
@@ -863,7 +1081,7 @@
     return el("ul", { class: "worker-preview" },
       workers.slice(0, 8).map((w) => el("li", { class: "worker-preview__item" }, [
         el("a", { class: "worker-preview__link", href: `#/workers/${encodeURIComponent(w.name)}` }, [
-          el("div", { class: `avatar avatar--${w.status || "idle"}${w.status === "vacation" ? " avatar--vacation" : ""}` }, [el("span", { class: "avatar__char", text: (w.name || "?").slice(0, 1) })]),
+          workerAvatarNode(w),
           el("div", { class: "worker-preview__body" }, [
             el("div", { class: "worker-preview__name" }, [
               workerStatusDot(w.status),
@@ -913,6 +1131,717 @@
   }
 
   // ---- Workers 页面 ----
+  // 纯前端过滤：输入 → name.toLowerCase().includes(query) → 隐藏/显示卡片
+  let workerSearchDebounceTimer = null;
+
+  function scheduleWorkerCardsFilter(query) {
+    if (workerSearchDebounceTimer) clearTimeout(workerSearchDebounceTimer);
+    workerSearchDebounceTimer = setTimeout(() => {
+      workerSearchDebounceTimer = null;
+      filterWorkerCards(query);
+    }, 140);
+  }
+
+  function filterWorkerCards(query) {
+    const list = $(".workers__list");
+    if (!list) return;
+    const q = String(query || "").trim().toLowerCase();
+    const cards = $$(".worker-card", list);
+    let visible = 0;
+    for (const card of cards) {
+      const name = String(card.dataset.name || "").toLowerCase();
+      const match = !q || name.includes(q);
+      card.hidden = !match;
+      if (match) visible += 1;
+    }
+    const counter = $("#workerSearchCount");
+    const total = cards.length;
+    if (counter) {
+      counter.textContent = q ? `${visible} / ${total} 匹配` : `${total} 员工`;
+    }
+  }
+
+  // ---- 外包团队页面 ----
+  // 信息架构：标题「外包团队」；区块「外包团队配置」(Profiles) + 「运行与消息」(Runs)
+  async function renderOutsource() {
+    const main = $("#main");
+    main.innerHTML = "";
+    const wrap = el("div", { class: "page page--outsource" });
+
+    // 顶部标题
+    wrap.appendChild(sectionHead("外包团队", "外包 profile 配置 + 运行历史与消息流 · 只读展示"));
+
+    // 并行拉取 profiles + runs，各自独立容错
+    const [profileRes, runsRes] = await Promise.all([
+      api("/api/outsource/profiles"),
+      api("/api/outsource/runs?limit=50"),
+    ]);
+
+    const profiles = profileRes.ok ? (profileRes.data?.profiles || []) : [];
+    const runs = runsRes.ok ? (runsRes.data?.runs || []) : [];
+    const counts = computeOutsourceCounts(runs);
+
+    // KPI 区（始终展示，基于已有数据）
+    wrap.appendChild(renderOutsourceKpis(profiles, counts));
+
+    // 外包团队配置区块
+    const profileSection = el("section", { class: "section", id: "outsource-profiles-section" });
+    profileSection.appendChild(cardHead("外包团队配置", `${profiles.length} 个可用 profile${profileRes.ok ? "" : " (加载失败)"}`));
+    if (!profileRes.ok) {
+      profileSection.appendChild(errorBox("加载 profiles 失败", profileRes.detail));
+    } else if (!profiles.length) {
+      profileSection.appendChild(emptyState("暂无外包 profile", "用 factory_outsource_profiles 创建外包团队配置。"));
+    } else {
+      const grid = el("div", { class: "profile-grid" });
+      for (const p of profiles) {
+        grid.appendChild(renderOutsourceProfileCard(p));
+      }
+      profileSection.appendChild(grid);
+    }
+    wrap.appendChild(profileSection);
+
+    // 运行与消息区块
+    const runsSection = el("section", { class: "section", id: "outsource-runs-section" });
+    runsSection.appendChild(cardHead("运行与消息", `${runs.length} 条执行记录${runsRes.ok ? "" : " (加载失败)"}`));
+    if (!runsRes.ok) {
+      runsSection.appendChild(errorBox("加载 runs 失败", runsRes.detail));
+    } else {
+      const tableEl = renderOutsourceRunsTable(runs, profiles);
+      runsSection.appendChild(tableEl);
+    }
+    wrap.appendChild(runsSection);
+
+    return wrap;
+  }
+
+  // 异常终态：failed / cancelled / stale / aborted + 有 error 的
+  const OUTSOURCE_NEEDS_ATTENTION_STATUSES = new Set(["failed", "cancelled", "stale", "aborted"]);
+
+  function isLocalToday(iso) {
+    if (!iso) return false;
+    const date = new Date(iso);
+    if (Number.isNaN(date.getTime())) return false;
+    const pad = (value) => String(value).padStart(2, "0");
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` === todayLocal();
+  }
+
+  function computeOutsourceCounts(runs) {
+    const activeGroupIds = new Set();
+    let needsAttention = 0;
+    let running = 0;
+    let doneToday = 0;
+    let done = 0;
+    let queued = 0;
+    let failed = 0;
+
+    for (const r of runs) {
+      const status = r.status || "";
+      // 活跃 group：至少有一个 queued/running 的 run
+      if (r.groupId && (status === "queued" || status === "running")) {
+        activeGroupIds.add(r.groupId);
+      }
+      if (status === "queued") queued++;
+      else if (status === "running") running++;
+      else if (status === "done") {
+        done++;
+        // 今日完成：finishedAt 或 updatedAt 在今天
+        const ref = r.finishedAt || r.updatedAt || r.createdAt;
+        if (isLocalToday(ref)) doneToday++;
+      }
+      if (OUTSOURCE_NEEDS_ATTENTION_STATUSES.has(status) || r.error) {
+        needsAttention++;
+      }
+      if (status === "failed") failed++;
+    }
+    return {
+      activeGroups: activeGroupIds.size,
+      needsAttention,
+      running,
+      queued,
+      done,
+      doneToday,
+      failed,
+      total: runs.length,
+    };
+  }
+
+  function renderOutsourceKpis(profiles, counts) {
+    const section = el("section", { class: "section kpi-row kpi-row--outsource" });
+    // 可用 Profiles
+    section.appendChild(kpiCard("可用 Profiles", String(profiles.length), "外包团队配置数"));
+    // 正在运行（queued + running）
+    section.appendChild(kpiCard("正在运行", String(counts.running + counts.queued), `运行 ${counts.running} · 排队 ${counts.queued}`));
+    // 今日完成
+    section.appendChild(kpiCard("今日完成", String(counts.doneToday), `本地时区 ${todayLocal()}`));
+    // 需关注（failed/cancelled/stale/aborted/error）
+    section.appendChild(kpiCard("需关注", String(counts.needsAttention), "异常终态 + error"));
+    return section;
+  }
+
+  function renderOutsourceProfileCard(p) {
+    const tools = Array.isArray(p.tools) && p.tools.length ? p.tools.join(", ") : "-";
+    const skillsList = Array.isArray(p.skills) && p.skills.length ? p.skills.join(", ") : (p.skills ? "yes" : "no");
+    const card = el("article", {
+      class: "profile-card profile-card--clickable",
+      tabindex: "0",
+      "data-profile-name": p.name || "",
+      role: "button",
+      "aria-label": `查看外包 profile ${p.name}`,
+    }, [
+      el("header", { class: "profile-card__head" }, [
+        el("span", { class: "profile-card__name" }, p.name || "?"),
+        el("span", { class: "profile-card__backend" }, p.backend || "?"),
+      ]),
+      el("div", { class: "profile-card__meta" }, [
+        el("div", { class: "profile-card__meta-row" }, [
+          el("span", { class: "profile-card__meta-key" }, "model"),
+          el("span", { class: "profile-card__meta-val mono" }, p.model || "-"),
+        ]),
+        el("div", { class: "profile-card__meta-row" }, [
+          el("span", { class: "profile-card__meta-key" }, "thinking"),
+          el("span", { class: "profile-card__meta-val mono" }, p.thinking || "-"),
+        ]),
+        el("div", { class: "profile-card__meta-row" }, [
+          el("span", { class: "profile-card__meta-key" }, "tools"),
+          el("span", { class: "profile-card__meta-val" }, tools),
+        ]),
+        el("div", { class: "profile-card__meta-row" }, [
+          el("span", { class: "profile-card__meta-key" }, "skills"),
+          el("span", { class: "profile-card__meta-val" }, skillsList),
+        ]),
+        el("div", { class: "profile-card__meta-row" }, [
+          el("span", { class: "profile-card__meta-key" }, "defaultWait"),
+          el("span", { class: "profile-card__meta-val mono" }, p.defaultWait ? "yes" : "no"),
+        ]),
+        el("div", { class: "profile-card__meta-row" }, [
+          el("span", { class: "profile-card__meta-key" }, "timeout"),
+          el("span", { class: "profile-card__meta-val mono" }, Number(p.timeoutMs) > 0 ? fmtDurationMs(p.timeoutMs) : "不超时"),
+        ]),
+      ]),
+      p.description ? el("p", { class: "profile-card__desc" }, p.description) : null,
+      el("div", { class: "profile-card__hint muted" }, "点击查看详情 →"),
+    ]);
+    card.addEventListener("click", () => openOutsourceProfileDrawer(p.name));
+    card.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openOutsourceProfileDrawer(p.name); } });
+    return card;
+  }
+
+  async function openOutsourceProfileDrawer(name) {
+    const [profRes, runsRes] = await Promise.all([
+      api(`/api/outsource/profiles/${encodeURIComponent(name)}`),
+      api(`/api/outsource/runs?profile=${encodeURIComponent(name)}&limit=10`),
+    ]);
+    if (!profRes.ok) { toast("加载 profile 失败: " + (profRes.detail || ""), "error"); return; }
+    const p = profRes.data || {};
+    const recentRuns = runsRes.ok ? (runsRes.data?.runs || []) : [];
+    const tools = Array.isArray(p.tools) && p.tools.length ? p.tools.join(", ") : "-";
+    const skillsList = Array.isArray(p.skills) && p.skills.length ? p.skills.join(", ") : (p.skills ? "yes" : "no");
+
+    // 优先清晰展示的字段：name / backend / model / thinking / tools / skills / defaultWait / timeout / maxTurns / description
+    const body = el("div", { class: "outsource-run outsource-run--profile" }, [
+      el("header", { class: "outsource-run__head" }, [
+        el("div", { class: "outsource-run__head-main" }, [
+          el("h2", { class: "outsource-run__title" }, p.name || name),
+          el("span", { class: "profile-card__backend" }, p.backend || "?"),
+        ]),
+      ]),
+      el("dl", { class: "outsource-run__meta outsource-run__meta--profile" }, [
+        el("dt", {}, "model"),        el("dd", { class: "mono" }, p.model || "-"),
+        el("dt", {}, "thinking"),     el("dd", { class: "mono" }, p.thinking || "-"),
+        el("dt", {}, "tools"),        el("dd", {}, tools),
+        el("dt", {}, "skills"),       el("dd", {}, skillsList),
+        el("dt", {}, "defaultWait"),  el("dd", { class: "mono" }, p.defaultWait ? "yes" : "no"),
+        el("dt", {}, "timeout"),      el("dd", { class: "mono" }, Number(p.timeoutMs) > 0 ? fmtDurationMs(p.timeoutMs) : "不超时"),
+        el("dt", {}, "maxTurns"),     el("dd", { class: "mono" }, p.maxTurns != null ? String(p.maxTurns) : "-"),
+        p.createdAt ? el("dt", {}, "createdAt") : null,
+        p.createdAt ? el("dd", { class: "mono" }, p.createdAt) : null,
+        p.updatedAt ? el("dt", {}, "updatedAt") : null,
+        p.updatedAt ? el("dd", { class: "mono" }, p.updatedAt) : null,
+      ].filter(Boolean)),
+      p.description ? el("section", { class: "outsource-run__desc-section" }, [
+        cardHead("描述", null),
+        el("p", { class: "outsource-run__desc" }, p.description),
+      ]) : null,
+      el("section", { class: "outsource-run__recent" }, [
+        cardHead(`最近 ${recentRuns.length} 条 Run`, "点击查看 run 详情与消息流"),
+        recentRuns.length === 0
+          ? emptyState("该 profile 暂无 run")
+          : el("table", { class: "runs-table runs-table--mini" }, [
+              el("thead", {}, [el("tr", {}, [
+                el("th", {}, "runId"), el("th", {}, "status"), el("th", {}, "耗时"), el("th", {}, "task"),
+              ])]),
+              el("tbody", {}, recentRuns.map((r) => el("tr", {
+                class: "runs-row", "data-run-id": r.runId, tabindex: "0",
+              }, [
+                el("td", { class: "mono" }, r.runId || "-"),
+                el("td", {}, statusPill(r.status)),
+                el("td", { class: "mono" }, r.elapsedMs != null ? fmtDurationMs(r.elapsedMs) : "-"),
+                el("td", { class: "runs-row__task" }, (r.taskPreview || r.summary || "-").slice(0, 80)),
+              ]))),
+            ]),
+      ]),
+    ].filter(Boolean));
+    // 给 mini 表里的行绑事件
+    body.querySelectorAll(".runs-row[data-run-id]").forEach((row) => {
+      row.addEventListener("click", () => openOutsourceRunDrawer(row.dataset.runId));
+      row.addEventListener("keydown", (e) => { if (e.key === "Enter") openOutsourceRunDrawer(row.dataset.runId); });
+    });
+    openDrawer(body, { eyebrow: "PROFILE", title: p.name || name });
+  }
+
+  function renderOutsourceRunsTable(runs, profiles) {
+    const wrap = el("div", { class: "runs-section" });
+    if (!runs.length) {
+      wrap.appendChild(emptyState("暂无 run", "使用 factory_outsource_run 或 POST /api/outsource/runs 派活。"));
+      return wrap;
+    }
+    const profileOptions = (profiles || []).map((p) => p.name).filter(Boolean);
+    const filterBar = el("div", { class: "runs-filter" }, [
+      el("input", {
+        type: "search",
+        id: "outsourceRunSearch",
+        class: "input runs-filter__search",
+        placeholder: "搜索 runId / requestedBy / task…",
+      }),
+      el("select", {
+        id: "outsourceRunStatus",
+        class: "input runs-filter__status",
+      }, [
+        el("option", { value: "" }, "全部状态"),
+        ...["queued", "running", "done", "failed", "cancelled", "stale", "aborted"].map((s) =>
+          el("option", { value: s }, STATUS_LABELS[s] || s)
+        ),
+      ]),
+      el("select", {
+        id: "outsourceRunProfile",
+        class: "input runs-filter__profile",
+      }, [
+        el("option", { value: "" }, "全部 profile"),
+        ...profileOptions.map((name) => el("option", { value: name }, name)),
+      ]),
+      el("span", { id: "outsourceRunCount", class: "runs-filter__count muted" }, `显示 ${runs.length} / ${runs.length} 条`),
+    ]);
+    filterBar.addEventListener("input", filterOutsourceRuns);
+    filterBar.addEventListener("change", filterOutsourceRuns);
+    wrap.appendChild(filterBar);
+
+    // 空状态提示（过滤后 0 条时显示）
+    const emptyHint = el("div", { class: "runs-empty", hidden: true }, [
+      emptyState("无匹配的执行记录", "试试调整搜索词或筛选条件。"),
+    ]);
+    wrap.appendChild(emptyHint);
+
+    const tbl = el("table", { class: "runs-table", id: "outsource__table" });
+    tbl.appendChild(el("thead", {}, [
+      el("tr", {}, [
+        el("th", {}, "状态"),
+        el("th", {}, "Profile"),
+        el("th", {}, "派活方"),
+        el("th", {}, "耗时"),
+        el("th", {}, "任务长度"),
+        el("th", {}, "任务 / 摘要"),
+        el("th", {}, "更新"),
+      ]),
+    ]));
+    const tbody = el("tbody");
+    for (const r of runs) {
+      const tr = el("tr", {
+        class: "runs-row",
+        "data-run-id": r.runId || "",
+        "data-profile": r.profile || "",
+        "data-status": r.status || "",
+        "data-search-blob": [r.runId, r.groupId, r.requestedBy, r.taskPreview, r.summary, r.project, r.profile].filter(Boolean).join(" ").toLowerCase(),
+        tabindex: "0",
+        title: `runId: ${r.runId || "-"}${r.groupId ? " · group: " + r.groupId : ""}${r.project ? " · project: " + r.project : ""}`,
+      });
+      tr.appendChild(el("td", { class: "runs-row__status" }, statusPill(r.status)));
+      tr.appendChild(el("td", { class: "runs-row__profile" }, r.profile || "-"));
+      tr.appendChild(el("td", { class: "runs-row__requester" }, r.requestedBy || "-"));
+      tr.appendChild(el("td", { class: "mono runs-row__elapsed" }, r.elapsedMs != null ? fmtDurationMs(r.elapsedMs) : "-"));
+      tr.appendChild(el("td", { class: "mono outsource-run__task-length", title: "原始任务字符数" }, fmtTaskLength(r.taskLength)));
+      const taskText = (r.taskPreview || r.summary || r.error || "(无任务描述)").slice(0, 140);
+      tr.appendChild(el("td", { class: "runs-row__task" }, taskText));
+      tr.appendChild(el("td", { class: "runs-row__time muted mono" }, fmtRelative(r.updatedAt || r.finishedAt || r.startedAt || r.createdAt)));
+      tr.addEventListener("click", () => openOutsourceRunDrawer(r.runId));
+      tr.addEventListener("keydown", (e) => { if (e.key === "Enter") openOutsourceRunDrawer(r.runId); });
+      tbody.appendChild(tr);
+    }
+    tbl.appendChild(tbody);
+    wrap.appendChild(tbl);
+    return wrap;
+  }
+
+  function filterOutsourceRuns() {
+    const q = String($("#outsourceRunSearch")?.value || "").trim().toLowerCase();
+    const status = String($("#outsourceRunStatus")?.value || "");
+    const profile = String($("#outsourceRunProfile")?.value || "");
+    const rows = $$("#outsource__table .runs-row");
+    let visible = 0;
+    for (const row of rows) {
+      const blob = row.dataset.searchBlob || "";
+      const matchQ = !q || blob.includes(q);
+      const matchStatus = !status || row.dataset.status === status;
+      const matchProfile = !profile || row.dataset.profile === profile;
+      const show = matchQ && matchStatus && matchProfile;
+      row.hidden = !show;
+      if (show) visible++;
+    }
+    const count = $("#outsourceRunCount");
+    if (count) count.textContent = `显示 ${visible} / ${rows.length} 条`;
+    // 过滤后 0 条时显示空状态提示，隐藏表格
+    const table = $("#outsource__table");
+    const emptyHint = $(".runs-empty");
+    if (table) table.style.display = visible === 0 ? "none" : "";
+    if (emptyHint) emptyHint.hidden = visible !== 0;
+  }
+
+  // ---- 外包 Run 抽屉：消息流阅读体验 ----
+  async function openOutsourceRunDrawer(runId) {
+    const res = await api(`/api/outsource/runs/${encodeURIComponent(runId)}`);
+    if (!res.ok) { toast("加载 run 失败: " + (res.detail || ""), "error"); return; }
+    const run = res.data || {};
+    const events = Array.isArray(run.events) ? run.events : [];
+
+    // 元信息区
+    const metaRows = [];
+    if (run.profile) metaRows.push(["profile", el("span", { class: "mono" }, run.profile)]);
+    if (run.groupId) metaRows.push(["groupId", el("span", { class: "mono" }, run.groupId)]);
+    if (run.requestedBy) metaRows.push(["requestedBy", el("span", {}, run.requestedBy)]);
+    if (run.project) metaRows.push(["project", el("span", {}, run.project)]);
+    if (run.model) metaRows.push(["model", el("span", { class: "mono" }, run.model)]);
+    if (run.createdAt) metaRows.push(["createdAt", el("span", { class: "mono" }, run.createdAt)]);
+    if (run.startedAt) metaRows.push(["startedAt", el("span", { class: "mono" }, run.startedAt)]);
+    if (run.finishedAt) metaRows.push(["finishedAt", el("span", { class: "mono" }, run.finishedAt)]);
+    if (run.elapsedMs != null) metaRows.push(["elapsed", el("span", { class: "mono" }, fmtDurationMs(run.elapsedMs))]);
+    if (run.taskLength != null) metaRows.push(["任务长度", el("span", { class: "mono outsource-run__task-length" }, fmtTaskLength(run.taskLength))]);
+    if (run.jobId) metaRows.push(["jobId", el("span", { class: "mono" }, run.jobId)]);
+
+    const metaDl = el("dl", { class: "outsource-run__meta" });
+    for (const [dt, dd] of metaRows) {
+      metaDl.appendChild(el("dt", {}, dt));
+      metaDl.appendChild(el("dd", {}, dd));
+    }
+
+    // 构建消息流
+    const messageFlow = buildOutsourceMessageFlow(run, events);
+
+    // 技术事件折叠区（thinking + 原始 events）
+    const techSection = buildOutsourceTechSection(run, events);
+
+    // Error 区
+    let errorSection = null;
+    if (run.error) {
+      errorSection = el("section", { class: "outsource-run__error-section" }, [
+        cardHead("错误", null),
+        el("pre", { class: "outsource-run__error" }, run.error),
+      ]);
+    }
+
+    // Usage 折叠
+    let usageSection = null;
+    if (run.usage) {
+      usageSection = el("details", { class: "outsource-run__usage" }, [
+        el("summary", { class: "outsource-run__usage-summary" }, "Token 使用情况"),
+        el("pre", { class: "outsource-run__usage-body mono" }, JSON.stringify(run.usage, null, 2)),
+      ]);
+    }
+
+    const body = el("div", { class: "outsource-run outsource-run--detail" }, [
+      el("header", { class: "outsource-run__head" }, [
+        el("div", { class: "outsource-run__head-main" }, [
+          el("h2", { class: "outsource-run__title" }, run.runId || "-"),
+          statusPill(run.status),
+        ]),
+      ]),
+      metaDl,
+      messageFlow,
+      errorSection,
+      techSection,
+      usageSection,
+    ].filter(Boolean));
+
+    openDrawer(body, { eyebrow: "RUN", title: run.runId || runId });
+  }
+
+  // 构建消息流：task 作为派活方消息，连续 text chunk 聚合成外包回复，tool 调用独立卡片
+  function buildOutsourceMessageFlow(run, events) {
+    const container = el("div", { class: "outsource-msgflow" });
+
+    // 1) 派活方消息（task）
+    if (run.task) {
+      const taskCard = el("div", { class: "outsource-msg outsource-msg--task" }, [
+        el("div", { class: "outsource-msg__head" }, [
+          el("span", { class: "outsource-msg__role" }, run.requestedBy || "派活方"),
+          el("span", { class: "outsource-msg__tag" }, "任务"),
+          run.createdAt ? el("span", { class: "outsource-msg__time muted mono" }, fmtTime(run.createdAt)) : null,
+        ]),
+        el("div", { class: "outsource-msg__body" }, [mdNode(run.task)]),
+      ]);
+      container.appendChild(taskCard);
+    }
+
+    // 2) 完成时优先展示 fullOutput，否则 summary/result fallback
+    const finalOutput = run.fullOutput || run.summary || (run.result && typeof run.result === "string" ? run.result : null);
+    const hasFinalOutput = finalOutput && String(finalOutput).trim().length > 0;
+
+    // 3) 从 events 中提取外包回复（聚合连续 text）和工具调用
+    const { replyBlocks, toolCalls } = parseOutsourceEvents(events);
+
+    // 如果有 finalOutput，用它作为最终回复（不重复展示 events 里的 text 碎片）
+    if (hasFinalOutput) {
+      const replyCard = el("div", { class: "outsource-msg outsource-msg--reply" }, [
+        el("div", { class: "outsource-msg__head" }, [
+          el("span", { class: "outsource-msg__role" }, run.profile || "外包"),
+          el("span", { class: "outsource-msg__tag outsource-msg__tag--done" }, "完成"),
+          run.finishedAt ? el("span", { class: "outsource-msg__time muted mono" }, fmtTime(run.finishedAt)) : null,
+        ]),
+        el("div", { class: "outsource-msg__body" }, [mdNode(finalOutput)]),
+      ]);
+      container.appendChild(replyCard);
+    } else if (replyBlocks.length > 0) {
+      for (const block of replyBlocks) {
+        const replyCard = el("div", { class: "outsource-msg outsource-msg--reply" }, [
+          el("div", { class: "outsource-msg__head" }, [
+            el("span", { class: "outsource-msg__role" }, run.profile || "外包"),
+            el("span", { class: "outsource-msg__tag" }, "回复"),
+            block.time ? el("span", { class: "outsource-msg__time muted mono" }, fmtTime(block.time)) : null,
+          ]),
+          el("div", { class: "outsource-msg__body" }, [mdNode(block.text)]),
+        ]);
+        container.appendChild(replyCard);
+      }
+    } else if (run.status === "running" || run.status === "queued") {
+      // 运行中但还没有 text 输出
+      const pendingCard = el("div", { class: "outsource-msg outsource-msg--pending" }, [
+        el("div", { class: "outsource-msg__body" }, [
+          el("span", { class: "outsource-msg__pending-dot" }, "●"),
+          el("span", { class: "muted" }, run.status === "queued" ? "等待执行…" : "执行中，等待输出…"),
+        ]),
+      ]);
+      container.appendChild(pendingCard);
+    }
+
+    // 4) 工具调用卡片（如果有 finalOutput 且工具调用在 events 里，仍展示工具调用但放进技术区折叠）
+    if (toolCalls.length > 0 && !hasFinalOutput) {
+      for (const tc of toolCalls) {
+        container.appendChild(buildToolCallCard(tc));
+      }
+    }
+
+    // 如果容器为空（没有 task 也没有 events），给一个提示
+    if (!container.children.length) {
+      container.appendChild(el("div", { class: "muted" }, "暂无消息内容。"));
+    }
+
+    return el("section", { class: "outsource-run__messages" }, [
+      cardHead("任务消息", "像消息流一样阅读派活与外包回复"),
+      container,
+    ]);
+  }
+
+  // 解析 events：聚合连续 text chunk，提取工具调用
+  function parseOutsourceEvents(events) {
+    const replyBlocks = [];
+    const toolCalls = [];
+    let currentText = null;
+    let currentTool = null;
+
+    const flushText = () => {
+      if (currentText && currentText.text.trim()) {
+        replyBlocks.push(currentText);
+      }
+      currentText = null;
+    };
+    const flushTool = () => {
+      if (currentTool && (currentTool.input || currentTool.output || currentTool.name)) {
+        toolCalls.push(currentTool);
+      }
+      currentTool = null;
+    };
+
+    for (const ev of events || []) {
+      const streamType = ev.streamType || ev.type || "";
+      const time = ev.createdAt || ev.time || ev.timestamp;
+
+      if (streamType === "text" || (streamType === "" && ev.text && !ev.toolName)) {
+        // 连续 text 聚合
+        const chunk = ev.text || ev.content || ev.message || "";
+        if (!chunk) continue;
+        if (currentText) {
+          currentText.text += chunk;
+          currentText.time = time || currentText.time;
+        } else {
+          currentText = { text: chunk, time };
+        }
+      } else if (streamType === "tool_start" || streamType === "tool_call" || ev.type === "tool_start") {
+        flushText();
+        if (currentTool) flushTool();
+        currentTool = {
+          name: ev.toolName || ev.name || ev.tool || "?",
+          input: ev.input || ev.args || ev.text || "",
+          output: "",
+          status: "running",
+          time,
+        };
+      } else if (streamType === "tool_output" || ev.type === "tool_output") {
+        if (currentTool) {
+          currentTool.output += (ev.output || ev.text || ev.content || "");
+          currentTool.time = time || currentTool.time;
+        }
+      } else if (streamType === "tool_end" || ev.type === "tool_end") {
+        if (currentTool) {
+          currentTool.status = (ev.error || ev.isError) ? "error" : "done";
+          if (ev.output && !currentTool.output) currentTool.output = ev.output;
+          currentTool.time = time || currentTool.time;
+          flushTool();
+        }
+      } else if (streamType === "thinking" || ev.type === "thinking") {
+        // thinking 不放进消息流，放进技术事件区
+        flushText();
+      }
+      // 其他事件类型忽略（done / error / started 等状态事件）
+    }
+    flushText();
+    if (currentTool) flushTool();
+
+    return { replyBlocks, toolCalls };
+  }
+
+  // 工具调用卡片
+  function buildToolCallCard(tc) {
+    const statusClass = tc.status === "error" ? "tool-call--error" : tc.status === "running" ? "tool-call--running" : "";
+    const card = el("div", { class: `tool-call ${statusClass}` }, [
+      el("div", { class: "tool-call__head" }, [
+        el("span", { class: "tool-call__icon" }, tc.status === "error" ? "⚠" : "⚙"),
+        el("span", { class: "tool-call__name mono" }, tc.name),
+        el("span", { class: `tool-call__status pill pill--${tc.status === "error" ? "failed" : tc.status === "running" ? "running" : "done"}` },
+          tc.status === "error" ? "失败" : tc.status === "running" ? "执行中" : "完成"
+        ),
+      ]),
+    ]);
+    if (tc.input) {
+      const inputDetails = el("details", { class: "tool-call__input" }, [
+        el("summary", {}, "输入"),
+        el("pre", { class: "tool-call__pre" }, typeof tc.input === "string" ? tc.input : JSON.stringify(tc.input, null, 2)),
+      ]);
+      card.appendChild(inputDetails);
+    }
+    if (tc.output) {
+      const outputDetails = el("details", { class: "tool-call__output" }, [
+        el("summary", {}, "输出"),
+        el("pre", { class: "tool-call__pre" }, typeof tc.output === "string" ? tc.output : JSON.stringify(tc.output, null, 2)),
+      ]);
+      card.appendChild(outputDetails);
+    }
+    return card;
+  }
+
+  // 构建技术事件折叠区（thinking + 原始 events 列表 + 工具调用详情）
+  function buildOutsourceTechSection(run, events) {
+    const thinkingEvents = (events || []).filter((e) =>
+      (e.streamType === "thinking" || e.type === "thinking") && (e.text || e.content || e.message)
+    );
+    const { toolCalls } = parseOutsourceEvents(events);
+    const hasFinalOutput = run.fullOutput || run.summary;
+
+    // 如果有 finalOutput，工具调用放这里；否则放消息流里
+    const showToolsHere = hasFinalOutput && toolCalls.length > 0;
+    const showThinking = thinkingEvents.length > 0;
+    const showRawEvents = (events || []).length > 0 && (showThinking || toolCalls.length > 0);
+
+    if (!showThinking && !showToolsHere && !showRawEvents) return null;
+
+    const details = el("details", { class: "outsource-tech" });
+    const summary = el("summary", { class: "outsource-tech__summary" }, [
+      el("span", { class: "outsource-tech__icon" }, "⚙"),
+      el("span", {}, "推理过程 / 技术事件"),
+      el("span", { class: "outsource-tech__count muted" }, `(${(events || []).length} 条事件)`),
+    ]);
+    details.appendChild(summary);
+
+    const body = el("div", { class: "outsource-tech__body" });
+
+    // Thinking 聚合
+    if (showThinking) {
+      let thinkingText = "";
+      for (const t of thinkingEvents) {
+        thinkingText += (t.text || t.content || t.message || "") + "\n";
+      }
+      const thinkingLimit = 50_000;
+      const thinkingTruncated = thinkingText.length > thinkingLimit;
+      if (thinkingTruncated) thinkingText = thinkingText.slice(-thinkingLimit);
+      body.appendChild(el("div", { class: "outsource-tech__block" }, [
+        el("div", { class: "outsource-tech__label" }, "推理过程 (thinking)"),
+        thinkingTruncated
+          ? el("p", { class: "outsource-tech__notice" }, `内容较长，仅展示最后 ${thinkingLimit.toLocaleString()} 个字符。`)
+          : null,
+        el("pre", { class: "outsource-tech__pre" }, thinkingText.trim() || "(空)"),
+      ]));
+    }
+
+    // 工具调用（当有 finalOutput 时放这里）
+    if (showToolsHere) {
+      const toolsWrap = el("div", { class: "outsource-tech__block" }, [
+        el("div", { class: "outsource-tech__label" }, `工具调用 (${toolCalls.length})`),
+      ]);
+      for (const tc of toolCalls) {
+        toolsWrap.appendChild(buildToolCallCard(tc));
+      }
+      body.appendChild(toolsWrap);
+    }
+
+    // 原始事件时间线（紧凑）
+    if (showRawEvents) {
+      const timelineWrap = el("div", { class: "outsource-tech__block" }, [
+        el("div", { class: "outsource-tech__label" }, "原始事件流"),
+      ]);
+      const list = el("ol", { class: "outsource-tech__timeline" });
+      const eventLimit = 200;
+      const visibleEvents = (events || []).slice(-eventLimit);
+      if ((events || []).length > eventLimit) {
+        timelineWrap.appendChild(el("p", { class: "outsource-tech__notice" }, `事件较多，仅展示最后 ${eventLimit} 条。`));
+      }
+      for (const ev of visibleEvents) {
+        const evType = ev.streamType || ev.type || "event";
+        const evText = ev.text || ev.message || ev.summary || ev.error || (ev.toolName ? ev.toolName : "") || "";
+        const evTime = ev.createdAt || ev.time || ev.timestamp || "";
+        list.appendChild(el("li", { class: `outsource-tech__event outsource-tech__event--${evType}` }, [
+          el("span", { class: "outsource-tech__event-type mono" }, evType),
+          evTime ? el("span", { class: "outsource-tech__event-time muted mono" }, fmtTime(evTime)) : null,
+          el("span", { class: "outsource-tech__event-text" }, String(evText).slice(0, 200)),
+        ]));
+      }
+      timelineWrap.appendChild(list);
+      body.appendChild(timelineWrap);
+    }
+
+    // result JSON（如果有且不是字符串）
+    if (run.result && typeof run.result === "object") {
+      body.appendChild(el("div", { class: "outsource-tech__block" }, [
+        el("div", { class: "outsource-tech__label" }, "Result (JSON)"),
+        el("pre", { class: "outsource-tech__pre" }, JSON.stringify(run.result, null, 2)),
+      ]));
+    }
+
+    details.appendChild(body);
+    return el("section", { class: "outsource-run__tech" }, [details]);
+  }
+
+  // ---- 通用抽屉打开函数 ----
+  function openDrawer(contentNode, opts = {}) {
+    const drawer = $("#drawer");
+    if (!drawer) return;
+    const eyebrow = opts.eyebrow || "DETAIL";
+    const title = opts.title || "详情";
+    $("#drawerEyebrow").textContent = eyebrow;
+    $("#drawerTitle").textContent = title;
+    const bodyEl = $("#drawerBody");
+    bodyEl.innerHTML = "";
+    bodyEl.appendChild(contentNode);
+    drawer.classList.add(DRAWER_OPEN_CLASS);
+    drawer.setAttribute("aria-hidden", "false");
+  }
+
   function renderWorkers(workers) {
     const main = $("#main");
     main.innerHTML = "";
@@ -930,65 +1859,100 @@
     // 初次渲染时，根据当前 URL 选中的 worker 高亮 active card
     const initialWorker = decodeURIComponent((location.hash.split("?")[0].split("/")[2] || ""));
 
+    // 最近交互靠前 · 已读只清 badge，不改变 lastInteractionAt，因此不会让员工掉下去。
+    const sortedWorkers = [...workers].sort((a, b) => {
+      const la = a.lastInteractionAt ? new Date(a.lastInteractionAt).getTime() : 0;
+      const lb = b.lastInteractionAt ? new Date(b.lastInteractionAt).getTime() : 0;
+      if (lb !== la) return lb - la;
+      return (a.name || "").localeCompare(b.name || "", "zh-Hans-CN");
+    });
+
     const split = el("section", { class: "workers" }, [
-      el("aside", { class: "workers__list" },
-        workers.map((w) => el("a", {
-          class: `worker-card${w.status === "vacation" ? " worker-card--vacation" : ""}${w.name === initialWorker ? " worker-card--active" : ""}`,
-          href: `#/workers/${encodeURIComponent(w.name)}`,
-          data: { name: w.name },
-          onclick: (e) => {
-            // 拦截：只更新 detail + active class，不重渲染整个 main
-            e.preventDefault();
-            navigateToWorker(w.name);
-          },
-        }, [
-          el("div", { class: `avatar avatar--${w.status || "idle"}${w.status === "vacation" ? " avatar--vacation" : ""}` }, [el("span", { class: "avatar__char", text: (w.name || "?").slice(0, 1) })]),
-          el("div", { class: "worker-card__body" }, [
-            el("div", { class: "worker-card__name" }, [
-              workerStatusDot(w.status),
-              el("span", { text: w.name }),
-              w.status === "vacation" ? el("span", { class: "worker-card__vacation-badge", text: "🏖 休假" }) : null,
+      el("aside", { class: "workers__list" }, [
+        el("div", { class: "workers__search" }, [
+          el("input", {
+            class: "input workers__search-input",
+            type: "search",
+            id: "workerSearch",
+            placeholder: "搜索员工名（中文/英文）…",
+            oninput: (e) => scheduleWorkerCardsFilter(e.target.value),
+            onkeydown: (e) => {
+              if (e.key === "Escape") {
+                e.target.value = "";
+                if (workerSearchDebounceTimer) clearTimeout(workerSearchDebounceTimer);
+                workerSearchDebounceTimer = null;
+                filterWorkerCards("");
+              }
+            },
+          }),
+          el("span", { class: "muted workers__search-count", id: "workerSearchCount" }),
+        ]),
+        ...sortedWorkers.map((w) => {
+          const unread = Number(w.unreadCount || 0);
+          const hasUnread = unread > 0;
+          const status = w.status || "idle";
+          return el("a", {
+            class: `worker-card${status === "vacation" ? " worker-card--vacation" : ""}${w.name === initialWorker ? " worker-card--active" : ""}${hasUnread ? " worker-card--unread" : ""}`,
+            href: `#/workers/${encodeURIComponent(w.name)}`,
+            data: { name: w.name, role: w.role || "", model: w.model || "", unread, lastInteractionAt: w.lastInteractionAt || "" },
+            onclick: (e) => {
+              e.preventDefault();
+              navigateToWorker(w.name);
+            },
+          }, [
+            workerAvatarNode(w),
+            el("div", { class: "worker-card__body" }, [
+              el("div", { class: "worker-card__headline" }, [
+                el("span", { class: "worker-card__name", text: w.name }),
+                el("span", { class: `worker-card__status-dot dot dot--${status || "idle"}`, title: status || "idle" }),
+                status === "vacation" ? el("span", { class: "worker-card__vacation-badge", text: "休假" }) : null,
+              ]),
+              workerCardTalkPreviewNode(w),
             ]),
-            el("div", { class: "worker-card__meta" }, [
-              el("span", { text: STATUS_LABELS[w.status] || w.status || "idle" }),
-              w.role ? el("span", { text: `· ${w.role}` }) : null,
+            el("div", { class: "worker-card__aside" }, [
+              hasUnread ? el("span", {
+                class: "worker-card__badge worker-card__badge--unread",
+                text: unread > 99 ? "99+" : String(unread),
+                title: unreadBadgeTitle(w),
+              }) : null,
             ]),
-            w.responsibility ? el("div", { class: "worker-card__meta", text: w.responsibility.split("\n")[0] }) : null,
-            el("div", { class: "worker-card__stats" }, [
-              el("span", { text: `Jobs ${w.jobCount}` }),
-              el("span", { text: `Tok ${fmtNumber(w.tokenToday?.totalWithCached || 0)}` }),
-              el("span", { text: `消息 ${w.unreadMessages || 0}` }),
-            ]),
-          ]),
-        ]))),
+          ]);
+        }),
+      ]),
       el("div", { class: "workers__detail", id: "workerDetail" }, [
         emptyState("选择左侧员工查看详情"),
       ]),
     ]);
     wrap.appendChild(split);
     main.appendChild(wrap);
+    // 初始化搜索计数
+    queueMicrotask(() => filterWorkerCards(""));
   }
 
 // 和 TA 对话 · Web 版 /talk 员工名
-  // 限制：text 发送后，服务端调 jobs.mjs.createJob(kind:"talk") 创建 job。
-  // Pi 主进程内 workerJobQueues 不会主动拾取 web 创建的 job 文件；
-  // 依赖秘书/主 agent 读 messages.jsonl 后用 /talk 内核正式起活。
-  // 这里只要 UI：输入 → 看已发 → 默认一次拉、看响应 → 「刷新」重拉
-  function buildTalkPanel(worker, d) {
+  // 后端走 web-talk 流程：POST /api/talk → createWebTalkRequest (pending)，
+  // Pi 主进程接管后转为 accepted (创建 talk job)、done / failed / cancelled。
+  // 前端轮询 /api/talk-requests/:id 看状态；点开抽屉默认会调 /api/jobs/:id (后端会标已读)。
+  function buildTalkPanel(worker, d, initialJobs = []) {
+    STATE.talkMode = STATE.talkMode || "auto";
     const card = el("div", { class: "card talk-panel" });
     const head = el("div", { class: "card__head" });
     head.appendChild(el("h3", { class: "card__title", text: `和 ${worker} 对话` }));
-    head.appendChild(el("p", { class: "card__sub", text: "Web 版 /talk · 提交到 Pi 主进程，由主进程走正常 talk 调度：空闲马上开始，忙碌自动排队。", }));
+    head.appendChild(el("p", { class: "card__sub", text: "Web 版 /talk · 提交 web-talk 请求，Pi 主进程接管后走正常 talk 调度。", }));
     card.appendChild(head);
 
-    // 状态条：显示后台进程是否能拾起
+    // 状态条：员工元信息 + 未读气泡
     const status = d.status || "idle";
-    card.appendChild(el("div", { class: "talk-panel__meta" }, [
+    const metaChildren = [
       el("span", { class: `tag tag--${status === "busy" ? "main" : "soft"}`, text: `状态：${status}` }),
       d.backend ? el("span", { class: "tag tag--soft", text: `backend: ${d.backend}` }) : null,
       d.model ? el("span", { class: "tag tag--soft", text: `model: ${d.model}` }) : null,
       d.thinking ? el("span", { class: "tag tag--soft", text: `thinking: ${d.thinking}` }) : null,
-    ]));
+    ];
+    if (d.unreadCount && d.unreadCount > 0) {
+      metaChildren.push(el("span", { class: "talk-panel__badge", text: `${d.unreadCount} 条未读` }));
+    }
+    card.appendChild(el("div", { class: "talk-panel__meta" }, metaChildren));
 
     // 输入区
     const textarea = el("textarea", {
@@ -1004,11 +1968,23 @@
       text: "发送",
       disabled: false,
     });
-    const hint = el("p", { class: "muted talk-panel__hint", html: md("发送后会生成 web-talk 请求；Pi 主进程接管后才会创建真实 talk job。若刚升级代码，请 reload Pi。", { compact: true, max: 200 }) });
+    const modeSel = el("select", {
+      class: "input talk-panel__mode",
+      id: `talkMode-${worker}`,
+      onchange: (e) => { STATE.talkMode = e.target.value; },
+    }, [
+      el("option", { value: "auto",  text: "自动 (auto)",  ...(STATE.talkMode === "auto"  ? { selected: "selected" } : {}) }),
+      el("option", { value: "queue", text: "排队 (queue)", ...(STATE.talkMode === "queue" ? { selected: "selected" } : {}) }),
+      el("option", { value: "steer", text: "插队 (steer)", ...(STATE.talkMode === "steer" ? { selected: "selected" } : {}) }),
+    ]);
+    const hint = el("p", { class: "muted talk-panel__hint", html: md("**auto** 空闲马上起、忙碌排队 · **queue** 强制排队 · **steer** 优先插入 Codex active turn。", { compact: true, max: 240 }) });
 
     // 提示：API 调用状态
     const feedback = el("div", { class: "talk-panel__feedback", id: `talkFeedback-${worker}` });
-    const sendRow = el("div", { class: "talk-panel__row" }, [textarea, el("div", { class: "talk-panel__actions" }, [sendBtn, feedback])]);
+    const sendRow = el("div", { class: "talk-panel__row" }, [
+      textarea,
+      el("div", { class: "talk-panel__actions" }, [modeSel, sendBtn, feedback]),
+    ]);
     card.appendChild(sendRow);
     card.appendChild(hint);
 
@@ -1024,10 +2000,11 @@
       sendBtn.textContent = "发送中…";
       feedback.textContent = "";
       feedback.className = "talk-panel__feedback";
+      const mode = document.getElementById(`talkMode-${worker}`)?.value || "auto";
       const res = await api(`/api/talk/${encodeURIComponent(worker)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: msg }),
+        body: JSON.stringify({ message: msg, mode }),
       });
       sendBtn.disabled = false;
       sendBtn.textContent = "发送";
@@ -1037,11 +2014,13 @@
         return;
       }
       const requestId = res.data?.request?.id;
+      const deliveryMode = res.data?.request?.mode;
       feedback.textContent = requestId
-        ? `✓ 已提交 · request ${requestId.slice(-6)}，等待 Pi 主进程接管…`
+        ? `✓ 已提交 · request ${requestId.slice(-6)} · mode=${deliveryMode}，等待 Pi 主进程接管…`
         : "✓ 已提交，等待 Pi 主进程接管…";
       feedback.className = "talk-panel__feedback talk-panel__feedback--ok";
       textarea.value = "";
+      void refreshWorkerUnreadBadges();
       if (requestId) await waitTalkRequest(worker, requestId, feedback);
       await reloadTalkHistory(worker);
     };
@@ -1050,8 +2029,8 @@
       if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); send(); }
     });
 
-    // 首次加载历史
-    queueMicrotask(() => reloadTalkHistory(worker));
+    // 首次加载历史：复用 /api/workers/:name 已带回的 jobs / pending requests，避免点击员工后重复读。
+    queueMicrotask(() => renderTalkHistory(worker, initialJobs, d.talkRequests || []));
     return card;
   }
 
@@ -1064,6 +2043,7 @@
       if (request.status === "accepted") {
         feedback.textContent = `✓ 已接入 talk · job ${request.jobId || "—"}${request.deliveryMode ? ` · ${request.deliveryMode}` : ""}`;
         feedback.className = "talk-panel__feedback talk-panel__feedback--ok";
+        void refreshWorkerUnreadBadges();
         await reloadTalkHistory(worker);
         return;
       }
@@ -1077,28 +2057,217 @@
     feedback.className = "talk-panel__feedback";
   }
 
+  function talkRequestSortTime(request) {
+    return request?.updatedAt || request?.editedAt || request?.acceptedAt || request?.cancelledAt || request?.failedAt || request?.claimedAt || request?.createdAt || "";
+  }
+
+  function shouldShowTalkRequest(request, jobsById) {
+    const status = String(request?.status || "");
+    if (!request?.id) return false;
+    if (status === "accepted" && request.jobId && jobsById.has(request.jobId)) return false;
+    return ["pending", "processing", "accepted", "failed", "cancelled"].includes(status);
+  }
+
+  function isEditableQueuedJob(job) {
+    return Boolean(job?.id) && String(job.status || "") === "queued";
+  }
+
+  function renderTalkJobItem(worker, j) {
+    const queued = isEditableQueuedJob(j);
+    return el("li", { class: "talk-list__item talk-list__item--job" }, [
+      el("div", { class: "talk-list__head" }, [
+        statusPill(j.status),
+        el("span", { class: "talk-list__id", text: (j.id || "").slice(-6) }),
+        el("span", { class: "talk-list__time", text: fmtRelative(j.updatedAt || j.createdAt) }),
+        el("div", { class: "talk-list__actions" }, [
+          el("button", { class: "btn btn--ghost talk-list__btn", type: "button", text: "查看", onclick: () => openJobDrawer(j.id) }),
+          queued ? el("button", {
+            class: "btn btn--ghost talk-list__btn",
+            type: "button",
+            text: "编辑",
+            onclick: () => editQueuedTalkJobFromList(worker, j),
+          }) : null,
+          isCancellableJob(j) ? el("button", {
+            class: "btn btn--danger talk-list__btn",
+            type: "button",
+            text: queued ? "取消" : "停止",
+            onclick: (e) => stopTalkJobFromList(worker, j.id, e.currentTarget, { queued }),
+          }) : null,
+        ]),
+      ]),
+      (j.assignedBy || j.source) ? el("div", { class: "talk-list__meta", text: [j.assignedBy ? `指派: ${j.assignedBy}` : "", j.source ? `来源: ${j.source}` : ""].filter(Boolean).join(" · ") }) : null,
+      el("div", { class: "talk-list__task", text: j.task || "" }),
+    ]);
+  }
+
+  function renderTalkRequestItem(worker, request) {
+    const mode = request.deliveryMode || request.mode || "auto";
+    const status = String(request.status || "pending");
+    const pending = status === "pending";
+    const actions = [];
+    if (pending) {
+      actions.push(el("button", {
+        class: "btn btn--ghost talk-list__btn",
+        type: "button",
+        text: "编辑",
+        onclick: () => editTalkRequestFromList(worker, request),
+      }));
+      actions.push(el("button", {
+        class: "btn btn--danger talk-list__btn",
+        type: "button",
+        text: "取消",
+        onclick: (e) => cancelTalkRequestFromList(worker, request, e.currentTarget),
+      }));
+    } else if (request.jobId) {
+      actions.push(el("button", {
+        class: "btn btn--ghost talk-list__btn",
+        type: "button",
+        text: "查看",
+        onclick: () => openJobDrawer(request.jobId),
+      }));
+    }
+    return el("li", { class: "talk-list__item talk-list__item--request" }, [
+      el("div", { class: "talk-list__head" }, [
+        statusPill(status),
+        el("span", { class: "talk-list__id", text: (request.id || "").slice(-6) }),
+        el("span", { class: "talk-list__time", text: fmtRelative(talkRequestSortTime(request)) }),
+        actions.length ? el("div", { class: "talk-list__actions" }, actions) : null,
+      ]),
+      el("div", {
+        class: "talk-list__meta",
+        text: [
+          `请求: ${mode}`,
+          request.jobId ? `job: ${String(request.jobId).slice(-6)}` : "",
+          pending ? "未接管前可编辑/取消" : "",
+          status === "accepted" ? "已生效后只跟随 job 控制" : "",
+          request.error ? `错误: ${request.error}` : "",
+        ].filter(Boolean).join(" · "),
+      }),
+      el("div", { class: "talk-list__task", text: request.message || "" }),
+    ]);
+  }
+
+  function renderTalkHistory(worker, jobs = [], requests = []) {
+    const box = document.getElementById(`talkHistory-${worker}`);
+    if (!box) return;
+    const talkJobs = (jobs || []).filter((j) => j.project === "talk" || j.kind === "talk" || j.displayChannel === "talk");
+    const jobsById = new Map(talkJobs.filter((j) => j.id).map((j) => [j.id, j]));
+    const talkRequests = (requests || []).filter((request) => shouldShowTalkRequest(request, jobsById));
+    const items = [
+      ...talkJobs.map((job) => ({ type: "job", at: job.updatedAt || job.createdAt || "", job })),
+      ...talkRequests.map((request) => ({ type: "request", at: talkRequestSortTime(request), request })),
+    ].sort((a, b) => String(b.at || "").localeCompare(String(a.at || ""))).slice(0, 40);
+    box.innerHTML = "";
+    if (!items.length) { box.appendChild(el("p", { class: "muted", text: "暂无对话记录。发第一条消息试试。", })); return; }
+    // 最新在上面
+    const list = el("ul", { class: "talk-list" }, items.map((item) =>
+      item.type === "job" ? renderTalkJobItem(worker, item.job) : renderTalkRequestItem(worker, item.request),
+    ));
+    box.appendChild(list);
+  }
+
   async function reloadTalkHistory(worker) {
     const box = document.getElementById(`talkHistory-${worker}`);
     if (!box) return;
-    const res = await api(`/api/jobs?worker=${encodeURIComponent(worker)}&limit=20`);
-    if (!res.ok) { box.innerHTML = ""; box.appendChild(errorBox("加载对话历史失败", res.detail)); return; }
-    const jobs = (res.data.jobs || []).filter((j) => j.project === "talk");
-    box.innerHTML = "";
-    if (!jobs.length) { box.appendChild(el("p", { class: "muted", text: "暂无对话记录。发第一条消息试试。", })); return; }
-    // 最新在上面
-    const list = el("ul", { class: "talk-list" }, jobs.map((j) => {
-      const li = el("li", { class: "talk-list__item" }, [
-        el("div", { class: "talk-list__head" }, [
-          statusPill(j.status),
-          el("span", { class: "talk-list__id", text: (j.id || "").slice(-6) }),
-          el("span", { class: "talk-list__time", text: fmtRelative(j.updatedAt || j.createdAt) }),
-          el("button", { class: "btn btn--ghost talk-list__btn", type: "button", text: "查看", onclick: () => openJobDrawer(j.id) }),
-        ]),
-        el("div", { class: "talk-list__task", text: j.task || "" }),
-      ]);
-      return li;
-    }));
-    box.appendChild(list);
+    const [jobsRes, requestsRes] = await Promise.all([
+      api(`/api/jobs?worker=${encodeURIComponent(worker)}&limit=20`),
+      api(`/api/talk-requests?worker=${encodeURIComponent(worker)}&limit=20`),
+    ]);
+    if (!jobsRes.ok) { box.innerHTML = ""; box.appendChild(errorBox("加载对话历史失败", jobsRes.detail)); return; }
+    if (!requestsRes.ok) toast("加载 talk 请求状态失败，仅展示 job", "error");
+    renderTalkHistory(worker, jobsRes.data.jobs || [], requestsRes.ok ? (requestsRes.data.requests || []) : []);
+  }
+
+  async function stopTalkJobFromList(worker, jobId, button, options = {}) {
+    if (!jobId) return;
+    const queued = Boolean(options.queued);
+    if (!window.confirm(`确定要${queued ? "取消排队中的" : "停止"} job ${jobId} 吗？`)) return;
+    if (button) button.disabled = true;
+    const res = await api(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ from: "web", reason: queued ? "用户通过 Web talk 列表取消排队 job" : "用户通过 Web talk 列表停止 job" }),
+    });
+    if (!res.ok) {
+      if (button) button.disabled = false;
+      toast("停止 job 失败", "error");
+      return;
+    }
+    toast("停止请求已提交", "success");
+    await reloadTalkHistory(worker);
+    if (STATE.currentPage === "jobs") await loadJobs();
+  }
+
+  async function editQueuedTalkJobFromList(worker, job) {
+    if (!isEditableQueuedJob(job)) {
+      toast("只有排队中的 job 可编辑", "error");
+      return;
+    }
+    const message = window.prompt("编辑排队中的任务内容", job.task || "");
+    if (message == null) return;
+    const nextMessage = String(message || "").trim();
+    if (!nextMessage) {
+      toast("任务不能为空", "error");
+      return;
+    }
+    const res = await api(`/api/jobs/${encodeURIComponent(job.id)}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ from: "web", message: nextMessage }),
+    });
+    if (!res.ok) {
+      toast("编辑排队 job 失败", "error");
+      return;
+    }
+    toast("编辑请求已提交", "success");
+    await reloadTalkHistory(worker);
+    if (STATE.currentPage === "jobs") await loadJobs();
+  }
+
+  async function editTalkRequestFromList(worker, request) {
+    if (!request?.id || request.status !== "pending") {
+      toast("只有待接管请求可编辑", "error");
+      return;
+    }
+    const message = window.prompt("编辑待发送给员工的消息", request.message || "");
+    if (message == null) return;
+    const nextMessage = String(message || "").trim();
+    if (!nextMessage) {
+      toast("消息不能为空", "error");
+      return;
+    }
+    const res = await api(`/api/talk-requests/${encodeURIComponent(request.id)}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ from: "web", message: nextMessage, mode: request.mode || request.deliveryMode || "auto" }),
+    });
+    if (!res.ok) {
+      toast("编辑请求失败", "error");
+      return;
+    }
+    toast("请求已更新", "success");
+    await reloadTalkHistory(worker);
+  }
+
+  async function cancelTalkRequestFromList(worker, request, button) {
+    if (!request?.id || request.status !== "pending") {
+      toast("只有待接管请求可取消", "error");
+      return;
+    }
+    if (!window.confirm(`确定取消这条 ${request.mode || "talk"} 请求吗？`)) return;
+    if (button) button.disabled = true;
+    const res = await api(`/api/talk-requests/${encodeURIComponent(request.id)}/cancel`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ from: "web", reason: "用户通过 Web talk 列表取消待接管请求" }),
+    });
+    if (!res.ok) {
+      if (button) button.disabled = false;
+      toast("取消请求失败", "error");
+      return;
+    }
+    toast("请求已取消", "success");
+    await reloadTalkHistory(worker);
   }
 
   async function renderWorkerDetail(name) {
@@ -1115,13 +2284,34 @@
       return;
     }
     const d = res.data;
+    const previousUnreadMessages = Number(d.unreadMessages || 0);
+    const previousUnreadJobUpdates = Number(d.unreadJobUpdates || 0);
+    const previousUnreadJobEvents = Number(d.unreadJobEvents || 0);
+    const hasUnreadForWorker = previousUnreadMessages > 0 || previousUnreadJobUpdates > 0 || previousUnreadJobEvents > 0;
+    if (hasUnreadForWorker) {
+      const marked = await markWorkerReadFromUi(name);
+      if (myId !== currentDetailId) return;
+      if (marked.ok) {
+        for (const message of d.inbox || []) {
+          if (message.from !== name && (message.to === name || message.to === "*")) message.read = true;
+        }
+        d.unreadMessages = 0;
+        d.unreadJobUpdates = 0;
+        d.unreadJobEvents = 0;
+        d.unreadCount = 0;
+        d.lastUnreadAt = null;
+        clearWorkerCardUnreadLocally(name);
+        void refreshWorkerUnreadBadges();
+      }
+    }
     target.innerHTML = "";
     const head = el("header", { class: "worker-detail__head" }, [
-      el("div", { class: `avatar avatar--lg${d.status === "vacation" ? " avatar--vacation" : ""}` }, [el("span", { class: "avatar__char", text: (d.name || "?").slice(0, 1) })]),
+      workerAvatarNode(d, { large: true }),
       el("div", { class: "worker-detail__title" }, [
         el("h2", {}, [
           d.status === "vacation" ? el("span", { class: "worker-card__vacation-badge", text: "🏖 休假" }) : null,
           el("span", { text: ` ${d.name}` }),
+          d.unreadCount > 0 ? el("span", { class: "worker-detail__unread-badge", text: `${d.unreadCount} 条未读` }) : null,
         ]),
         el("div", { class: "worker-detail__sub" }, [
           statusPill(d.status),
@@ -1134,10 +2324,8 @@
     ]);
     target.appendChild(head);
 
-        target.appendChild(head);
-
     // 和 TA 对话 · Web 版 /talk 员工名
-    target.appendChild(buildTalkPanel(name, d));
+    target.appendChild(buildTalkPanel(name, d, d.jobs || []));
 
     // 职责
     const responsibilities = d.responsibilities || [];
@@ -1176,11 +2364,11 @@
           ]),
     ]));
 
-    // 消息收件箱（每条消息默认折叠；点 header 展开看完整 markdown）
+    // 收件箱 / 发件（默认折叠；长内容不直接展开；支持 markdown）
     const inbox = d.inbox || [];
     const inboxBody = inbox.length === 0
       ? emptyState("暂无消息")
-      : el("ul", { class: "msg-list" }, inbox.map((m) => messageItem(m, { defaultOpen: false, showDirection: true, showRead: false })));
+      : el("ul", { class: "msg-list" }, inbox.map((m) => messageItem(m, { defaultOpen: false, showDirection: true, showRead: true, worker: name })));
     target.appendChild(collapsibleCard({
       title: `收件箱 / 发件 (${inbox.length})`,
       sub: "授权式通信记录 · Markdown 渲染",
@@ -1190,7 +2378,6 @@
       body: inbox.length > 0 ? inboxBody : null,
     }));
   }
-
   // ---- Jobs 页面 ----
   function renderJobsPage() {
     const main = $("#main");
@@ -1356,13 +2543,27 @@
     const d = res.data;
     body.innerHTML = "";
     body.appendChild(el("div", { class: "drawer__meta" }, [
-      el("div", {}, [el("span", { class: "muted", text: "状态" }), statusPill(d.status)]),
-      el("div", {}, [el("span", { class: "muted", text: "员工" }), el("strong", { text: d.worker || "—" })]),
-      el("div", {}, [el("span", { class: "muted", text: "项目" }), el("strong", { text: d.project || "—" })]),
-      el("div", {}, [el("span", { class: "muted", text: "创建" }), el("span", { text: fmtTime(d.createdAt, { dateOnly: false }) })]),
+	      el("div", {}, [el("span", { class: "muted", text: "状态" }), statusPill(d.status)]),
+	      el("div", {}, [el("span", { class: "muted", text: "员工" }), el("strong", { text: d.worker || "—" })]),
+	      el("div", {}, [el("span", { class: "muted", text: "项目" }), el("strong", { text: d.project || "—" })]),
+	      (d.assignedBy || d.source) ? el("div", {}, [el("span", { class: "muted", text: "来源" }), el("span", { text: [d.assignedBy ? `指派: ${d.assignedBy}` : "", d.source ? `source: ${d.source}` : ""].filter(Boolean).join(" · ") })]) : null,
+	      el("div", {}, [el("span", { class: "muted", text: "创建" }), el("span", { text: fmtTime(d.createdAt, { dateOnly: false }) })]),
       el("div", {}, [el("span", { class: "muted", text: "更新" }), el("span", { text: fmtTime(d.updatedAt) })]),
       d.elapsedSeconds != null ? el("div", {}, [el("span", { class: "muted", text: "耗时" }), el("span", { text: `${d.elapsedSeconds}s` })]) : null,
     ]));
+    if (isCancellableJob(d)) {
+      body.appendChild(el("div", { class: "drawer__actions" }, [
+        el("button", {
+          class: "btn btn--danger",
+          type: "button",
+          onclick: (e) => cancelJobFromDrawer(d.id || id, e.currentTarget),
+        }, [
+          el("span", { class: "btn__icon", text: "⏹" }),
+          "停止 job",
+        ]),
+        el("span", { class: "muted", text: "会提交取消请求；运行中任务由 Pi 主进程尝试中止，排队任务会移出队列。" }),
+      ]));
+    }
     body.appendChild(el("div", { class: "drawer__section" }, [
       el("h4", { text: "任务" }),
       d.task ? mdNode(d.task) : el("p", { class: "prose", text: "—" }),
@@ -1388,15 +2589,77 @@
     }
     if (d.events && d.events.length) {
       body.appendChild(el("div", { class: "drawer__section" }, [
-        el("h4", { text: `事件流 (${d.events.length})` }),
-        el("ul", { class: "timeline" }, d.events.map((ev) => el("li", { class: `timeline__item timeline__item--${ev.isError ? "error" : ev.type}` }, [
-          el("span", { class: "timeline__time", text: fmtTime(ev.time) }),
-          el("span", { class: "timeline__type", text: ev.type }),
-          ev.name ? el("span", { class: "timeline__name", text: ev.name }) : null,
-          ev.text || ev.message ? el("span", { class: "timeline__text", text: ev.text || ev.message }) : null,
-        ]))),
+        el("h4", { text: `执行过程 (${d.events.length})` }),
+        el("ul", { class: "timeline" }, d.events.map(renderJobEventItem)),
       ]));
     }
+  }
+
+  async function cancelJobFromDrawer(jobId, button) {
+    if (!jobId) return;
+    if (!window.confirm(`确定要停止 job ${jobId} 吗？`)) return;
+    if (button) button.disabled = true;
+    const res = await api(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ from: "web", reason: "用户通过 Web 停止 job" }),
+    });
+    if (!res.ok) {
+      if (button) button.disabled = false;
+      toast("停止 job 失败", "error");
+      return;
+    }
+    toast("停止请求已提交", "success");
+    await openJobDrawer(jobId);
+    if (STATE.currentPage === "jobs") await loadJobs();
+  }
+
+  function jobEventLabel(ev) {
+    if (ev.isError || ev.type === "error") return "错误";
+    if (ev.type === "text") return "回答";
+    if (ev.type === "tool") return "工具";
+    if (ev.type === "thinking") return "思考";
+    if (ev.type === "done") return "完成";
+    if (ev.type === "queued") return "入队";
+    if (ev.type === "started") return "开始";
+    if (ev.type === "codex_thread") return "线程";
+    if (ev.type === "claude_session") return "会话";
+    return ev.type || "事件";
+  }
+
+  function renderJobEventItem(ev) {
+    const itemClass = ev.type === "text"
+      ? "timeline__item--assistant"
+      : `timeline__item--${ev.isError ? "error" : ev.type || "event"}`;
+    const text = ev.text || ev.message || "";
+    const contentChildren = [
+      el("div", { class: "timeline__meta" }, [
+        el("span", { class: "timeline__type", text: jobEventLabel(ev) }),
+        ev.name ? el("span", { class: "timeline__name", text: ev.name }) : null,
+      ]),
+    ];
+
+    if (ev.type === "text") {
+      contentChildren.push(el("div", { class: "timeline__text timeline__text--assistant" }, [mdNode(text, { compact: true, max: 8000 })]));
+    } else if (ev.type === "tool") {
+      contentChildren.push(el("div", { class: "timeline__tool-card" }, [
+        el("div", { class: "timeline__tool-head" }, [
+          el("span", { class: "timeline__tool-dot", text: ev.isError ? "!" : "›" }),
+          el("span", { class: "timeline__tool-name", text: ev.name || "tool" }),
+        ]),
+        text ? el("pre", { class: "timeline__tool-body", text }) : null,
+      ]));
+    } else {
+      contentChildren.push(el("div", {
+        class: `timeline__text${ev.isError ? " timeline__text--error" : ""}`,
+        text: text || "—",
+      }));
+    }
+
+    return el("li", { class: `timeline__item ${itemClass}` }, [
+      el("span", { class: "timeline__time", text: fmtTime(ev.time) }),
+      el("div", { class: "timeline__content" }, contentChildren),
+    ]);
   }
 
   function closeDrawer() {
@@ -1404,6 +2667,8 @@
     drawer.classList.remove(DRAWER_OPEN_CLASS);
     drawer.setAttribute("aria-hidden", "true");
     STATE.drawerJob = null;
+    // 关闭抽屉后异步静默刷新侧边气泡（GET /api/jobs/:id 打开时已自动 markRead）
+    void refreshWorkerUnreadBadges();
   }
 
   // ---- P1 页面 (Tokens / Compactions / Messages / Report / Permissions) ----
@@ -1573,12 +2838,26 @@
     ]);
   }
 
-  function trendKpi(label, value, sub) {
+  function trendKpi(label, value, sub, note) {
+    const labelChildren = [el("span", { class: "trend-kpi__label-text", text: label })];
+    if (note) labelChildren.push(noteTag(note));
     return el("div", { class: "trend-kpi" }, [
-      el("div", { class: "trend-kpi__label", text: label }),
+      el("div", { class: "trend-kpi__label" }, labelChildren),
       el("div", { class: "trend-kpi__value", text: value }),
       el("div", { class: "trend-kpi__sub", text: sub }),
     ]);
+  }
+
+  // 指标值 / 标签旁加一个问号 tooltip，用于说明“包含 subagent/外包相关工具调用”
+  const SUBAGENT_TOOL_NOTE = "包含 subagent/外包相关工具调用：factory_task_assign / factory_outsource_run / factory_outsource_wait / factory_outsource_result / factory_outsource_status";
+  function noteTag(text) {
+    return el("span", { class: "metric__note", title: text }, "ⓘ");
+  }
+  function labelWithNote(label, noteText) {
+    return el("span", { class: "metric-with-note" }, [label, noteTag(noteText)]);
+  }
+  function valueWithNote(valueNode, noteText) {
+    return el("span", { class: "metric-with-note" }, [valueNode, noteTag(noteText)]);
   }
 
   // ---- Projects 页面 ----
@@ -2168,7 +3447,7 @@
         trendKpi("样本 Turn", String(totals.turns || 0), displayDate),
         trendKpi("压缩次数", String(totals.compactions || 0), "所有员工 session"),
         trendKpi("平均耗时", fmtDurationMs(totals.avgResponseMs), "job elapsed"),
-        trendKpi("工具调用", String(totals.toolCalls || 0), "tool_start events"),
+        trendKpi("工具调用", String(totals.toolCalls || 0), "tool_start events", SUBAGENT_TOOL_NOTE),
         trendKpi("已评分", String(totals.scoredTurns || 0), config.enabled ? "情绪旁路已开启" : "情绪旁路关闭"),
         trendKpi("丢弃", String(history.droppedJobs || 0), Object.entries(history.dropReasons || {}).map(([k, v]) => `${k}:${v}`).join(" · ") || "无明显坏数据"),
       ]),
@@ -2191,27 +3470,27 @@
               el("table", { class: "table quality-table" }, [
                 el("thead", {}, [el("tr", {}, [
                   el("th", { text: "员工" }),
-                  el("th", { text: "会话轮次" }),
-                  el("th", { text: "上下文估算" }),
-                  el("th", { text: "压缩" }),
-                  el("th", { text: "样本" }),
-                  el("th", { text: "平均输入" }),
-                  el("th", { text: "平均输出" }),
-                  el("th", { text: "平均耗时" }),
-                  el("th", { text: "工具" }),
-                  el("th", { text: "情绪" }),
+                  sortableNumericTh("会话轮次"),
+                  sortableNumericTh("上下文估算"),
+                  sortableNumericTh("压缩"),
+                  sortableNumericTh("样本"),
+                  sortableNumericTh("平均输入"),
+                  sortableNumericTh("平均输出"),
+                  sortableNumericTh("平均耗时"),
+                  sortableNumericTh("工具"),
+                  sortableNumericTh("情绪"),
                 ])]),
                 el("tbody", {}, workers.map((w) => el("tr", {}, [
                   el("td", { class: "td--mono", text: w.worker || "—" }),
-                  el("td", { class: "td--mono", text: String(w.session?.userTurns || 0) }),
-                  el("td", { class: "td--mono", text: fmtNumber(w.session?.estimatedContextTokens || 0) }),
-                  el("td", { class: "td--mono", text: String(w.session?.compactionCount || 0) }),
-                  el("td", { class: "td--mono", text: String(w.jobs?.count || 0) }),
-                  el("td", { class: "td--mono", text: fmtNumber(w.jobs?.avgInputChars || 0) }),
-                  el("td", { class: "td--mono", text: fmtNumber(w.jobs?.avgOutputChars || 0) }),
-                  el("td", { class: "td--mono", text: fmtDurationMs(w.jobs?.avgResponseMs || 0) }),
-                  el("td", { class: "td--mono", text: String(w.jobs?.toolCalls || 0) }),
-                  el("td", { class: "td--mono", text: w.jobs?.avgEmotionScore == null ? "—" : String(w.jobs.avgEmotionScore) }),
+                  numericTd(w.session?.userTurns || 0, String(w.session?.userTurns || 0)),
+                  numericTd(w.session?.estimatedContextTokens || 0, fmtNumber(w.session?.estimatedContextTokens || 0)),
+                  numericTd(w.session?.compactionCount || 0, String(w.session?.compactionCount || 0)),
+                  numericTd(w.jobs?.count || 0, String(w.jobs?.count || 0)),
+                  numericTd(w.jobs?.avgInputChars || 0, fmtNumber(w.jobs?.avgInputChars || 0)),
+                  numericTd(w.jobs?.avgOutputChars || 0, fmtNumber(w.jobs?.avgOutputChars || 0)),
+                  numericTd(w.jobs?.avgResponseMs || 0, fmtDurationMs(w.jobs?.avgResponseMs || 0)),
+                  numericTd(w.jobs?.toolCalls || 0, String(w.jobs?.toolCalls || 0)),
+                  numericTd(w.jobs?.avgEmotionScore ?? "", w.jobs?.avgEmotionScore == null ? "—" : String(w.jobs.avgEmotionScore)),
                 ]))),
               ]),
             ])
@@ -2225,21 +3504,25 @@
                 el("thead", {}, [el("tr", {}, [
                   el("th", { text: "时间" }),
                   el("th", { text: "员工" }),
-                  el("th", { text: "输入/输出" }),
-                  el("th", { text: "耗时" }),
-                  el("th", { text: "工具" }),
-                  el("th", { text: "上下文/压缩" }),
-                  el("th", { text: "情绪" }),
+                  sortableNumericTh("输入"),
+                  sortableNumericTh("输出"),
+                  sortableNumericTh("耗时"),
+                  sortableNumericTh("工具"),
+                  sortableNumericTh("上下文"),
+                  sortableNumericTh("压缩"),
+                  sortableNumericTh("情绪"),
                   el("th", { text: "任务" }),
                 ])]),
                 el("tbody", {}, turns.slice(0, 30).map((turn) => el("tr", { onclick: () => { location.hash = `#/jobs/${encodeURIComponent(turn.jobId)}`; } }, [
                   el("td", { class: "td--time", text: fmtTime(turn.createdAt) }),
                   el("td", { class: "td--mono", text: turn.worker || "—" }),
-                  el("td", { class: "td--mono", text: `${fmtNumber(turn.inputChars)} / ${fmtNumber(turn.outputChars)}` }),
-                  el("td", { class: "td--mono", text: fmtDurationMs(turn.responseMs) }),
-                  el("td", { class: "td--mono", text: String(turn.toolCalls || 0) }),
-                  el("td", { class: "td--mono", text: `${fmtNumber(turn.sessionContextTokens || 0)} / ${turn.sessionCompactions || 0}` }),
-                  el("td", { class: "td--mono", text: turn.emotionScore == null ? "—" : `${turn.emotionScore}${turn.emotionLabel ? ` · ${turn.emotionLabel}` : ""}` }),
+                  numericTd(turn.inputChars || 0, fmtNumber(turn.inputChars)),
+                  numericTd(turn.outputChars || 0, fmtNumber(turn.outputChars)),
+                  numericTd(turn.responseMs || 0, fmtDurationMs(turn.responseMs)),
+                  numericTd(turn.toolCalls || 0, String(turn.toolCalls || 0)),
+                  numericTd(turn.sessionContextTokens || 0, fmtNumber(turn.sessionContextTokens || 0)),
+                  numericTd(turn.sessionCompactions || 0, String(turn.sessionCompactions || 0)),
+                  numericTd(turn.emotionScore ?? "", turn.emotionScore == null ? "—" : `${turn.emotionScore}${turn.emotionLabel ? ` · ${turn.emotionLabel}` : ""}`),
                   el("td", { class: "td--task", title: turn.taskPreview || "", text: turn.taskPreview || "—" }),
                 ]))),
               ]),
@@ -2468,11 +3751,11 @@
       trendKpi("输入字符(均)", fmtNumber(Math.round(avg(turns.map((t) => t.inputChars || 0)))), "inputChars"),
       trendKpi("输出字符(均)", fmtNumber(Math.round(avg(turns.map((t) => t.outputChars || 0)))), "outputChars"),
       trendKpi("耗时(均)", fmtDurationMs(Math.round(avg(turns.map((t) => t.responseMs || 0)))), "responseMs"),
-      trendKpi("工具/turn", (avg(turns.map((t) => t.toolCalls || 0))).toFixed(1), "tool_start 计数"),
+      trendKpi("工具/turn", (avg(turns.map((t) => t.toolCalls || 0))).toFixed(1), "tool_start 计数", SUBAGENT_TOOL_NOTE),
     ]));
     // 6 charts · 输入、上下文、时间趋势、情绪
     grid.appendChild(chartScatter("输入字符 → 输出字符", turns, "inputChars", "outputChars", "输入字符", "输出字符"));
-    grid.appendChild(chartScatter("工具调用 → 输出字符", turns, "toolCalls", "outputChars", "工具调用数", "输出字符"));
+    grid.appendChild(chartScatter("工具调用 → 输出字符", turns, "toolCalls", "outputChars", "工具调用数", "输出字符", { titleNote: SUBAGENT_TOOL_NOTE }));
     grid.appendChild(chartScatter("输入 token → 输出 token", turns, "inputTokens", "outputTokens", "输入 token", "输出 token"));
     grid.appendChild(chartScatter("耗时 ms → 输出字符", turns, "responseMs", "outputChars", "耗时 (ms)", "输出字符"));
     grid.appendChild(chartScatter("上下文估算 → 输出 token", turns, "sessionContextTokens", "outputTokens", "sessionContextTokens", "输出 token"));
@@ -2484,9 +3767,10 @@
     grid.appendChild(chartLine("时间序列：工具调用 / 耗时", turns, "createdAt", [
       { key: "toolCalls", label: "工具调用", color: "var(--seg-cache)" },
       { key: "responseMs", label: "耗时(ms)", color: "var(--seg-reasoning)" },
-    ]));
-    if (turns.some((t) => t.emotionScore != null)) {
-      grid.appendChild(chartLine("情绪评分（情绪旁路开启时）", turns, "createdAt", [
+    ], { titleNote: SUBAGENT_TOOL_NOTE }));
+    const emotionTurns = turns.filter((t) => isValidEmotionScore(t.emotionScore));
+    if (emotionTurns.length) {
+      grid.appendChild(chartLine("情绪评分（情绪旁路开启时）", emotionTurns, "createdAt", [
         { key: "emotionScore", label: "情绪 1-5", color: "var(--accent)" },
       ]));
     }
@@ -2553,10 +3837,12 @@
     return svg;
   }
 
-  function chartScatter(title, data, xKey, yKey, xLabel, yLabel) {
+  function chartScatter(title, data, xKey, yKey, xLabel, yLabel, opts = {}) {
+    const titleChildren = [el("span", { class: "chart-card__title-text", text: title })];
+    if (opts.titleNote) titleChildren.push(noteTag(opts.titleNote));
     const card = el("div", { class: "chart-card" }, [
       el("div", { class: "chart-card__head" }, [
-        el("h4", { class: "chart-card__title", text: title }),
+        el("h4", { class: "chart-card__title" }, titleChildren),
         el("span", { class: "chart-card__hint", text: `${data.length} 点 · ${xLabel || xKey} · ${yLabel || yKey}` }),
       ]),
     ]);
@@ -2575,11 +3861,13 @@
     return card;
   }
 
-  function chartLine(title, data, xKey, series) {
+  function chartLine(title, data, xKey, series, opts = {}) {
     // series: [{key, label, color}]
+    const titleChildren = [el("span", { class: "chart-card__title-text", text: title })];
+    if (opts.titleNote) titleChildren.push(noteTag(opts.titleNote));
     const card = el("div", { class: "chart-card" }, [
       el("div", { class: "chart-card__head" }, [
-        el("h4", { class: "chart-card__title", text: title }),
+        el("h4", { class: "chart-card__title" }, titleChildren),
         el("div", { class: "chart-card__legend" }, series.map((s) => el("span", { class: "chart-card__legend-item" }, [
           el("span", { class: "chart-card__swatch", style: `background:${s.color}` }),
           el("span", { text: s.label }),
@@ -2631,9 +3919,9 @@
     });
     // 折线
     series.forEach((s) => {
-      const points = sorted
-        .filter((d) => Number(d[s.key] || 0) > 0 || s.key === "emotionScore")
-        .map((d, i, arr) => {
+      const seriesData = sorted.filter((d) => Number(d[s.key] || 0) > 0);
+      const points = seriesData
+        .map((d) => {
           const t = new Date(d[xKey] || 0).getTime();
           const x = pad.l + ((t - xMin) / (xMax - xMin || 1)) * innerW;
           const y = pad.t + innerH - ((Number(d[s.key] || 0) - yMin) / (yMax - yMin || 1)) * innerH;
@@ -2647,7 +3935,7 @@
         svg.appendChild(svgEl("circle", { cx: x, cy: y, r: 4, fill: s.color }));
       }
       // 点
-      sorted.forEach((d) => {
+      seriesData.forEach((d) => {
         const t = new Date(d[xKey] || 0).getTime();
         const x = pad.l + ((t - xMin) / (xMax - xMin || 1)) * innerW;
         const y = pad.t + innerH - ((Number(d[s.key] || 0) - yMin) / (yMax - yMin || 1)) * innerH;
@@ -2659,6 +3947,11 @@
     });
     card.appendChild(svg);
     return card;
+  }
+
+  function isValidEmotionScore(value) {
+    const score = Number(value);
+    return Number.isFinite(score) && score >= 1 && score <= 5;
   }
 
   function showChartTip(layer, d, fallback, e) {
@@ -2679,6 +3972,149 @@
       const targetRect = e.target.getBoundingClientRect();
       layer.style.left = `${targetRect.left - svgRect.left + 8}px`;
       layer.style.top = `${targetRect.top - svgRect.top - 8}px`;
+    }
+  }
+
+  function taskRequestEventText(ev) {
+    if (!ev) return "—";
+    const parts = [];
+    if (ev.jobId) parts.push(`job ${String(ev.jobId).slice(-6)}`);
+    if (ev.deliveryMode || ev.mode) parts.push(`mode ${ev.deliveryMode || ev.mode}`);
+    if (ev.placement) parts.push(ev.placement);
+    if (ev.error) parts.push(ev.error);
+    if (ev.reason) parts.push(ev.reason);
+    if (ev.summary) parts.push(String(ev.summary).slice(0, 160));
+    if (ev.task && ev.type === "edited") parts.push(String(ev.task).slice(0, 160));
+    return parts.join(" · ") || "—";
+  }
+
+  function taskRequestCard(request) {
+    const id = request.id || "";
+    const jobId = request.jobId || "";
+    return el("article", {
+      class: `task-request-card task-request-card--${request.status || "pending"}`,
+      onclick: () => openTaskRequestDrawer(id),
+    }, [
+      el("div", { class: "task-request-card__top" }, [
+        statusPill(request.status || "pending"),
+        el("span", { class: "task-request-card__id", text: id ? id.slice(-8) : "—" }),
+      ]),
+      el("div", { class: "task-request-card__route" }, [
+        el("strong", { text: request.from || "用户" }),
+        el("span", { text: "→" }),
+        el("strong", { text: request.to || "—" }),
+      ]),
+      el("div", { class: "task-request-card__meta" }, [
+        el("span", { class: "tag tag--soft", text: request.project || "factory-task" }),
+        el("span", { class: "tag tag--soft", text: `mode: ${request.deliveryMode || request.mode || "auto"}` }),
+        jobId ? el("button", {
+          class: "btn btn--ghost task-request-card__job",
+          type: "button",
+          text: `job ${jobId.slice(-6)}`,
+          onclick: (event) => { event.stopPropagation(); openJobDrawer(jobId); },
+        }) : null,
+      ]),
+      el("div", { class: "task-request-card__task", title: request.task || "", text: request.task || "—" }),
+      request.resultSummary
+        ? el("div", { class: "task-request-card__result", text: request.resultSummary })
+        : null,
+      el("div", { class: "task-request-card__foot" }, [
+        el("span", { text: `创建 ${fmtRelative(request.createdAt)}` }),
+        request.updatedAt || request.acceptedAt || request.reportedAt || request.failedAt || request.cancelledAt
+          ? el("span", { text: `更新 ${fmtRelative(request.updatedAt || request.reportedAt || request.acceptedAt || request.failedAt || request.cancelledAt)}` })
+          : null,
+      ]),
+    ]);
+  }
+
+  async function renderTaskRequests() {
+    const wrap = el("div", { class: "page page--tasks" });
+    wrap.appendChild(el("section", { class: "section" }, [
+      sectionHead("员工派活", "授权动作 work:assign；页面创建请求后由 Pi 主进程接管，目标忙碌时按 mode 进入 queue/steer/now 语义。"),
+    ]));
+
+    const res = await api("/api/task-requests?limit=100");
+    if (!res.ok) {
+      wrap.appendChild(errorBox("加载派活请求失败", res.detail));
+      return wrap;
+    }
+
+    const requests = res.data.requests || [];
+    STATE.taskRequests = requests;
+    const counts = requests.reduce((acc, request) => {
+      const key = request.status || "pending";
+      acc[key] = (acc[key] || 0) + 1;
+      return acc;
+    }, {});
+    wrap.appendChild(el("div", { class: "kpi-row task-kpi-row" }, [
+      kpiCard("总请求", String(res.data.total ?? requests.length), "最近 100 条"),
+      kpiCard("待接管", String((counts.pending || 0) + (counts.processing || 0)), "pending + processing"),
+      kpiCard("已接管", String(counts.accepted || 0), "已有 worker job"),
+      kpiCard("已回传", String(counts.reported || 0), "已给来源回消息"),
+    ]));
+
+    wrap.appendChild(el("section", { class: "section" }, [
+      el("div", { class: "task-toolbar" }, [
+        el("span", { class: "muted", text: `共 ${requests.length} 条 · 新请求使用 POST /api/task-requests 或 comm-cli assign` }),
+      ]),
+      requests.length
+        ? el("div", { class: "task-grid" }, requests.map(taskRequestCard))
+        : emptyState("暂无派活请求", "员工可以用 comm-cli assign 或 factory_task_assign 工具创建授权派活请求。"),
+    ]));
+    return wrap;
+  }
+
+  async function openTaskRequestDrawer(id) {
+    const drawer = $("#drawer");
+    drawer.classList.add(DRAWER_OPEN_CLASS);
+    drawer.setAttribute("aria-hidden", "false");
+    $("#drawerEyebrow").textContent = "TASK";
+    $("#drawerTitle").textContent = id;
+    $("#drawerBody").innerHTML = "";
+    $("#drawerBody").appendChild(el("div", { class: "skeleton skeleton--row" }));
+    const res = await api(`/api/task-requests/${encodeURIComponent(id)}`);
+    const body = $("#drawerBody");
+    if (!res.ok) {
+      body.innerHTML = "";
+      body.appendChild(errorBox("加载派活详情失败", res.detail));
+      return;
+    }
+    const request = res.data.request || {};
+    body.innerHTML = "";
+    body.appendChild(el("div", { class: "drawer__meta" }, [
+      el("div", {}, [el("span", { class: "muted", text: "状态" }), statusPill(request.status || "pending")]),
+      el("div", {}, [el("span", { class: "muted", text: "来源" }), el("strong", { text: request.from || "用户" })]),
+      el("div", {}, [el("span", { class: "muted", text: "目标" }), el("strong", { text: request.to || "—" })]),
+      el("div", {}, [el("span", { class: "muted", text: "项目" }), el("strong", { text: request.project || "factory-task" })]),
+      el("div", {}, [el("span", { class: "muted", text: "模式" }), el("span", { text: request.deliveryMode || request.mode || "auto" })]),
+      el("div", {}, [el("span", { class: "muted", text: "创建" }), el("span", { text: fmtTime(request.createdAt) })]),
+      request.jobId ? el("div", {}, [
+        el("span", { class: "muted", text: "Job" }),
+        el("button", { class: "btn btn--ghost", type: "button", text: request.jobId, onclick: () => openJobDrawer(request.jobId) }),
+      ]) : null,
+      request.resultMessageId ? el("div", {}, [el("span", { class: "muted", text: "回执消息" }), el("span", { class: "td--mono", text: request.resultMessageId })]) : null,
+    ]));
+    body.appendChild(el("div", { class: "drawer__section" }, [
+      el("h4", { text: "派活内容" }),
+      request.task ? mdNode(request.task) : el("p", { class: "prose", text: "—" }),
+    ]));
+    if (request.resultSummary) {
+      body.appendChild(el("div", { class: "drawer__section" }, [
+        el("h4", { text: "回传摘要" }),
+        mdNode(request.resultSummary),
+      ]));
+    }
+    const events = request.events || [];
+    if (events.length) {
+      body.appendChild(el("div", { class: "drawer__section" }, [
+        el("h4", { text: `事件流 (${events.length})` }),
+        el("ul", { class: "timeline" }, events.map((ev) => el("li", { class: `timeline__item timeline__item--${ev.type}` }, [
+          el("span", { class: "timeline__time", text: fmtTime(ev.createdAt || ev.claimedAt || ev.acceptedAt || ev.failedAt || ev.editedAt || ev.cancelledAt || ev.reportedAt) }),
+          el("span", { class: "timeline__type", text: ev.type || "event" }),
+          el("span", { class: "timeline__name", text: ev.from || ev.claimedBy || ev.to || "—" }),
+          el("span", { class: "timeline__text", text: taskRequestEventText(ev) }),
+        ]))),
+      ]));
     }
   }
 
@@ -2834,6 +4270,64 @@
     renderWorkerDetail(name);
   }
 
+  // 静默重新拉 /api/workers 刷新侧边列表的未读气泡。
+  // 任何进入某个 worker detail / 打开 job drawer / 关闭 drawer 后都可能需要。
+  async function refreshWorkerUnreadBadges() {
+    if (STATE.currentPage !== "workers" && STATE.currentPage !== "") return;
+    if (STATE.unreadRefreshInFlight) return;
+    STATE.unreadRefreshInFlight = true;
+    const res = await api("/api/workers");
+    STATE.unreadRefreshInFlight = false;
+    if (!res.ok) return;
+    const workers = res.data.workers || [];
+    const map = new Map(workers.map((w) => [w.name, w]));
+    // 更新每张 worker-card 的未读 badge + 排序
+    const list = $(".workers__list");
+    if (!list) return;
+    const cards = $$(".worker-card", list);
+    // 1. 更新每张卡片：badge / class / dataset
+    for (const card of cards) {
+      const name = card.dataset.name;
+      const w = map.get(name);
+      if (!w) continue;
+      const unread = Number(w.unreadCount || 0);
+      card.dataset.unread = String(unread);
+      card.dataset.lastInteractionAt = w.lastInteractionAt || "";
+      card.classList.toggle("worker-card--unread", unread > 0);
+          // 找现存的 badge，并同步最近 talk 返回摘要
+          const existing = card.querySelector(".worker-card__badge--unread");
+          syncWorkerCardTalkPreview(card, w);
+          if (unread > 0) {
+        const text = unread > 99 ? "99+" : String(unread);
+        const title = unreadBadgeTitle(w);
+        if (existing) {
+          existing.textContent = text;
+          existing.title = title;
+        } else {
+          const badge = el("span", {
+            class: "worker-card__badge worker-card__badge--unread",
+            text,
+            title,
+          });
+          const aside = card.querySelector(".worker-card__aside");
+          if (aside) aside.appendChild(badge);
+        }
+      } else if (existing) {
+        existing.remove();
+      }
+    }
+    // 2. 按最近交互重排 DOM（保留 active card 仍 active；已读不会改变顺序）
+    const ordered = cards.slice().sort((a, b) => {
+      const la = a.dataset.lastInteractionAt ? new Date(a.dataset.lastInteractionAt).getTime() : 0;
+      const lb = b.dataset.lastInteractionAt ? new Date(b.dataset.lastInteractionAt).getTime() : 0;
+      if (lb !== la) return lb - la;
+      const an = a.dataset.name || "";
+      const bn = b.dataset.name || "";
+      return an.localeCompare(bn, "zh-Hans-CN");
+    });
+    for (const card of ordered) list.appendChild(card);
+  }
+
   // 路由调用计数器：保证只有最后一次 route() 调用会渲染，避免竞态造成内容重复
 let currentRouteId = 0;
   // 各子区域渲染计数器，防止并发请求导致旧数据覆盖新数据
@@ -2868,12 +4362,22 @@ async function route() {
 
     try {
       if (route === "overview" || route === "") {
-        const res = await api("/api/overview");
+        const [res, osProfRes, osRunRes] = await Promise.all([
+          api("/api/overview"),
+          api("/api/outsource/profiles"),
+          api("/api/outsource/runs?limit=200"),
+        ]);
         if (isStale()) return;
         if (!res.ok) { renderErrorPage("加载 Overview 失败", res.detail); return; }
         STATE.lastOverview = res.data;
         setTopbar(res.data);
-        renderOverview(res.data);
+        const outsourceBundle = {
+          profiles: osProfRes.ok ? (osProfRes.data?.profiles || []) : [],
+          runs: osRunRes.ok ? (osRunRes.data?.runs || []) : [],
+          profilesError: osProfRes.ok ? null : osProfRes.detail,
+          runsError: osRunRes.ok ? null : osRunRes.detail,
+        };
+        renderOverview(res.data, outsourceBundle);
       } else if (route === "workers") {
         const res = await api("/api/workers");
         if (isStale()) return;
@@ -2900,6 +4404,12 @@ async function route() {
         }
         if (status || project || worker) loadJobs();
         if (path[1]) openJobDrawer(path[1]);
+      } else if (route === "tasks") {
+        const node = await renderTaskRequests();
+        if (isStale()) return;
+        main.innerHTML = "";
+        main.appendChild(node);
+        if (path[1]) openTaskRequestDrawer(decodeURIComponent(path[1]));
       } else if (route === "projects") {
         if (path[1]) {
           const node = await renderProjectDetail(decodeURIComponent(path[1]));
@@ -2942,6 +4452,11 @@ async function route() {
         if (isStale()) return;
         main.innerHTML = "";
         main.appendChild(node);
+      } else if (route === "outsource") {
+        const node = await renderOutsource();
+        if (isStale()) return;
+        main.innerHTML = "";
+        main.appendChild(node);
       } else {
         if (!isStale()) renderErrorPage(`未知路由: ${route}`, null);
       }
@@ -2967,12 +4482,22 @@ async function route() {
     const route = path[0] || "overview";
 
     // 1) 总是拉一次 overview，更新 topbar
-    const ov = await api("/api/overview");
+    const [ov, osProfRes, osRunRes] = await Promise.all([
+      api("/api/overview"),
+      api("/api/outsource/profiles"),
+      api("/api/outsource/runs?limit=200"),
+    ]);
     if (ov.ok) { STATE.lastOverview = ov.data; setTopbar(ov.data); }
+    const outsourceBundle = {
+      profiles: osProfRes?.ok ? (osProfRes.data?.profiles || []) : [],
+      runs: osRunRes?.ok ? (osRunRes.data?.runs || []) : [],
+      profilesError: osProfRes?.ok ? null : osProfRes?.detail,
+      runsError: osRunRes?.ok ? null : osRunRes?.detail,
+    };
 
     // 2) 按当前路由刷新主体
     if (route === "overview" || route === "") {
-      renderOverview(STATE.lastOverview);
+      renderOverview(STATE.lastOverview, outsourceBundle);
     } else if (route === "workers") {
       const res = await api("/api/workers");
       if (res.ok) renderWorkers(res.data.workers || []);
@@ -2981,6 +4506,10 @@ async function route() {
     } else if (route === "jobs") {
       await loadJobs();
       if (path[1]) openJobDrawer(path[1]);
+    } else if (route === "tasks") {
+      const node = await renderTaskRequests();
+      const m = $("#main"); m.innerHTML = ""; m.appendChild(node);
+      if (path[1]) openTaskRequestDrawer(decodeURIComponent(path[1]));
     } else if (route === "projects") {
       if (path[1]) {
         const node = await renderProjectDetail(decodeURIComponent(path[1]));
@@ -3005,6 +4534,9 @@ async function route() {
       const m = $("#main"); m.innerHTML = ""; m.appendChild(node);
     } else if (route === "permissions") {
       const node = await renderPermissions();
+      const m = $("#main"); m.innerHTML = ""; m.appendChild(node);
+    } else if (route === "outsource") {
+      const node = await renderOutsource();
       const m = $("#main"); m.innerHTML = ""; m.appendChild(node);
     }
 
