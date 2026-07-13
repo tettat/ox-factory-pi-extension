@@ -2061,6 +2061,10 @@
     return request?.updatedAt || request?.editedAt || request?.acceptedAt || request?.cancelledAt || request?.failedAt || request?.claimedAt || request?.createdAt || "";
   }
 
+  function talkJobSortTime(job) {
+    return job?.createdAt || job?.updatedAt || "";
+  }
+
   function shouldShowTalkRequest(request, jobsById) {
     const status = String(request?.status || "");
     if (!request?.id) return false;
@@ -2078,7 +2082,7 @@
       el("div", { class: "talk-list__head" }, [
         statusPill(j.status),
         el("span", { class: "talk-list__id", text: (j.id || "").slice(-6) }),
-        el("span", { class: "talk-list__time", text: fmtRelative(j.updatedAt || j.createdAt) }),
+        el("span", { class: "talk-list__time", text: fmtRelative(talkJobSortTime(j)) }),
         el("div", { class: "talk-list__actions" }, [
           el("button", { class: "btn btn--ghost talk-list__btn", type: "button", text: "查看", onclick: () => openJobDrawer(j.id) }),
           queued ? el("button", {
@@ -2154,7 +2158,7 @@
     const jobsById = new Map(talkJobs.filter((j) => j.id).map((j) => [j.id, j]));
     const talkRequests = (requests || []).filter((request) => shouldShowTalkRequest(request, jobsById));
     const items = [
-      ...talkJobs.map((job) => ({ type: "job", at: job.updatedAt || job.createdAt || "", job })),
+      ...talkJobs.map((job) => ({ type: "job", at: talkJobSortTime(job), job })),
       ...talkRequests.map((request) => ({ type: "request", at: talkRequestSortTime(request), request })),
     ].sort((a, b) => String(b.at || "").localeCompare(String(a.at || ""))).slice(0, 40);
     box.innerHTML = "";
