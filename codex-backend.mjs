@@ -534,7 +534,7 @@ async function ensureThread(client, { worker, cwd, agentDef, workersDir, onWorke
       sandbox: sandboxMode(worker),
       model: model || null,
       baseInstructions: buildCodexBaseInstructions(worker, agentDef, { workersDir }),
-    });
+    }, 60_000);
     return reconcileCodexThreadId(worker, resume.thread.id, onWorkerPatch);
   } catch (error) {
     if (!shouldReplaceCodexThread(error)) throw error;
