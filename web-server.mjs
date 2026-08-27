@@ -61,6 +61,17 @@ import {
   normalizeWorkerTaskMode,
 } from "./task-requests.mjs";
 import {
+  FactoryTaskConflictError,
+  archiveFactoryTask,
+  createFactoryTask,
+  getFactoryTask,
+  listFactoryTasks,
+  restoreFactoryTask,
+  splitFactoryTask,
+  updateFactoryTask,
+} from "./task-board.mjs";
+import { dispatchDueFactoryTasks, dispatchFactoryTask } from "./task-dispatcher.mjs";
+import {
   findMainSessionFile,
   getWorkerRegistrySnapshot,
 } from "./worker-registry-snapshot.mjs";
@@ -658,7 +669,7 @@ export function buildWorkersView(workersDir, jobs, tokenReport, messages, regist
 // ---------------------------------------------------------------------------
 // 路由
 // ---------------------------------------------------------------------------
-function buildRouter({ workersDir }) {
+export function buildRouter({ workersDir }) {
   return async function handle(req, res) {
     const url = new URL(req.url, `http://${req.headers.host || "127.0.0.1"}`);
     const pathname = url.pathname;
@@ -696,6 +707,14 @@ function buildRouter({ workersDir }) {
         return await handleWorkerTaskRequestCreate(workersDir, res, body);
       } catch (err) {
         return errorResponse(res, 400, `读取请求体失败: ${err.message}`);
+      }
+    }
+    if (method === "POST" && (pathname === "/api/factory-tasks" || pathname.startsWith("/api/factory-tasks/"))) {
+      try {
+        const body = await readJsonBody(req);
+        return await handleFactoryTaskMutation(workersDir, res, pathname, method, body);
+      } catch (err) {
+        return handleFactoryTaskMutationError(res, err);
       }
     }
     if ((method === "POST" || method === "PATCH") && pathname === "/api/outsource/runs") {
@@ -770,9 +789,17 @@ function buildRouter({ workersDir }) {
         return errorResponse(res, 400, `读取请求体失败: ${err.message}`);
       }
     }
+    if (method === "PATCH" && pathname.startsWith("/api/factory-tasks/")) {
+      try {
+        const body = await readJsonBody(req);
+        return await handleFactoryTaskMutation(workersDir, res, pathname, method, body);
+      } catch (err) {
+        return handleFactoryTaskMutationError(res, err);
+      }
+    }
     if (method !== "GET") {
       res.writeHead(405, {
-        "allow": "GET, OPTIONS, POST /api/talk/*, POST /api/main-agent/talk, POST /api/task-requests, POST/PATCH /api/outsource/runs, POST/PATCH /api/notification-settings, PATCH /api/task-requests/*, POST /api/task-requests/*/cancel, PATCH /api/talk-requests/*, POST /api/talk-requests/*/cancel, POST /api/jobs/*/read, POST /api/jobs/*/cancel, PATCH /api/jobs/*, POST /api/messages/*/read, POST /api/workers/*/messages/read, POST /api/workers/*/read",
+        "allow": "GET, OPTIONS, POST/PATCH /api/factory-tasks*, POST /api/talk/*, POST /api/main-agent/talk, POST /api/task-requests, POST/PATCH /api/outsource/runs, POST/PATCH /api/notification-settings, PATCH /api/task-requests/*, POST /api/task-requests/*/cancel, PATCH /api/talk-requests/*, POST /api/talk-requests/*/cancel, POST /api/jobs/*/read, POST /api/jobs/*/cancel, PATCH /api/jobs/*, POST /api/messages/*/read, POST /api/workers/*/messages/read, POST /api/workers/*/read",
         "content-type": "application/json; charset=utf-8",
         "cache-control": "no-store",
       });
@@ -803,6 +830,9 @@ function buildRouter({ workersDir }) {
       if (pathname === "/api/notifications") return await handleNotifications(workersDir, res, url);
       if (pathname === "/api/permissions") return await handlePermissions(workersDir, res);
       if (pathname === "/api/messages") return await handleMessages(workersDir, res, url);
+      if (pathname === "/api/factory-tasks" || pathname.startsWith("/api/factory-tasks/")) {
+        return await handleFactoryTaskStatus(workersDir, res, pathname, url);
+      }
       if (pathname === "/api/task-requests" || pathname.startsWith("/api/task-requests/")) {
         return await handleWorkerTaskRequestStatus(workersDir, res, pathname, url);
       }
@@ -1526,6 +1556,167 @@ async function handleTalkMessage(workersDir, res, pathname, body) {
 // ---------------------------------------------------------------------------
 // Worker Task Requests · Web 版员工派活 intent
 // ---------------------------------------------------------------------------
+function factoryTaskActor(body) {
+  return String(body?.actor || body?.from || "用户").trim() || "用户";
+}
+
+function ensureFactoryTaskAssignee(workersDir, assignee, actor) {
+  const worker = String(assignee || "").trim();
+  if (!worker) return;
+  const sessionExists = existsSync(join(workersDir, "sessions", `${worker}.jsonl`));
+  const registry = getWorkerRegistry(workersDir);
+  const regInfo = registry.get(worker);
+  if (!sessionExists && !regInfo) throw new Error(`员工 ${worker} 不存在`);
+  if (regInfo?.status === "fired") throw new Error(`员工 ${worker} 已离职，不能指派任务`);
+  if (!hasPermission(workersDir, { subject: actor, action: "work:assign", target: worker })) {
+    const error = new Error(`${actor} 没有权限对 ${worker} 执行 work:assign`);
+    error.statusCode = 403;
+    throw error;
+  }
+}
+
+export function handleFactoryTaskMutationError(res, error) {
+  if (error instanceof FactoryTaskConflictError || error?.code === "FACTORY_TASK_REVISION_CONFLICT") {
+    return errorResponse(res, 409, "任务已被其他人更新", error.message);
+  }
+  const status = Number(error?.statusCode) || 400;
+  return errorResponse(res, status, "任务操作失败", error?.message || String(error));
+}
+
+function factoryTaskPath(pathname) {
+  const prefix = "/api/factory-tasks";
+  const rest = pathname.slice(prefix.length).replace(/^\/+/, "");
+  if (!rest) return { id: "", action: "" };
+  const parts = rest.split("/").map((part) => decodeURIComponent(part));
+  return { id: parts[0] || "", action: parts[1] || "" };
+}
+
+function splitQueryValues(url, key) {
+  return url.searchParams.getAll(key)
+    .flatMap((value) => String(value || "").split(","))
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
+export async function handleFactoryTaskMutation(workersDir, res, pathname, method, body = {}) {
+  const { id, action } = factoryTaskPath(pathname);
+  const actor = factoryTaskActor(body);
+
+  if (method === "POST" && !id) {
+    ensureFactoryTaskAssignee(workersDir, body.assignee, actor);
+    let task = createFactoryTask(workersDir, { ...body, creator: actor });
+    let request = null;
+    if (body.runNow === true) {
+      const dispatched = dispatchFactoryTask(workersDir, task.id, {
+        actor,
+        from: actor,
+        cwd: body.cwd,
+        mode: body.mode,
+        force: true,
+      });
+      task = dispatched.task;
+      request = dispatched.request;
+    }
+    return jsonResponse(res, body.runNow === true ? 202 : 201, {
+      ok: true,
+      task,
+      request,
+      note: request
+        ? "已创建看板任务和派活 intent；Pi 主进程会沿正常员工 job 链路执行。"
+        : "已创建全工厂共享看板任务。",
+    });
+  }
+
+  if (!id) return badRequest(res, "task id required");
+  const current = getFactoryTask(workersDir, id);
+  if (!current) return notFound(res, `factory task not found: ${id}`);
+
+  if (method === "PATCH" && !action) {
+    const nextAssignee = Object.hasOwn(body, "assignee") ? body.assignee : current.assignee;
+    if (Object.hasOwn(body, "assignee") || Object.hasOwn(body, "triggerAt")) {
+      ensureFactoryTaskAssignee(workersDir, nextAssignee, actor);
+    }
+    const task = updateFactoryTask(workersDir, id, { ...body, updatedBy: actor });
+    return jsonResponse(res, 200, { ok: true, task });
+  }
+
+  if (method === "POST" && action === "split") {
+    for (const child of body.children || []) ensureFactoryTaskAssignee(workersDir, child?.assignee, actor);
+    const children = splitFactoryTask(workersDir, id, {
+      children: body.children,
+      actor,
+      expectedRevision: body.expectedRevision,
+    });
+    return jsonResponse(res, 201, { ok: true, parentTaskId: id, children });
+  }
+
+  if (method === "POST" && (action === "archive" || action === "restore")) {
+    const task = action === "restore"
+      ? restoreFactoryTask(workersDir, id, { actor, expectedRevision: body.expectedRevision })
+      : archiveFactoryTask(workersDir, id, { actor, expectedRevision: body.expectedRevision });
+    return jsonResponse(res, 200, { ok: true, task });
+  }
+
+  if (method === "POST" && action === "run") {
+    ensureFactoryTaskAssignee(workersDir, current.assignee, actor);
+    const dispatched = dispatchFactoryTask(workersDir, id, {
+      actor,
+      from: actor,
+      cwd: body.cwd,
+      mode: body.mode || current.mode,
+      expectedRevision: body.expectedRevision,
+      force: true,
+    });
+    return jsonResponse(res, 202, {
+      ok: true,
+      task: dispatched.task,
+      request: dispatched.request,
+      note: "执行 intent 已写入；等待 Pi 主进程接管。",
+    });
+  }
+
+  return badRequest(res, `不支持的任务操作: ${method} ${pathname}`);
+}
+
+export async function handleFactoryTaskStatus(workersDir, res, pathname, url) {
+  const { id, action } = factoryTaskPath(pathname);
+  if (action) return notFound(res, `factory task route not found: ${pathname}`);
+  if (id) {
+    const task = getFactoryTask(workersDir, id, { includeEvents: true });
+    if (!task) return notFound(res, `factory task not found: ${id}`);
+    return jsonResponse(res, 200, { generatedAt: new Date().toISOString(), task });
+  }
+
+  const includeArchived = ["1", "true", "yes"].includes(String(url.searchParams.get("includeArchived") || "").toLowerCase());
+  const options = {
+    project: splitQueryValues(url, "project"),
+    status: splitQueryValues(url, "status"),
+    assignee: splitQueryValues(url, "assignee"),
+    priority: splitQueryValues(url, "priority"),
+    executionState: splitQueryValues(url, "executionState"),
+    labels: splitQueryValues(url, "label"),
+    query: url.searchParams.get("query") || "",
+    includeArchived,
+    limit: Math.min(5000, Math.max(1, Number(url.searchParams.get("limit")) || 1000)),
+  };
+  const tasks = listFactoryTasks(workersDir, options);
+  const statuses = [...new Set(tasks.map((task) => task.status).filter(Boolean))];
+  const allActive = listFactoryTasks(workersDir, { includeArchived, limit: 5000 });
+  return jsonResponse(res, 200, {
+    generatedAt: new Date().toISOString(),
+    total: tasks.length,
+    tasks,
+    statuses,
+    facets: {
+      projects: [...new Set(allActive.map((task) => task.project).filter(Boolean))].sort(),
+      assignees: [...new Set(allActive.map((task) => task.assignee).filter(Boolean))].sort(),
+      statuses: [...new Set(allActive.map((task) => task.status).filter(Boolean))],
+      priorities: [...new Set(allActive.map((task) => task.priority).filter(Boolean))],
+      executionStates: [...new Set(allActive.map((task) => task.execution?.state).filter(Boolean))],
+    },
+  });
+}
+
 async function handleWorkerTaskRequestCreate(workersDir, res, body) {
   const from = String(body?.from || "用户").trim() || "用户";
   const to = String(body?.to || body?.worker || "").trim();
@@ -2477,6 +2668,80 @@ function serveFile(res, filePath) {
 // ---------------------------------------------------------------------------
 // Bootstrap
 // ---------------------------------------------------------------------------
+function envNumber(name, fallback, min, max) {
+  const value = Number(process.env[name]);
+  if (!Number.isFinite(value)) return fallback;
+  return Math.max(min, Math.min(max, Math.round(value)));
+}
+
+export function createFactoryTaskScheduler({
+  workersDir,
+  graceMs = envNumber("OX_FACTORY_TASK_SCHEDULER_GRACE_MS", 15_000, 0, 300_000),
+  jitterMs = envNumber("OX_FACTORY_TASK_SCHEDULER_JITTER_MS", 15_000, 0, 300_000),
+  intervalMs = envNumber("OX_FACTORY_TASK_SCHEDULER_INTERVAL_MS", 5_000, 10, 300_000),
+  batchSize = envNumber("OX_FACTORY_TASK_SCHEDULER_BATCH_SIZE", 5, 1, 100),
+  random = Math.random,
+  dispatchDue = dispatchDueFactoryTasks,
+  onResult,
+  onError,
+} = {}) {
+  if (!workersDir) throw new Error("workersDir is required for task scheduler");
+  let startupTimer = null;
+  let intervalTimer = null;
+  let running = false;
+  let stopped = true;
+
+  const runOnce = async () => {
+    if (stopped || running) return { skipped: true };
+    running = true;
+    try {
+      const result = await dispatchDue(workersDir, {
+        actor: "web-scheduler",
+        limit: batchSize,
+        now: new Date(),
+      });
+      onResult?.(result);
+      return result;
+    } catch (error) {
+      onError?.(error);
+      return { checked: 0, dispatched: [], errors: [{ error: error?.message || String(error) }] };
+    } finally {
+      running = false;
+    }
+  };
+
+  const start = () => {
+    if (!stopped) return;
+    stopped = false;
+    const jitter = Math.max(0, Number(jitterMs) || 0);
+    const delay = Math.max(0, Number(graceMs) || 0) + Math.floor(Math.max(0, Math.min(1, Number(random()) || 0)) * jitter);
+    startupTimer = setTimeout(() => {
+      startupTimer = null;
+      void runOnce();
+      intervalTimer = setInterval(() => void runOnce(), Math.max(10, Number(intervalMs) || 5_000));
+      intervalTimer.unref?.();
+    }, delay);
+    startupTimer.unref?.();
+  };
+
+  const stop = () => {
+    stopped = true;
+    if (startupTimer) clearTimeout(startupTimer);
+    if (intervalTimer) clearInterval(intervalTimer);
+    startupTimer = null;
+    intervalTimer = null;
+  };
+
+  return {
+    start,
+    stop,
+    runOnce,
+    get state() {
+      return { running, stopped, graceMs, jitterMs, intervalMs, batchSize };
+    },
+  };
+}
+
 function main() {
   const args = parseArgs(process.argv.slice(2));
   if (!existsSync(args.workersDir)) {
@@ -2488,6 +2753,15 @@ function main() {
     process.exit(2);
   }
   const handler = buildRouter({ workersDir: args.workersDir });
+  const taskScheduler = createFactoryTaskScheduler({
+    workersDir: args.workersDir,
+    onResult: (result) => {
+      if (result?.dispatched?.length || result?.errors?.length) {
+        process.stdout.write(`[task-scheduler] dispatched=${result.dispatched.length} errors=${result.errors.length}\n`);
+      }
+    },
+    onError: (error) => process.stderr.write(`[task-scheduler] ${error?.message || String(error)}\n`),
+  });
   const server = createServer((req, res) => {
     handler(req, res).catch((err) => {
       // eslint-disable-next-line no-console
@@ -2500,6 +2774,7 @@ function main() {
     });
   });
   server.listen(args.port, args.host, () => {
+    taskScheduler.start();
     process.stdout.write(
       [
         "🐂🐴 牛马工厂本地 Web 驾驶舱 (Phase 1)",
@@ -2515,6 +2790,7 @@ function main() {
   });
   const shutdown = () => {
     process.stdout.write("\n[web-server] shutting down…\n");
+    taskScheduler.stop();
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 1500).unref();
   };

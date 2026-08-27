@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -32,6 +33,10 @@ import {
   findWorkerTaskRequestByExecutionKey,
   listWorkerTaskRequests,
 } from "../task-requests.mjs";
+import {
+  buildRouter,
+  createFactoryTaskScheduler,
+} from "../web-server.mjs";
 
 function withWorkersDir(fn) {
   const workersDir = mkdtempSync(join(tmpdir(), "ox-factory-task-board-"));
@@ -39,6 +44,28 @@ function withWorkersDir(fn) {
     return fn(workersDir);
   } finally {
     rmSync(workersDir, { recursive: true, force: true });
+  }
+}
+
+async function withWorkersDirAsync(fn) {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-factory-task-board-"));
+  try {
+    return await fn(workersDir);
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+}
+
+async function withTaskApi(workersDir, fn) {
+  const handler = buildRouter({ workersDir });
+  const server = createServer((req, res) => handler(req, res));
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  try {
+    return await fn(baseUrl);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
   }
 }
 
@@ -334,5 +361,100 @@ test("factory task dispatcher supports explicit immediate runs and stable assign
     assert.equal(result.request.from, "派派");
     assert.equal(result.request.to, "阿哲");
     assert.equal(result.task.execution.state, "queued");
+  });
+});
+
+test("factory task web API supports CRUD, filters, split, archive, and revision conflicts", async () => {
+  await withWorkersDirAsync(async (workersDir) => {
+    await withTaskApi(workersDir, async (baseUrl) => {
+      const createdResponse = await fetch(`${baseUrl}/api/factory-tasks`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          title: "Web 看板任务",
+          project: "talk",
+          status: "设计中",
+          context: "用户和牛马共同维护",
+          priority: "high",
+          actor: "用户",
+        }),
+      });
+      assert.equal(createdResponse.status, 201);
+      const created = (await createdResponse.json()).task;
+      assert.equal(created.status, "设计中");
+
+      const listResponse = await fetch(`${baseUrl}/api/factory-tasks?project=talk&status=${encodeURIComponent("设计中")}`);
+      assert.equal(listResponse.status, 200);
+      const listed = await listResponse.json();
+      assert.equal(listed.tasks.length, 1);
+      assert.deepEqual(listed.statuses, ["设计中"]);
+
+      const updatedResponse = await fetch(`${baseUrl}/api/factory-tasks/${encodeURIComponent(created.id)}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ status: "待验收", expectedRevision: created.revision, actor: "用户" }),
+      });
+      assert.equal(updatedResponse.status, 200);
+      const updated = (await updatedResponse.json()).task;
+      assert.equal(updated.status, "待验收");
+
+      const conflictResponse = await fetch(`${baseUrl}/api/factory-tasks/${encodeURIComponent(created.id)}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ status: "完成", expectedRevision: created.revision, actor: "用户" }),
+      });
+      assert.equal(conflictResponse.status, 409);
+
+      const splitResponse = await fetch(`${baseUrl}/api/factory-tasks/${encodeURIComponent(created.id)}/split`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ actor: "用户", children: [{ title: "后端" }, { title: "页面", status: "设计中" }] }),
+      });
+      assert.equal(splitResponse.status, 201);
+      const split = await splitResponse.json();
+      assert.equal(split.children.length, 2);
+
+      const archiveResponse = await fetch(`${baseUrl}/api/factory-tasks/${encodeURIComponent(split.children[0].id)}/archive`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ actor: "用户" }),
+      });
+      assert.equal(archiveResponse.status, 200);
+      assert.ok((await archiveResponse.json()).task.archivedAt);
+
+      const detailResponse = await fetch(`${baseUrl}/api/factory-tasks/${encodeURIComponent(created.id)}`);
+      assert.equal(detailResponse.status, 200);
+      const detail = (await detailResponse.json()).task;
+      assert.equal(detail.childTaskIds.length, 2);
+      assert.ok(detail.events.length >= 3);
+    });
+  });
+});
+
+test("factory task scheduler waits for startup grace, batches scans, and stops cleanly", async () => {
+  await withWorkersDirAsync(async (workersDir) => {
+    let calls = 0;
+    const scheduler = createFactoryTaskScheduler({
+      workersDir,
+      graceMs: 25,
+      jitterMs: 0,
+      intervalMs: 15,
+      batchSize: 2,
+      dispatchDue: (_dir, options) => {
+        calls += 1;
+        assert.equal(options.limit, 2);
+        return { checked: 0, dispatched: [], errors: [] };
+      },
+    });
+
+    scheduler.start();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(calls, 0);
+    await new Promise((resolve) => setTimeout(resolve, 45));
+    assert.ok(calls >= 1);
+    scheduler.stop();
+    const stoppedAt = calls;
+    await new Promise((resolve) => setTimeout(resolve, 35));
+    assert.equal(calls, stoppedAt);
   });
 });
