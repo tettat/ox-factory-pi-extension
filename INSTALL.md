@@ -110,7 +110,7 @@ pi
 
 ## 启动 Web dashboard
 
-Web dashboard 是本地只读页面，默认读取宿主项目的 `.pi/workers` 运行数据。
+Web dashboard 默认读取宿主项目的 `.pi/workers` 运行数据；大部分管理视图保持 read-first，任务看板等明确操作会写入同一目录下的本地事件总账。
 
 推荐在 Pi 里直接执行：
 

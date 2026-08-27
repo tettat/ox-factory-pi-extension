@@ -8,6 +8,6 @@
     "install-check": "node install-check.mjs",
     "check": "node --check projects.mjs && node --check task-board.mjs && node --check task-dispatcher.mjs && node --check factory-handbook.mjs && node --check worker-prompts.mjs && node --check codex-backend.mjs && node --check claude-backend.mjs && node --check kimi-backend.mjs && node --check codex-thread-audit.mjs && node --check web-talk.mjs && node --check web-job-read.mjs && node --check main-agent-talk.mjs && node --check task-requests.mjs && node --check outsource-agents.mjs && node --check outsource-runner.mjs && node --check outsource-dispatcher.mjs && node --check outsource-worker.mjs && node --check outsource-cli.mjs && node --check worker-registry-snapshot.mjs && node --check markdown-preview.mjs && node --check notifications.mjs && node --check comm-cli.mjs && node --check web-server.mjs && node --check web/app.js && node --check install-check.mjs && bash -n scripts/install.sh && node validate-tools.mjs",
     "test": "node --test test/*.test.mjs",
-    "verify": "npm run check && npm test"
+    "verify": "pnpm run check && pnpm test"
   }
 }

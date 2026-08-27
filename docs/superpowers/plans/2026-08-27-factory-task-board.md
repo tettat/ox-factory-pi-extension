@@ -1,6 +1,6 @@
 # Factory-wide Task Board Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Build a durable factory-wide Kanban board that humans and workers can edit, and dispatch immediate or scheduled assignments through the existing Pi worker-job path without cron.
 
@@ -16,11 +16,11 @@
 - Create: `task-board.mjs`
 - Create: `test/factory-task-board.test.mjs`
 
-- [ ] Write failing tests for creation, free-form status updates, revision conflicts, filters, splitting, archive/restore, event history, and stale dispatch lease recovery.
-- [ ] Run `node --test --test-name-pattern="factory task board" test/ox-factory.test.mjs` and confirm failure because `task-board.mjs` does not exist.
-- [ ] Implement JSONL projection, validation, per-task atomic locks, CRUD/split/archive APIs, status derivation, and execution transitions.
-- [ ] Re-run the targeted tests and confirm they pass.
-- [ ] Commit `task-board.mjs` and tests as `feat: add durable factory task board store`.
+- [x] Write failing tests for creation, free-form status updates, revision conflicts, filters, splitting, archive/restore, event history, and stale dispatch lease recovery.
+- [x] Run `node --test --test-name-pattern="factory task board" test/ox-factory.test.mjs` and confirm failure because `task-board.mjs` does not exist.
+- [x] Implement JSONL projection, validation, per-task atomic locks, CRUD/split/archive APIs, status derivation, and execution transitions.
+- [x] Re-run the targeted tests and confirm they pass.
+- [x] Commit `task-board.mjs` and tests as `feat: add durable factory task board store`.
 
 ### Task 2: Idempotent dispatch bridge
 
@@ -29,11 +29,11 @@
 - Modify: `task-requests.mjs`
 - Modify: `test/factory-task-board.test.mjs`
 
-- [ ] Write failing tests showing one due task creates exactly one request per `executionKey`, repeated scans are no-ops, expired leases recover, future tasks remain scheduled, and request records preserve `factoryTaskId`.
-- [ ] Run the targeted task-dispatch tests and confirm expected failures.
-- [ ] Extend worker task request metadata without changing existing request semantics; implement due selection and idempotent request creation.
-- [ ] Re-run task-board/task-dispatch tests and all task-request tests.
-- [ ] Commit as `feat: dispatch due board tasks through worker requests`.
+- [x] Write failing tests showing one due task creates exactly one request per `executionKey`, repeated scans are no-ops, expired leases recover, future tasks remain scheduled, and request records preserve `factoryTaskId`.
+- [x] Run the targeted task-dispatch tests and confirm expected failures.
+- [x] Extend worker task request metadata without changing existing request semantics; implement due selection and idempotent request creation.
+- [x] Re-run task-board/task-dispatch tests and all task-request tests.
+- [x] Commit as `feat: dispatch due board tasks through worker requests`.
 
 ### Task 3: Pi job lifecycle and Agent tools
 
@@ -44,12 +44,12 @@
 - Modify: `test/factory-task-board.test.mjs`
 - Modify: `test/ox-factory.test.mjs`
 
-- [ ] Write failing source/behavior tests for task tools, assignment compatibility, permission checks, board task ID in worker prompts, accepted job linkage, and terminal execution evidence.
-- [ ] Run targeted tests and confirm they fail for missing registrations/integration.
-- [ ] Register create/list/get/update/split/archive/run tools; adapt `factory_task_assign` to create a board task and dispatch it; write request/job lifecycle back to the task store.
-- [ ] Document task-board CLI/tool usage in the worker handbook and add new modules to `pnpm run check`.
-- [ ] Run targeted tests and `pnpm run check`.
-- [ ] Commit as `feat: expose task board to factory workers`.
+- [x] Write failing source/behavior tests for task tools, assignment compatibility, permission checks, board task ID in worker prompts, accepted job linkage, and terminal execution evidence.
+- [x] Run targeted tests and confirm they fail for missing registrations/integration.
+- [x] Register create/list/get/update/split/archive/run tools; adapt `factory_task_assign` to create a board task and dispatch it; write request/job lifecycle back to the task store.
+- [x] Document task-board CLI/tool usage in the worker handbook and add new modules to `pnpm run check`.
+- [x] Run targeted tests and `pnpm run check`.
+- [x] Commit as `feat: expose task board to factory workers`.
 
 ### Task 4: Web API and scheduler
 
@@ -57,12 +57,12 @@
 - Modify: `web-server.mjs`
 - Modify: `test/factory-task-board.test.mjs`
 
-- [ ] Write failing HTTP/store tests for list/detail/create/update/split/archive/run endpoints, 409 revision conflicts, server-side filters, and delayed/batched scheduler behavior.
-- [ ] Run targeted Web API tests and confirm expected failures.
-- [ ] Add `/api/factory-tasks` routes and handlers, trusted-local validation, worker existence/assignment permission checks, and an exported scheduler controller with grace, jitter, interval, and batch limits.
-- [ ] Start the scheduler only from `main()`, unref timers, and stop timers during graceful shutdown so imports/tests remain side-effect free.
-- [ ] Run targeted Web tests and `node --check web-server.mjs`.
-- [ ] Commit as `feat: add task board web api and scheduler`.
+- [x] Write failing HTTP/store tests for list/detail/create/update/split/archive/run endpoints, 409 revision conflicts, server-side filters, and delayed/batched scheduler behavior.
+- [x] Run targeted Web API tests and confirm expected failures.
+- [x] Add `/api/factory-tasks` routes and handlers, trusted-local validation, worker existence/assignment permission checks, and an exported scheduler controller with grace, jitter, interval, and batch limits.
+- [x] Start the scheduler only from `main()`, unref timers, and stop timers during graceful shutdown so imports/tests remain side-effect free.
+- [x] Run targeted Web tests and `node --check web-server.mjs`.
+- [x] Commit as `feat: add task board web api and scheduler`.
 
 ### Task 5: Kanban Web UI
 
@@ -73,13 +73,13 @@
 - Modify: `test/factory-task-board.test.mjs`
 - Modify: `test/ox-factory.test.mjs`
 
-- [ ] Write failing static contract tests for visible board navigation, free-form status columns, project/status/assignee/archive filters, drag/drop revision update, create/edit/run/split/archive actions, keyboard-accessible status editing, and responsive styles.
-- [ ] Run targeted UI tests and confirm expected failures.
-- [ ] Replace `renderTaskRequests` at `#/tasks` with global board rendering; preserve low-level request drawer under `#/task-requests/:id`.
-- [ ] Implement task detail/create forms in the existing drawer, explicit loading/error feedback, drag/drop with revision conflicts, and accessible filter controls.
-- [ ] Add responsive Kanban styling using existing design tokens, visible focus states, reduced-motion handling, and mobile column layout.
-- [ ] Run `node --check web/app.js` and targeted UI tests.
-- [ ] Commit as `feat(web): add factory task kanban board`.
+- [x] Write failing static contract tests for visible board navigation, free-form status columns, project/status/assignee/archive filters, drag/drop revision update, create/edit/run/split/archive actions, keyboard-accessible status editing, and responsive styles.
+- [x] Run targeted UI tests and confirm expected failures.
+- [x] Replace `renderTaskRequests` at `#/tasks` with global board rendering; preserve low-level request drawer under `#/task-requests/:id`.
+- [x] Implement task detail/create forms in the existing drawer, explicit loading/error feedback, drag/drop with revision conflicts, and accessible filter controls.
+- [x] Add responsive Kanban styling using existing design tokens, visible focus states, reduced-motion handling, and mobile column layout.
+- [x] Run `node --check web/app.js` and targeted UI tests.
+- [x] Commit as `feat(web): add factory task kanban board`.
 
 ### Task 6: Recovery, performance, and end-to-end verification
 
@@ -88,12 +88,12 @@
 - Modify: `test/factory-task-board.test.mjs`
 - Modify: `docs/superpowers/specs/2026-08-27-factory-task-board-design.md` only if implementation facts require clarification
 
-- [ ] Add a temporary-directory integration test covering create → scheduled dispatch scan → worker request link → simulated accepted/running/terminal evidence, including a repeated scan assertion.
-- [ ] Document board URLs, agent tools, storage file, scheduler environment variables, one-shot scheduling, and the separation between display/execution status.
-- [ ] Run `git diff --check`, `pnpm run check`, and `pnpm test` and fix every failure.
-- [ ] Start `web-server.mjs` against a fresh temp workers directory and use HTTP requests to smoke-test board create/list/update/split/archive without touching the real factory directory.
-- [ ] Review the spec requirement-by-requirement and record any residual limitations in the final report.
-- [ ] Commit as `docs: document factory task board operations`.
+- [x] Add a temporary-directory integration test covering create → scheduled dispatch scan → worker request link → simulated accepted/running/terminal evidence, including a repeated scan assertion.
+- [x] Document board URLs, agent tools, storage file, scheduler environment variables, one-shot scheduling, and the separation between display/execution status.
+- [x] Run `git diff --check`, `pnpm run check`, and `pnpm test` and fix every failure.
+- [x] Start `web-server.mjs` against a fresh temp workers directory and use HTTP requests to smoke-test board create/list/update/split/archive without touching the real factory directory.
+- [x] Review the spec requirement-by-requirement and record any residual limitations in the final report.
+- [x] Commit as `docs: document factory task board operations`.
 
 ## Self-review
 
