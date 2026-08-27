@@ -1805,17 +1805,17 @@ test("web task requests are event-sourced for dashboard delegation", () => {
   assert.doesNotMatch(webServerSource, /createJob\(workersDir,\s*\{\s*kind:\s*"assigned-task"/);
 });
 
-test("web dashboard keeps worker task delegation route while hiding nav entry", () => {
+test("web dashboard exposes factory task board and keeps worker request audit route", () => {
   const html = readFileSync(join(testDir, "../web/index.html"), "utf8");
   const webAppSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
   const styleSource = readFileSync(join(testDir, "../web/styles.css"), "utf8");
 
-  assert.doesNotMatch(html, /data-route="tasks"/);
-  assert.doesNotMatch(html, /data-i18n="nav\.tasks"/);
-  assert.match(webAppSource, /"nav\.tasks":\s*"派活"/);
+  assert.match(html, /data-route="tasks"/);
+  assert.match(html, /data-i18n="nav\.tasks"/);
+  assert.match(webAppSource, /"nav\.tasks":\s*"任务看板"/);
   assert.match(webAppSource, /async function renderTaskRequests/);
   assert.match(webAppSource, /api\("\/api\/task-requests/);
-  assert.match(webAppSource, /route === "tasks"/);
+  assert.match(webAppSource, /route === "task-requests"/);
   assert.match(webAppSource, /renderTaskRequests\(\)/);
   assert.match(webAppSource, /openTaskRequestDrawer/);
   assert.match(styleSource, /\.task-grid/);

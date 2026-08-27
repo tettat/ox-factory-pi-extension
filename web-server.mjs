@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 牛马工厂本地 Web 驾驶舱 (Phase 1)
+// 牛马工厂本地 Web 协作驾驶舱
 // ---------------------------------------------------------------------------
 // 目标：把 .pi/workers/ 下的工厂运行数据聚合成一个本地仪表盘。
 // 边界：读优先；Web talk/control 只写 intent，由 Pi 主进程接管执行。不写权限 / 不 apply 主 agent 压缩 / 不扫全局 session。
@@ -141,7 +141,7 @@ function parseArgs(argv) {
 function printHelp() {
   process.stdout.write(
     [
-      "牛马工厂本地 Web 驾驶舱 (Phase 1)",
+      "牛马工厂本地 Web 协作驾驶舱",
       "",
       "用法:",
       "  node .pi/extensions/ox-factory/web-server.mjs [--workers-dir <dir>] [--port <n>] [--host <addr>]",
@@ -2777,13 +2777,13 @@ function main() {
     taskScheduler.start();
     process.stdout.write(
       [
-        "🐂🐴 牛马工厂本地 Web 驾驶舱 (Phase 1)",
+        "🐂🐴 牛马工厂本地 Web 协作驾驶舱",
         `   version:   ${VERSION}`,
         `   workers:   ${args.workersDir}`,
         `   listen:    http://${args.host}:${args.port}`,
         `   static:    ${WEB_DIR}`,
         "",
-        "  按 Ctrl+C 停止。Phase 1 只读，不写权限 / 不派活 / 不 apply 压缩。",
+        "  按 Ctrl+C 停止。任务看板写入本地总账，员工派活由 Pi 主进程接管。",
         "",
       ].join("\n"),
     );

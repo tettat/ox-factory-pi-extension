@@ -458,3 +458,36 @@ test("factory task scheduler waits for startup grace, batches scans, and stops c
     assert.equal(calls, stoppedAt);
   });
 });
+
+test("factory task web UI exposes a global accessible Kanban board", () => {
+  const appSource = readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
+  const htmlSource = readFileSync(new URL("../web/index.html", import.meta.url), "utf8");
+  const cssSource = readFileSync(new URL("../web/styles.css", import.meta.url), "utf8");
+
+  assert.match(htmlSource, /href="#\/tasks"[^>]+data-route="tasks"/);
+  assert.match(htmlSource, /data-i18n="nav\.tasks"/);
+  assert.match(appSource, /async function renderFactoryTaskBoard/);
+  assert.match(appSource, /function factoryTaskCard/);
+  assert.match(appSource, /async function moveFactoryTask/);
+  assert.match(appSource, /draggable:\s*"true"/);
+  assert.match(appSource, /ondragstart:/);
+  assert.match(appSource, /ondrop:/);
+  assert.match(appSource, /expectedRevision:\s*task\.revision/);
+  assert.match(appSource, /openNewFactoryTaskDrawer/);
+  assert.match(appSource, /openFactoryTaskDrawer/);
+  assert.match(appSource, /saveFactoryTaskForm/);
+  assert.match(appSource, /splitFactoryTaskFromDrawer/);
+  assert.match(appSource, /runFactoryTaskFromDrawer/);
+  assert.match(appSource, /archiveFactoryTaskFromDrawer/);
+  assert.match(appSource, /factoryTaskProjectFilter/);
+  assert.match(appSource, /factoryTaskStatusFilter/);
+  assert.match(appSource, /factoryTaskAssigneeFilter/);
+  assert.match(appSource, /factoryTaskArchiveFilter/);
+  assert.match(appSource, /\/api\/factory-tasks/);
+  assert.match(appSource, /route === "task-requests"/);
+  assert.match(cssSource, /\.factory-board\s*\{/);
+  assert.match(cssSource, /\.factory-board__column\s*\{/);
+  assert.match(cssSource, /\.factory-task-card:focus-visible/);
+  assert.match(cssSource, /@media \(prefers-reduced-motion: reduce\)/);
+  assert.match(cssSource, /@media \(max-width: 640px\)[\s\S]*\.factory-board/);
+});

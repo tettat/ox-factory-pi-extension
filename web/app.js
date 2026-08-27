@@ -1,4 +1,4 @@
-// 牛马工厂本地 Web 驾驶舱 · Phase 1 客户端
+// 牛马工厂本地 Web 协作驾驶舱
 // 纯原生 JS，无依赖；不引第三方库。
 // ---------------------------------------------------------------------------
 
@@ -15,7 +15,7 @@
     zh: {
       "app.title": "牛马工厂 · 驾驶舱",
       "brand.title": "牛马工厂",
-      "brand.subtitle": "本地驾驶舱 · 只读",
+      "brand.subtitle": "本地协作驾驶舱",
       "health.loading": "加载中…",
       "metrics.workers": "员工",
       "metrics.jobs": "Jobs",
@@ -29,7 +29,7 @@
       "nav.projects": "项目",
       "nav.workers": "员工",
       "nav.jobs": "任务",
-      "nav.tasks": "派活",
+      "nav.tasks": "任务看板",
       "nav.schedules": "定时任务",
       "nav.tokens": "Token",
       "nav.compactions": "压缩",
@@ -44,7 +44,7 @@
     en: {
       "app.title": "Ox Factory · Dashboard",
       "brand.title": "Ox Factory",
-      "brand.subtitle": "Local Dashboard · Read-only",
+      "brand.subtitle": "Local Collaboration Dashboard",
       "health.loading": "Loading…",
       "metrics.workers": "Workers",
       "metrics.jobs": "Jobs",
@@ -58,7 +58,7 @@
       "nav.projects": "Projects",
       "nav.workers": "Workers",
       "nav.jobs": "Jobs",
-      "nav.tasks": "Tasks",
+      "nav.tasks": "Task Board",
       "nav.schedules": "Schedules",
       "nav.tokens": "Tokens",
       "nav.compactions": "Compactions",
@@ -76,6 +76,18 @@
     workers: [],
     jobs: [],
     taskRequests: [],
+    factoryTasks: [],
+    factoryTaskFacets: {},
+    factoryTaskFilters: {
+      query: "",
+      project: "",
+      status: "",
+      assignee: "",
+      priority: "",
+      executionState: "",
+      includeArchived: false,
+    },
+    factoryTaskDragId: null,
     notificationSettings: null,
     notificationPollTimer: null,
     notificationPollInFlight: false,
@@ -4145,6 +4157,442 @@
     }
   }
 
+  function factoryTaskQueryString(filters = STATE.factoryTaskFilters) {
+    const query = new URLSearchParams();
+    for (const key of ["query", "project", "status", "assignee", "priority", "executionState"]) {
+      if (filters[key]) query.set(key, filters[key]);
+    }
+    if (filters.includeArchived) query.set("includeArchived", "true");
+    query.set("limit", "1000");
+    return query.toString();
+  }
+
+  function factoryTaskStatusRank(status) {
+    const normalized = String(status || "").trim().toLowerCase();
+    const ranks = [
+      [/^(todo|待办|待处理)$/i, 10],
+      [/(设计|方案)/, 20],
+      [/(进行中|开发中|处理中|doing|progress)/i, 30],
+      [/(blocked|阻塞|等待)/i, 40],
+      [/(review|验收|评审|测试)/i, 50],
+      [/(done|完成|已完成)/i, 90],
+    ];
+    return ranks.find(([pattern]) => pattern.test(normalized))?.[1] ?? 60;
+  }
+
+  function factoryTaskExecutionLabel(state) {
+    return ({
+      idle: "未执行",
+      scheduled: "待触发",
+      dispatching: "派发中",
+      queued: "已排队",
+      running: "执行中",
+      succeeded: "执行成功",
+      failed: "执行失败",
+      cancelled: "已取消",
+    })[state] || state || "未执行";
+  }
+
+  function factoryTaskPriorityLabel(priority) {
+    return ({ low: "低", normal: "普通", high: "高", urgent: "紧急" })[priority] || priority || "普通";
+  }
+
+  function factoryTaskCard(task) {
+    const executionState = task.execution?.state || "idle";
+    return el("article", {
+      class: `factory-task-card factory-task-card--${task.priority || "normal"}`,
+      tabindex: "0",
+      role: "button",
+      draggable: "true",
+      data: { taskId: task.id },
+      "aria-label": `${task.title}，状态 ${task.status}，负责人 ${task.assignee || "未指派"}`,
+      onclick: () => openFactoryTaskDrawer(task.id),
+      onkeydown: (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          openFactoryTaskDrawer(task.id);
+        }
+      },
+      ondragstart: (event) => {
+        STATE.factoryTaskDragId = task.id;
+        event.dataTransfer.effectAllowed = "move";
+        event.dataTransfer.setData("text/plain", task.id);
+        event.currentTarget.classList.add("factory-task-card--dragging");
+      },
+      ondragend: (event) => {
+        STATE.factoryTaskDragId = null;
+        event.currentTarget.classList.remove("factory-task-card--dragging");
+      },
+    }, [
+      el("div", { class: "factory-task-card__head" }, [
+        el("span", { class: `factory-task-card__priority factory-task-card__priority--${task.priority || "normal"}`, text: factoryTaskPriorityLabel(task.priority) }),
+        el("span", { class: `factory-task-card__execution factory-task-card__execution--${executionState}`, text: factoryTaskExecutionLabel(executionState) }),
+      ]),
+      el("h3", { class: "factory-task-card__title", text: task.title }),
+      task.description ? el("p", { class: "factory-task-card__description", text: task.description }) : null,
+      el("div", { class: "factory-task-card__route" }, [
+        task.project ? el("span", { class: "tag tag--soft", text: task.project }) : el("span", { class: "muted", text: "无项目" }),
+        el("span", { class: "factory-task-card__assignee", text: task.assignee || "未指派" }),
+      ]),
+      task.labels?.length ? el("div", { class: "factory-task-card__labels" }, task.labels.slice(0, 4).map((label) => el("span", { class: "tag tag--soft", text: label }))) : null,
+      el("div", { class: "factory-task-card__foot" }, [
+        task.parentTaskId ? el("span", { text: "子任务" }) : el("span", { text: `#${String(task.id).slice(-6)}` }),
+        task.triggerAt ? el("time", { datetime: task.triggerAt, text: `触发 ${fmtTime(task.triggerAt)}` }) : el("span", { text: `更新 ${fmtRelative(task.updatedAt)}` }),
+      ]),
+    ]);
+  }
+
+  async function moveFactoryTask(taskId, nextStatus) {
+    const task = STATE.factoryTasks.find((item) => item.id === taskId);
+    if (!task || !nextStatus || task.status === nextStatus) return;
+    const card = document.querySelector(`.factory-task-card[data-task-id="${CSS.escape(taskId)}"]`);
+    card?.classList.add("factory-task-card--saving");
+    const res = await api(`/api/factory-tasks/${encodeURIComponent(taskId)}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ status: nextStatus, expectedRevision: task.revision, actor: "用户" }),
+    });
+    if (!res.ok) {
+      toast(res.status === 409 ? "任务刚被其他人更新，已刷新看板" : "移动任务失败", "error");
+    } else {
+      toast(`已移动到「${nextStatus}」`, "success");
+    }
+    await refreshFactoryTaskBoard();
+  }
+
+  function factoryTaskColumn(status, tasks) {
+    return el("section", {
+      class: "factory-board__column",
+      data: { status },
+      "aria-label": `${status}，${tasks.length} 个任务`,
+      ondragover: (event) => {
+        event.preventDefault();
+        event.dataTransfer.dropEffect = "move";
+        event.currentTarget.classList.add("factory-board__column--over");
+      },
+      ondragleave: (event) => event.currentTarget.classList.remove("factory-board__column--over"),
+      ondrop: (event) => {
+        event.preventDefault();
+        event.currentTarget.classList.remove("factory-board__column--over");
+        const taskId = event.dataTransfer.getData("text/plain") || STATE.factoryTaskDragId;
+        if (taskId) void moveFactoryTask(taskId, status);
+      },
+    }, [
+      el("header", { class: "factory-board__column-head" }, [
+        el("div", { class: "factory-board__column-title" }, [
+          el("span", { class: "factory-board__status-dot", "aria-hidden": "true" }),
+          el("h2", { text: status }),
+        ]),
+        el("span", { class: "factory-board__count", text: String(tasks.length), title: `${tasks.length} 个任务` }),
+      ]),
+      el("div", { class: "factory-board__cards" }, tasks.length
+        ? tasks.map(factoryTaskCard)
+        : [el("div", { class: "factory-board__empty", text: "拖动任务到这里" })]),
+    ]);
+  }
+
+  function factoryTaskFilterSelect(id, label, value, options, onchange) {
+    return el("label", { class: "filters__group" }, [
+      el("span", { class: "filters__label", text: label }),
+      el("select", { class: "input", id, onchange }, [
+        el("option", { value: "", text: "全部" }),
+        ...options.map((option) => el("option", { value: option, text: option, selected: option === value })),
+      ]),
+    ]);
+  }
+
+  async function refreshFactoryTaskBoard() {
+    const node = await renderFactoryTaskBoard();
+    if (STATE.currentPage !== "tasks") return;
+    const main = $("#main");
+    main.innerHTML = "";
+    main.appendChild(node);
+  }
+
+  function updateFactoryTaskFilter(key, value) {
+    STATE.factoryTaskFilters[key] = value;
+    void refreshFactoryTaskBoard();
+  }
+
+  async function renderFactoryTaskBoard() {
+    const wrap = el("div", { class: "page page--factory-tasks" });
+    const query = factoryTaskQueryString();
+    const [res, workersRes] = await Promise.all([
+      api(`/api/factory-tasks?${query}`),
+      STATE.workers.length ? Promise.resolve({ ok: true, data: { workers: STATE.workers } }) : api("/api/workers"),
+    ]);
+    if (!res.ok) {
+      wrap.appendChild(errorBox("加载任务看板失败", res.detail));
+      return wrap;
+    }
+    if (workersRes.ok) STATE.workers = workersRes.data.workers || [];
+    STATE.factoryTasks = res.data.tasks || [];
+    STATE.factoryTaskFacets = res.data.facets || {};
+    const filters = STATE.factoryTaskFilters;
+    const tasks = STATE.factoryTasks;
+    const statuses = [...(res.data.statuses || [])].sort((a, b) => factoryTaskStatusRank(a) - factoryTaskStatusRank(b));
+    const running = tasks.filter((task) => ["dispatching", "queued", "running"].includes(task.execution?.state)).length;
+    const scheduled = tasks.filter((task) => task.execution?.state === "scheduled").length;
+
+    wrap.appendChild(el("section", { class: "factory-task-hero" }, [
+      el("div", {}, [
+        el("span", { class: "eyebrow", text: "FACTORY TASK BOARD" }),
+        el("h1", { text: "全局任务看板" }),
+        el("p", { text: "一套总账，项目只是筛选。状态由人和牛马按真实工作阶段共同维护。" }),
+      ]),
+      el("div", { class: "factory-task-hero__actions" }, [
+        el("a", { class: "btn btn--ghost", href: "#/task-requests", text: "派活审计" }),
+        el("button", { class: "btn btn--primary", type: "button", text: "新建任务", onclick: openNewFactoryTaskDrawer }),
+      ]),
+    ]));
+
+    wrap.appendChild(el("section", { class: "factory-task-summary", "aria-label": "看板摘要" }, [
+      el("div", {}, [el("strong", { text: String(tasks.length) }), el("span", { text: "当前任务" })]),
+      el("div", {}, [el("strong", { text: String(statuses.length) }), el("span", { text: "实际状态" })]),
+      el("div", {}, [el("strong", { text: String(running) }), el("span", { text: "执行中" })]),
+      el("div", {}, [el("strong", { text: String(scheduled) }), el("span", { text: "待触发" })]),
+    ]));
+
+    wrap.appendChild(el("section", { class: "filters factory-task-filters", "aria-label": "任务筛选" }, [
+      el("label", { class: "filters__group filters__group--grow" }, [
+        el("span", { class: "filters__label", text: "搜索" }),
+        el("input", {
+          class: "input",
+          id: "factoryTaskSearchFilter",
+          type: "search",
+          value: filters.query,
+          placeholder: "标题、上下文、标签",
+          oninput: debounce((event) => updateFactoryTaskFilter("query", event.target.value.trim()), 250),
+        }),
+      ]),
+      factoryTaskFilterSelect("factoryTaskProjectFilter", "项目", filters.project, STATE.factoryTaskFacets.projects || [], (event) => updateFactoryTaskFilter("project", event.target.value)),
+      factoryTaskFilterSelect("factoryTaskStatusFilter", "状态", filters.status, STATE.factoryTaskFacets.statuses || [], (event) => updateFactoryTaskFilter("status", event.target.value)),
+      factoryTaskFilterSelect("factoryTaskAssigneeFilter", "负责人", filters.assignee, STATE.factoryTaskFacets.assignees || [], (event) => updateFactoryTaskFilter("assignee", event.target.value)),
+      factoryTaskFilterSelect("factoryTaskPriorityFilter", "优先级", filters.priority, ["urgent", "high", "normal", "low"], (event) => updateFactoryTaskFilter("priority", event.target.value)),
+      factoryTaskFilterSelect("factoryTaskExecutionFilter", "执行", filters.executionState, STATE.factoryTaskFacets.executionStates || [], (event) => updateFactoryTaskFilter("executionState", event.target.value)),
+      el("label", { class: "factory-task-filter-check" }, [
+        el("input", {
+          id: "factoryTaskArchiveFilter",
+          type: "checkbox",
+          checked: filters.includeArchived,
+          onchange: (event) => updateFactoryTaskFilter("includeArchived", event.target.checked),
+        }),
+        el("span", { text: "包含归档" }),
+      ]),
+    ]));
+
+    if (!tasks.length) {
+      wrap.appendChild(emptyState("暂无匹配任务", "新建第一条任务，或清除筛选条件。"));
+      return wrap;
+    }
+    wrap.appendChild(el("div", { class: "factory-board", role: "region", "aria-label": "任务状态看板", tabindex: "0" },
+      statuses.map((status) => factoryTaskColumn(status, tasks.filter((task) => task.status === status)))));
+    return wrap;
+  }
+
+  function toDatetimeLocal(value) {
+    if (!value) return "";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "";
+    const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+    return local.toISOString().slice(0, 16);
+  }
+
+  function factoryTaskForm(task = null) {
+    const isNew = !task;
+    const record = task || { priority: "normal", status: "TODO", mode: "auto", labels: [] };
+    const form = el("form", { class: "factory-task-form", id: "factoryTaskForm" }, [
+      el("label", { class: "factory-task-form__field factory-task-form__field--wide" }, [
+        el("span", { text: "标题" }),
+        el("input", { class: "input", name: "title", required: "true", maxlength: "240", value: record.title || "", placeholder: "要推进什么？" }),
+      ]),
+      el("label", { class: "factory-task-form__field factory-task-form__field--wide" }, [
+        el("span", { text: "任务说明" }),
+        el("textarea", { class: "input", name: "description", rows: "4", placeholder: "交付物、验收标准、边界", text: record.description || "" }),
+      ]),
+      el("label", { class: "factory-task-form__field factory-task-form__field--wide" }, [
+        el("span", { text: "上下文" }),
+        el("textarea", { class: "input", name: "context", rows: "5", placeholder: "背景、约束、决策和交接信息", text: record.context || "" }),
+      ]),
+      el("label", { class: "factory-task-form__field" }, [
+        el("span", { text: "项目" }),
+        el("input", { class: "input", name: "project", value: record.project || "", placeholder: "可为空" }),
+      ]),
+      el("label", { class: "factory-task-form__field" }, [
+        el("span", { text: "状态（自由输入）" }),
+        el("input", { class: "input", name: "status", list: "factoryTaskStatusOptions", required: "true", value: record.status || "TODO" }),
+        el("datalist", { id: "factoryTaskStatusOptions" }, (STATE.factoryTaskFacets.statuses || []).map((status) => el("option", { value: status }))),
+      ]),
+      el("label", { class: "factory-task-form__field" }, [
+        el("span", { text: "负责人" }),
+        el("select", { class: "input", name: "assignee" }, [
+          el("option", { value: "", text: "未指派" }),
+          ...STATE.workers.map((worker) => el("option", { value: worker.name, text: worker.name, selected: worker.name === record.assignee })),
+        ]),
+      ]),
+      el("label", { class: "factory-task-form__field" }, [
+        el("span", { text: "优先级" }),
+        el("select", { class: "input", name: "priority" }, ["low", "normal", "high", "urgent"].map((value) => el("option", { value, text: factoryTaskPriorityLabel(value), selected: value === record.priority }))),
+      ]),
+      el("label", { class: "factory-task-form__field factory-task-form__field--wide" }, [
+        el("span", { text: "标签（逗号分隔）" }),
+        el("input", { class: "input", name: "labels", value: (record.labels || []).join(", ") }),
+      ]),
+      el("label", { class: "factory-task-form__field" }, [
+        el("span", { text: "触发时间" }),
+        el("input", { class: "input", name: "triggerAt", type: "datetime-local", value: toDatetimeLocal(record.triggerAt) }),
+      ]),
+      el("label", { class: "factory-task-form__field" }, [
+        el("span", { text: "执行方式" }),
+        el("select", { class: "input", name: "mode" }, ["auto", "queue", "steer", "now"].map((value) => el("option", { value, text: value, selected: value === record.mode }))),
+      ]),
+      isNew ? el("label", { class: "factory-task-filter-check factory-task-form__field--wide" }, [
+        el("input", { name: "runNow", type: "checkbox" }),
+        el("span", { text: "创建后立即执行（需要负责人）" }),
+      ]) : null,
+      el("div", { class: "factory-task-form__actions factory-task-form__field--wide" }, [
+        el("button", { class: "btn btn--primary", type: "submit", text: isNew ? "创建任务" : "保存修改" }),
+      ]),
+    ]);
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      void saveFactoryTaskForm(form, task);
+    });
+    return form;
+  }
+
+  function factoryTaskFormPayload(form) {
+    const data = new FormData(form);
+    const triggerValue = String(data.get("triggerAt") || "").trim();
+    return {
+      title: String(data.get("title") || "").trim(),
+      description: String(data.get("description") || "").trim(),
+      context: String(data.get("context") || "").trim(),
+      project: String(data.get("project") || "").trim(),
+      status: String(data.get("status") || "TODO").trim(),
+      assignee: String(data.get("assignee") || "").trim(),
+      priority: String(data.get("priority") || "normal"),
+      labels: String(data.get("labels") || "").split(/[,，]/).map((item) => item.trim()).filter(Boolean),
+      triggerAt: triggerValue ? new Date(triggerValue).toISOString() : "",
+      mode: String(data.get("mode") || "auto"),
+      runNow: data.get("runNow") === "on",
+      actor: "用户",
+    };
+  }
+
+  async function saveFactoryTaskForm(form, task = null) {
+    const submit = form.querySelector('button[type="submit"]');
+    submit.disabled = true;
+    submit.textContent = task ? "保存中…" : "创建中…";
+    const payload = factoryTaskFormPayload(form);
+    if (task) {
+      payload.expectedRevision = task.revision;
+      delete payload.runNow;
+    }
+    const res = await api(task ? `/api/factory-tasks/${encodeURIComponent(task.id)}` : "/api/factory-tasks", {
+      method: task ? "PATCH" : "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      submit.disabled = false;
+      submit.textContent = task ? "保存修改" : "创建任务";
+      toast(res.status === 409 ? "任务已被其他人更新，请重新打开" : "保存任务失败", "error");
+      if (res.status === 409 && task) void openFactoryTaskDrawer(task.id);
+      return;
+    }
+    toast(task ? "任务已更新" : "任务已创建", "success");
+    closeDrawer();
+    await refreshFactoryTaskBoard();
+  }
+
+  function openNewFactoryTaskDrawer() {
+    openDrawer(factoryTaskForm(), { eyebrow: "NEW TASK", title: "新建任务" });
+    requestAnimationFrame(() => document.querySelector('#factoryTaskForm input[name="title"]')?.focus());
+  }
+
+  async function splitFactoryTaskFromDrawer(task) {
+    const title = String($("#factoryTaskSplitTitle")?.value || "").trim();
+    if (!title) { toast("请先填写子任务标题", "error"); return; }
+    const res = await api(`/api/factory-tasks/${encodeURIComponent(task.id)}/split`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ actor: "用户", expectedRevision: task.revision, children: [{ title, project: task.project, status: "TODO" }] }),
+    });
+    if (!res.ok) { toast(res.status === 409 ? "任务已更新，请重试" : "拆分失败", "error"); return; }
+    toast("已创建子任务", "success");
+    await refreshFactoryTaskBoard();
+    void openFactoryTaskDrawer(task.id);
+  }
+
+  async function runFactoryTaskFromDrawer(task) {
+    if (!task.assignee) { toast("请先设置负责人", "error"); return; }
+    const res = await api(`/api/factory-tasks/${encodeURIComponent(task.id)}/run`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ actor: "用户", expectedRevision: task.revision }),
+    });
+    if (!res.ok) { toast(res.status === 409 ? "任务已更新，请重试" : "请求执行失败", "error"); return; }
+    toast("已提交执行请求", "success");
+    await refreshFactoryTaskBoard();
+    void openFactoryTaskDrawer(task.id);
+  }
+
+  async function archiveFactoryTaskFromDrawer(task) {
+    const action = task.archivedAt ? "restore" : "archive";
+    const res = await api(`/api/factory-tasks/${encodeURIComponent(task.id)}/${action}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ actor: "用户", expectedRevision: task.revision }),
+    });
+    if (!res.ok) { toast(res.status === 409 ? "任务已更新，请重试" : "归档操作失败", "error"); return; }
+    toast(action === "restore" ? "任务已恢复" : "任务已归档", "success");
+    closeDrawer();
+    await refreshFactoryTaskBoard();
+  }
+
+  async function openFactoryTaskDrawer(id) {
+    openDrawer(el("div", { class: "skeleton skeleton--row" }), { eyebrow: "TASK", title: "加载中…" });
+    const res = await api(`/api/factory-tasks/${encodeURIComponent(id)}`);
+    if (!res.ok) {
+      openDrawer(errorBox("加载任务详情失败", res.detail), { eyebrow: "TASK", title: id });
+      return;
+    }
+    const task = res.data.task;
+    const content = el("div", { class: "factory-task-detail" }, [
+      el("section", { class: "factory-task-detail__summary" }, [
+        el("div", {}, [el("span", { class: "muted", text: "人类状态" }), el("strong", { text: task.status })]),
+        el("div", {}, [el("span", { class: "muted", text: "执行状态" }), el("strong", { text: factoryTaskExecutionLabel(task.execution?.state) })]),
+        el("div", {}, [el("span", { class: "muted", text: "Revision" }), el("strong", { text: String(task.revision) })]),
+      ]),
+      factoryTaskForm(task),
+      el("section", { class: "factory-task-detail__actions" }, [
+        el("button", { class: "btn", type: "button", text: "立即执行", disabled: !task.assignee, onclick: () => runFactoryTaskFromDrawer(task) }),
+        el("button", { class: task.archivedAt ? "btn" : "btn btn--danger", type: "button", text: task.archivedAt ? "恢复任务" : "归档任务", onclick: () => archiveFactoryTaskFromDrawer(task) }),
+        task.execution?.jobId ? el("button", { class: "btn btn--ghost", type: "button", text: `查看 Job ${String(task.execution.jobId).slice(-6)}`, onclick: () => openJobDrawer(task.execution.jobId) }) : null,
+        task.execution?.taskRequestId ? el("a", { class: "btn btn--ghost", href: `#/task-requests/${encodeURIComponent(task.execution.taskRequestId)}`, text: "查看派活请求" }) : null,
+      ]),
+      el("section", { class: "factory-task-detail__split" }, [
+        el("h4", { text: "拆分子任务" }),
+        el("div", { class: "factory-task-detail__split-row" }, [
+          el("input", { class: "input", id: "factoryTaskSplitTitle", placeholder: "子任务标题" }),
+          el("button", { class: "btn", type: "button", text: "添加子任务", onclick: () => splitFactoryTaskFromDrawer(task) }),
+        ]),
+        task.childTaskIds?.length ? el("div", { class: "factory-task-detail__children" }, task.childTaskIds.map((childId) => el("button", { class: "btn btn--ghost", type: "button", text: childId, onclick: () => openFactoryTaskDrawer(childId) }))) : el("p", { class: "muted", text: "暂无子任务" }),
+      ]),
+      el("section", { class: "factory-task-detail__timeline" }, [
+        el("h4", { text: `事件时间线 (${task.events?.length || 0})` }),
+        el("ul", { class: "timeline" }, (task.events || []).slice().reverse().map((event) => el("li", { class: `timeline__item timeline__item--${event.type}` }, [
+          el("span", { class: "timeline__time", text: fmtTime(event.at) }),
+          el("span", { class: "timeline__type", text: event.type }),
+          el("span", { class: "timeline__name", text: event.actor || "—" }),
+          el("span", { class: "timeline__text", text: event.data?.jobLinked ? "已关联员工 Job" : event.execution?.resultSummary || event.execution?.error || "—" }),
+        ]))),
+      ]),
+    ]);
+    openDrawer(content, { eyebrow: task.parentTaskId ? "SUBTASK" : "TASK", title: task.title });
+  }
+
   function taskRequestEventText(ev) {
     if (!ev) return "—";
     const parts = [];
@@ -4724,6 +5172,12 @@ async function route() {
         if (status || project || worker) loadJobs();
         if (path[1]) openJobDrawer(path[1]);
       } else if (route === "tasks") {
+        const node = await renderFactoryTaskBoard();
+        if (isStale()) return;
+        main.innerHTML = "";
+        main.appendChild(node);
+        if (path[1]) openFactoryTaskDrawer(decodeURIComponent(path[1]));
+      } else if (route === "task-requests") {
         const node = await renderTaskRequests();
         if (isStale()) return;
         main.innerHTML = "";
@@ -4831,6 +5285,10 @@ async function route() {
       await loadJobs();
       if (path[1]) openJobDrawer(path[1]);
     } else if (route === "tasks") {
+      const node = await renderFactoryTaskBoard();
+      const m = $("#main"); m.innerHTML = ""; m.appendChild(node);
+      if (path[1]) openFactoryTaskDrawer(decodeURIComponent(path[1]));
+    } else if (route === "task-requests") {
       const node = await renderTaskRequests();
       const m = $("#main"); m.innerHTML = ""; m.appendChild(node);
       if (path[1]) openTaskRequestDrawer(decodeURIComponent(path[1]));
