@@ -55,7 +55,7 @@ function normalizeList(value, fallback = []) {
 
 function normalizeBackend(value) {
   const backend = nonEmptyString(value, "pi").toLowerCase();
-  if (!["pi", "codex"].includes(backend)) {
+  if (!["pi", "codex", "claude"].includes(backend)) {
     throw new Error(`不支持的外包后端: ${value}`);
   }
   return backend;
@@ -97,6 +97,14 @@ function normalizeNonNegativeNumber(value, fallback = 0, max = Number.MAX_SAFE_I
   const numberValue = Number(value);
   if (!Number.isFinite(numberValue)) return fallback;
   return Math.max(0, Math.min(max, Math.floor(numberValue)));
+}
+
+function normalizeClaudePermissionMode(value) {
+  const mode = nonEmptyString(value);
+  if (!mode) return "";
+  const allowed = new Set(["acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"]);
+  if (!allowed.has(mode)) throw new Error(`非法 Claude permission mode: ${value}`);
+  return mode;
 }
 
 function summarize(text, max = 1000) {
@@ -148,10 +156,23 @@ export function normalizeOutsourceProfile(input = {}) {
     maxTurns: normalizePositiveNumber(input.maxTurns ?? input.max_turns, 1, 1, 50),
     defaultWait: input.defaultWait == null ? true : Boolean(input.defaultWait),
     timeoutMs: normalizeNonNegativeNumber(input.timeoutMs ?? input.timeout_ms, 0),
+    claudeCommand: nonEmptyString(input.claudeCommand || input.claude_command),
+    claudePermissionMode: normalizeClaudePermissionMode(input.claudePermissionMode || input.claude_permission_mode),
+    claudeTools: nonEmptyString(input.claudeTools || input.claude_tools),
+    claudeAllowedTools: normalizeList(input.claudeAllowedTools || input.claude_allowed_tools),
+    claudeDisallowedTools: normalizeList(input.claudeDisallowedTools || input.claude_disallowed_tools),
   };
+  if (input.claudeBare !== undefined || input.claude_bare !== undefined) {
+    profile.claudeBare = Boolean(input.claudeBare ?? input.claude_bare);
+  }
   if (!profile.thinking) delete profile.thinking;
   if (!profile.model) delete profile.model;
   if (!profile.systemPrompt) delete profile.systemPrompt;
+  if (!profile.claudeCommand) delete profile.claudeCommand;
+  if (!profile.claudePermissionMode) delete profile.claudePermissionMode;
+  if (!profile.claudeTools) delete profile.claudeTools;
+  if (!profile.claudeAllowedTools.length) delete profile.claudeAllowedTools;
+  if (!profile.claudeDisallowedTools.length) delete profile.claudeDisallowedTools;
   return profile;
 }
 

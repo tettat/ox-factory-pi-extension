@@ -59,6 +59,7 @@ export function init(cwd: string) {
 export interface HireOptions {
   backend?: WorkerBackend;
   codexThreadId?: string;
+  codexThreadInitialized?: boolean;
   codexServerUrl?: string;
   codexApprovalPolicy?: Worker["codexApprovalPolicy"];
   codexSandbox?: Worker["codexSandbox"];
@@ -71,6 +72,10 @@ export interface HireOptions {
   claudeAllowedTools?: string[] | string;
   claudeDisallowedTools?: string[] | string;
   claudeBare?: boolean;
+  kimiSessionId?: string;
+  kimiSessionInitialized?: boolean;
+  kimiCwd?: string;
+  kimiCommand?: string;
 }
 
 export function hire(name: string, role: WorkerRole, model?: string, thinking?: string, options: HireOptions = {}): Worker {
@@ -86,6 +91,7 @@ export function hire(name: string, role: WorkerRole, model?: string, thinking?: 
     model,
     thinking: thinking as Worker["thinking"],
     codexThreadId: options.codexThreadId,
+    codexThreadInitialized: options.codexThreadInitialized,
     codexServerUrl: options.codexServerUrl,
     codexApprovalPolicy: options.codexApprovalPolicy,
     codexSandbox: options.codexSandbox,
@@ -99,6 +105,10 @@ export function hire(name: string, role: WorkerRole, model?: string, thinking?: 
     claudeAllowedTools: options.claudeAllowedTools,
     claudeDisallowedTools: options.claudeDisallowedTools,
     claudeBare: options.claudeBare,
+    kimiSessionId: options.kimiSessionId,
+    kimiSessionInitialized: options.kimiSessionInitialized,
+    kimiCwd: options.kimiCwd,
+    kimiCommand: options.kimiCommand,
     status: "idle",
     hired: new Date().toISOString().slice(0, 10),
     projects: [],
@@ -119,6 +129,7 @@ export function hire(name: string, role: WorkerRole, model?: string, thinking?: 
     model,
     thinking: w.thinking,
     codexThreadId: w.codexThreadId,
+    codexThreadInitialized: w.codexThreadInitialized,
     codexServerUrl: w.codexServerUrl,
     codexApprovalPolicy: w.codexApprovalPolicy,
     codexSandbox: w.codexSandbox,
@@ -132,6 +143,10 @@ export function hire(name: string, role: WorkerRole, model?: string, thinking?: 
     claudeAllowedTools: w.claudeAllowedTools,
     claudeDisallowedTools: w.claudeDisallowedTools,
     claudeBare: w.claudeBare,
+    kimiSessionId: w.kimiSessionId,
+    kimiSessionInitialized: w.kimiSessionInitialized,
+    kimiCwd: w.kimiCwd,
+    kimiCommand: w.kimiCommand,
     hired: w.hired,
     sessionFile: w.sessionFile,
   });
@@ -149,6 +164,7 @@ export function updateWorkerConfig(workerId: string, patch: Partial<Worker>) {
     "model",
     "thinking",
     "codexThreadId",
+    "codexThreadInitialized",
     "codexServerUrl",
     "codexApprovalPolicy",
     "codexSandbox",
@@ -162,6 +178,10 @@ export function updateWorkerConfig(workerId: string, patch: Partial<Worker>) {
     "claudeAllowedTools",
     "claudeDisallowedTools",
     "claudeBare",
+    "kimiSessionId",
+    "kimiSessionInitialized",
+    "kimiCwd",
+    "kimiCommand",
   ] as const;
 
   const entry: Record<string, unknown> = { workerId };
@@ -394,12 +414,14 @@ function workerStatusIcon(w: Worker): string {
 function backendLabel(backend?: WorkerBackend): string {
   if (backend === "codex") return "Codex";
   if (backend === "claude") return "Claude";
+  if (backend === "kimi") return "Kimi";
   return "Pi";
 }
 
 function backendProfileLabel(backend?: WorkerBackend): string {
   if (backend === "codex") return "Codex app-server";
   if (backend === "claude") return "Claude Code CLI";
+  if (backend === "kimi") return "Kimi Code CLI";
   return "Pi CLI";
 }
 
@@ -456,6 +478,7 @@ export function formatWorkerProfile(w: Worker): string {
   }
   if (w.codexThreadId) lines.push(`\n**Codex Thread**：${w.codexThreadId}`);
   if (w.claudeSessionId) lines.push(`\n**Claude Session**：${w.claudeSessionId}`);
+  if (w.kimiSessionId) lines.push(`\n**Kimi Session**：${w.kimiSessionId}`);
   if (w.promotions.length > 0) {
     lines.push("");
     lines.push(`**角色变动**：${w.promotions.map((p) => `${p.from} → ${p.to} (${p.date})`).join(" · ")}`);
@@ -497,6 +520,7 @@ export function restoreFromEntries(entries: any[]) {
           model: backend === "codex" ? normalizeCodexModel(d.model) : d.model,
           thinking: d.thinking,
           codexThreadId: d.codexThreadId,
+          codexThreadInitialized: d.codexThreadInitialized,
           codexServerUrl: d.codexServerUrl,
           codexApprovalPolicy: d.codexApprovalPolicy,
           codexSandbox: d.codexSandbox,
@@ -510,6 +534,10 @@ export function restoreFromEntries(entries: any[]) {
           claudeAllowedTools: d.claudeAllowedTools,
           claudeDisallowedTools: d.claudeDisallowedTools,
           claudeBare: d.claudeBare,
+          kimiSessionId: d.kimiSessionId,
+          kimiSessionInitialized: d.kimiSessionInitialized,
+          kimiCwd: d.kimiCwd,
+          kimiCommand: d.kimiCommand,
           status: (d.status as WorkerStatus) || "idle",
           hired: d.hired,
     projects: [],
@@ -574,6 +602,7 @@ export function restoreFromEntries(entries: any[]) {
           if (entry.data.model) w.model = (w.backend ?? "pi") === "codex" ? normalizeCodexModel(entry.data.model) : entry.data.model;
           if (entry.data.thinking) w.thinking = entry.data.thinking;
           if ("codexThreadId" in entry.data) w.codexThreadId = entry.data.codexThreadId;
+          if ("codexThreadInitialized" in entry.data) w.codexThreadInitialized = entry.data.codexThreadInitialized;
           if ("codexServerUrl" in entry.data) w.codexServerUrl = entry.data.codexServerUrl;
           if ("codexApprovalPolicy" in entry.data) w.codexApprovalPolicy = entry.data.codexApprovalPolicy;
           if ("codexSandbox" in entry.data) w.codexSandbox = entry.data.codexSandbox;
@@ -587,6 +616,10 @@ export function restoreFromEntries(entries: any[]) {
           if ("claudeAllowedTools" in entry.data) w.claudeAllowedTools = entry.data.claudeAllowedTools;
           if ("claudeDisallowedTools" in entry.data) w.claudeDisallowedTools = entry.data.claudeDisallowedTools;
           if ("claudeBare" in entry.data) w.claudeBare = entry.data.claudeBare;
+          if ("kimiSessionId" in entry.data) w.kimiSessionId = entry.data.kimiSessionId;
+          if ("kimiSessionInitialized" in entry.data) w.kimiSessionInitialized = entry.data.kimiSessionInitialized;
+          if ("kimiCwd" in entry.data) w.kimiCwd = entry.data.kimiCwd;
+          if ("kimiCommand" in entry.data) w.kimiCommand = entry.data.kimiCommand;
         }
         break;
       }

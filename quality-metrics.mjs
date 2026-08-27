@@ -257,6 +257,49 @@ function entryTimeMs(entry) {
   return Number.isFinite(date.getTime()) ? date.getTime() : NaN;
 }
 
+function sessionEntryText(entry) {
+  if (!entry || typeof entry !== "object") return "";
+  if (entry.type === "message") return messageText(entry.message);
+  if (entry.type === "custom_message") return contentToText(entry.content);
+  if (entry.type === "branch_summary") return String(entry.summary || "");
+  if (entry.type === "compaction") return String(entry.summary || "");
+  return "";
+}
+
+function isContextMessageEntry(entry) {
+  return Boolean(entry && ["message", "custom_message", "branch_summary"].includes(entry.type));
+}
+
+function buildActiveSessionContextText(entries = []) {
+  const latestCompactionIndex = entries.reduce((latest, entry, index) => (entry?.type === "compaction" ? index : latest), -1);
+  if (latestCompactionIndex < 0) {
+    return entries.filter(isContextMessageEntry).map(sessionEntryText).filter(Boolean).join("\n");
+  }
+
+  const compaction = entries[latestCompactionIndex];
+  const activeParts = [String(compaction.summary || "")].filter(Boolean);
+
+  let foundFirstKept = false;
+  for (let i = 0; i < latestCompactionIndex; i += 1) {
+    const entry = entries[i];
+    if (entry?.id && entry.id === compaction.firstKeptEntryId) foundFirstKept = true;
+    if (foundFirstKept && isContextMessageEntry(entry)) {
+      const text = sessionEntryText(entry);
+      if (text) activeParts.push(text);
+    }
+  }
+
+  for (let i = latestCompactionIndex + 1; i < entries.length; i += 1) {
+    const entry = entries[i];
+    if (isContextMessageEntry(entry)) {
+      const text = sessionEntryText(entry);
+      if (text) activeParts.push(text);
+    }
+  }
+
+  return activeParts.join("\n");
+}
+
 function readSessionStats(workersDir, worker, options = {}) {
   const data = readSessionData(workersDir, worker, options.cache);
   const file = data.file;
@@ -274,12 +317,17 @@ function readSessionStats(workersDir, worker, options = {}) {
       latestCompactionAt: null,
       latestTokensBefore: 0,
       estimatedContextTokens: 0,
+      activeContextTokens: 0,
+      sessionFileTokens: 0,
       bytes: 0,
     };
   }
 
-  const entries = data.entries;
-  let text = "";
+  const entries = data.entries.filter((entry) => {
+    const ts = entryTimeMs(entry);
+    return !(Number.isFinite(asOfMs) && Number.isFinite(ts) && ts > asOfMs);
+  });
+  let sessionFileText = "";
   let messageCount = 0;
   let userTurns = 0;
   let assistantTurns = 0;
@@ -288,21 +336,24 @@ function readSessionStats(workersDir, worker, options = {}) {
   let latestTokensBefore = 0;
 
   for (const entry of entries) {
-    const ts = entryTimeMs(entry);
-    if (Number.isFinite(asOfMs) && Number.isFinite(ts) && ts > asOfMs) continue;
     if (entry.type === "message") {
       messageCount += 1;
       const role = entry.message?.role || "";
       if (role === "user") userTurns += 1;
       if (role === "assistant") assistantTurns += 1;
-      text += `\n${messageText(entry.message)}`;
+      sessionFileText += `\n${messageText(entry.message)}`;
     } else if (entry.type === "compaction") {
       compactionCount += 1;
       latestCompactionAt = entry.timestamp || latestCompactionAt;
       latestTokensBefore = Number(entry.tokensBefore || latestTokensBefore || 0);
-      text += `\n${entry.summary || ""}`;
+      sessionFileText += `\n${entry.summary || ""}`;
+    } else if (entry.type === "custom_message" || entry.type === "branch_summary") {
+      sessionFileText += `\n${sessionEntryText(entry)}`;
     }
   }
+
+  const activeContextTokens = estimateTokens(buildActiveSessionContextText(entries));
+  const sessionFileTokens = estimateTokens(sessionFileText);
 
   return {
     sessionFile: file,
@@ -314,7 +365,9 @@ function readSessionStats(workersDir, worker, options = {}) {
     compactionCount,
     latestCompactionAt,
     latestTokensBefore,
-    estimatedContextTokens: estimateTokens(text),
+    estimatedContextTokens: activeContextTokens,
+    activeContextTokens,
+    sessionFileTokens,
     bytes: data.bytes,
   };
 }
@@ -605,11 +658,11 @@ export function formatFactoryQualityReport(report = {}) {
     `- 情绪评分：${report.config?.enabled ? "开启" : "关闭"} (${report.config?.provider || "-"}/${report.config?.model || "-"})`,
     `- 样本 turn：${report.totals?.turns || 0}，已评分：${report.totals?.scoredTurns || 0}，平均情绪：${report.totals?.avgEmotionScore ?? "-"}`,
     "",
-    "| 员工 | 会话轮次 | 上下文估算 tok | 压缩次数 | Job 样本 | 平均输入字 | 平均输出字 | 平均耗时 | 工具调用 | 平均情绪 |",
-    "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    "| 员工 | 会话轮次 | 当前上下文 tok | 历史文件 tok | 压缩次数 | Job 样本 | 平均输入字 | 平均输出字 | 平均耗时 | 工具调用 | 平均情绪 |",
+    "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
   ];
   for (const worker of report.workers || []) {
-    lines.push(`| ${worker.worker} | ${worker.session?.userTurns || 0} | ${fmtNumber(worker.session?.estimatedContextTokens || 0)} | ${worker.session?.compactionCount || 0} | ${worker.jobs?.count || 0} | ${worker.jobs?.avgInputChars || 0} | ${worker.jobs?.avgOutputChars || 0} | ${worker.jobs?.avgResponseMs || 0}ms | ${worker.jobs?.toolCalls || 0} | ${worker.jobs?.avgEmotionScore ?? "-"} |`);
+    lines.push(`| ${worker.worker} | ${worker.session?.userTurns || 0} | ${fmtNumber(worker.session?.activeContextTokens ?? worker.session?.estimatedContextTokens ?? 0)} | ${fmtNumber(worker.session?.sessionFileTokens || 0)} | ${worker.session?.compactionCount || 0} | ${worker.jobs?.count || 0} | ${worker.jobs?.avgInputChars || 0} | ${worker.jobs?.avgOutputChars || 0} | ${worker.jobs?.avgResponseMs || 0}ms | ${worker.jobs?.toolCalls || 0} | ${worker.jobs?.avgEmotionScore ?? "-"} |`);
   }
   return lines.join("\n");
 }

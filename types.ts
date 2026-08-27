@@ -8,7 +8,7 @@ export const ALL_ROLES: WorkerRole[] = ["programmer", "tester", "reviewer", "for
 
 export type WorkerStatus = "idle" | "working" | "vacation" | "fired";
 
-export type WorkerBackend = "pi" | "codex" | "claude";
+export type WorkerBackend = "pi" | "codex" | "claude" | "kimi";
 
 export interface ProjectRecord {
   project: string;
@@ -51,6 +51,7 @@ export interface Worker {
   model?: string;
   thinking?: ThinkingLevel;
   codexThreadId?: string | null;
+  codexThreadInitialized?: boolean;
   codexServerUrl?: string;
   codexApprovalPolicy?: "untrusted" | "on-failure" | "on-request" | "never";
   codexSandbox?: "read-only" | "workspace-write" | "danger-full-access";
@@ -65,6 +66,10 @@ export interface Worker {
   claudeAllowedTools?: string[] | string;
   claudeDisallowedTools?: string[] | string;
   claudeBare?: boolean;
+  kimiSessionId?: string | null;
+  kimiSessionInitialized?: boolean;
+  kimiCwd?: string | null;
+  kimiCommand?: string;
   status: WorkerStatus;
   hired: string;
   projects: ProjectRecord[];

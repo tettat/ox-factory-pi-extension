@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -12,6 +13,7 @@ import {
   normalizeCodexEffort,
   normalizeCodexModel,
 } from "./codex-backend.mjs";
+import { runClaudeWorkerStreaming } from "./claude-backend.mjs";
 
 const DEFAULT_OUTSOURCE_SYSTEM_PROMPT = [
   "你是牛马工厂临时外包 agent。",
@@ -368,9 +370,42 @@ export async function runOutsourceCodexStreaming({ profile = {}, task = "", cwd,
   }
 }
 
+export async function runOutsourceClaudeStreaming({ profile = {}, task = "", project = "", cwd, workersDir, signal } = {}, onEvent = () => {}) {
+  const worker = {
+    id: `outsource-${profile.name || "agent"}`,
+    role: "programmer",
+    backend: "claude",
+    model: profile.model || "",
+    thinking: profile.thinking,
+    claudeSessionId: randomUUID(),
+    claudeSessionInitialized: false,
+    claudeCwd: cwd || process.cwd(),
+    claudeCommand: profile.claudeCommand,
+    claudePermissionMode: profile.claudePermissionMode || "bypassPermissions",
+    claudeTools: profile.claudeTools,
+    claudeAllowedTools: profile.claudeAllowedTools,
+    claudeDisallowedTools: profile.claudeDisallowedTools,
+    claudeBare: profile.claudeBare,
+  };
+  return runClaudeWorkerStreaming(
+    {
+      worker,
+      task,
+      project,
+      cwd,
+      additionalContext: "",
+      signal,
+      agentDef: String(profile.systemPrompt || DEFAULT_OUTSOURCE_SYSTEM_PROMPT),
+      workersDir: workersDir || process.cwd(),
+    },
+    onEvent,
+  );
+}
+
 export async function runOutsourceAgentStreaming(options = {}, onEvent = () => {}) {
   const profile = options.profile || {};
   const backend = String(profile.backend || "pi").toLowerCase();
   if (backend === "codex") return runOutsourceCodexStreaming(options, onEvent);
+  if (backend === "claude") return runOutsourceClaudeStreaming(options, onEvent);
   return runOutsourcePiStreaming(options, onEvent);
 }

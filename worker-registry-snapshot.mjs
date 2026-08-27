@@ -27,6 +27,7 @@ function applyWorkerPatch(worker, data) {
     "model",
     "thinking",
     "codexThreadId",
+    "codexThreadInitialized",
     "codexServerUrl",
     "codexApprovalPolicy",
     "codexSandbox",
@@ -40,6 +41,10 @@ function applyWorkerPatch(worker, data) {
     "claudeAllowedTools",
     "claudeDisallowedTools",
     "claudeBare",
+    "kimiSessionId",
+    "kimiSessionInitialized",
+    "kimiCwd",
+    "kimiCommand",
     "sessionFile",
   ];
   for (const field of fields) {

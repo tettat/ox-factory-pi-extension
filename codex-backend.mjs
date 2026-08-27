@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { createWriteStream, mkdirSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { buildWorkerSystemPrompt, buildWorkerTaskPrompt } from "./worker-prompts.mjs";
 
@@ -235,19 +235,26 @@ export function assertCodexThreadBinding(worker = {}) {
   return threadId;
 }
 
+function applyWorkerPatch(worker = {}, patch = {}, onWorkerPatch) {
+  // Persist first. Registry persistence compares against the current Worker
+  // object; mutating that object before the callback makes durable changes look
+  // like no-ops after reload.
+  onWorkerPatch?.(patch);
+  Object.assign(worker, patch);
+}
+
 export function reconcileCodexThreadId(worker = {}, resumedThreadId, onWorkerPatch) {
   const threadId = String(resumedThreadId || "").trim();
   if (!threadId) {
     throw new Error(`Codex worker ${worker.id || "(unknown)"} resume returned an empty thread id`);
   }
   if (worker.codexThreadId !== threadId) {
-    worker.codexThreadId = threadId;
     const patch = {
       codexThreadId: threadId,
       codexServerUrl: getCodexServerUrl(worker),
       model: normalizeCodexModel(worker.model) || worker.model,
     };
-    onWorkerPatch?.(patch);
+    applyWorkerPatch(worker, patch, onWorkerPatch);
   }
   return threadId;
 }
@@ -495,6 +502,31 @@ function shouldReplaceCodexThread(error) {
   return /no rollout found|thread .*not found|unknown thread/i.test(message);
 }
 
+function hasSuccessfulCodexWorkerJob(workerId, workersDir) {
+  const id = String(workerId || "").trim();
+  const jobsDir = workersDir ? join(workersDir, "jobs") : "";
+  if (!id || !jobsDir || !existsSync(jobsDir)) return false;
+  for (const file of readdirSync(jobsDir)) {
+    if (!file.endsWith(".json")) continue;
+    try {
+      const job = JSON.parse(readFileSync(join(jobsDir, file), "utf8"));
+      if (job?.worker === id && job?.status === "done") return true;
+    } catch {
+      // Ignore corrupt job files; the safety decision remains conservative
+      // unless another successful job is found.
+    }
+  }
+  return false;
+}
+
+export function canReplaceMissingCodexThread(worker = {}, workersDir = "") {
+  if ((worker.backend || "codex") !== "codex") return false;
+  if (worker.codexThreadInitialized === true) return false;
+  if (!String(worker.codexThreadId || "").trim()) return false;
+  if (worker.codexThreadInitialized === false) return true;
+  return Boolean(workersDir) && !hasSuccessfulCodexWorkerJob(worker.id, workersDir);
+}
+
 export async function createCodexWorkerThread({ worker, cwd, agentDef, workersDir }) {
   const url = getCodexServerUrl(worker);
   await ensureCodexAppServer(url, { workersDir });
@@ -521,8 +553,7 @@ async function ensureThread(client, { worker, cwd, agentDef, workersDir, onWorke
   await ensureCodexAppServer(url, { workersDir });
   const model = normalizeCodexModel(worker.model);
   if (model && model !== worker.model) {
-    worker.model = model;
-    onWorkerPatch?.({ model });
+    applyWorkerPatch(worker, { model }, onWorkerPatch);
   }
 
   const boundThreadId = assertCodexThreadBinding(worker);
@@ -538,6 +569,16 @@ async function ensureThread(client, { worker, cwd, agentDef, workersDir, onWorke
     return reconcileCodexThreadId(worker, resume.thread.id, onWorkerPatch);
   } catch (error) {
     if (!shouldReplaceCodexThread(error)) throw error;
+    if (canReplaceMissingCodexThread(worker, workersDir)) {
+      const start = await startThread(client, { worker, cwd, agentDef, workersDir, ephemeral: false });
+      const threadId = reconcileCodexThreadId(worker, start.thread.id, onWorkerPatch);
+      applyWorkerPatch(worker, {
+        codexThreadInitialized: false,
+        codexServerUrl: url,
+        model: start.model || model || worker.model,
+      }, onWorkerPatch);
+      return threadId;
+    }
     throw new Error(
       `Codex worker ${worker.id} thread ${boundThreadId} cannot be resumed; refusing to silently create a new thread. ` +
       `Repair codexThreadId with codex-thread-audit.mjs or explicitly reset/re-hire the worker. ` +
@@ -551,8 +592,7 @@ export async function runCodexWorkerStreaming(options, onEvent) {
   const url = getCodexServerUrl(worker);
   const model = normalizeCodexModel(worker.model);
   if (model && model !== worker.model) {
-    worker.model = model;
-    onWorkerPatch?.({ model });
+    applyWorkerPatch(worker, { model }, onWorkerPatch);
   }
   const client = new CodexAppServerClient(url);
   const result = {
@@ -601,9 +641,8 @@ export async function runCodexWorkerStreaming(options, onEvent) {
 
       if (message.method === "turn/started" && params.turn?.id) {
         turnId = params.turn.id;
-        worker.codexActiveTurnId = turnId;
         result.codexTurnId = turnId;
-        onWorkerPatch?.({ codexActiveTurnId: turnId });
+        applyWorkerPatch(worker, { codexActiveTurnId: turnId }, onWorkerPatch);
       }
 
       if (message.method === "thread/tokenUsage/updated") {
@@ -631,9 +670,8 @@ export async function runCodexWorkerStreaming(options, onEvent) {
     });
 
     turnId = start.turn.id;
-    worker.codexActiveTurnId = turnId;
     result.codexTurnId = turnId;
-    onWorkerPatch?.({ codexActiveTurnId: turnId });
+    applyWorkerPatch(worker, { codexActiveTurnId: turnId }, onWorkerPatch);
 
     if (signal) {
       const interrupt = () => {
@@ -645,6 +683,7 @@ export async function runCodexWorkerStreaming(options, onEvent) {
 
     const turn = await completedPromise;
     result.turns = 1;
+    applyWorkerPatch(worker, { codexThreadInitialized: true }, onWorkerPatch);
     const turnUsage = extractCodexTokenUsage(turn);
     const capturedUsage = await waitForCapturedTokenUsage(turn.id);
     const usage = hasNonZeroTokenUsage(capturedUsage) ? capturedUsage : turnUsage;

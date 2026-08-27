@@ -239,6 +239,7 @@ function spawnSucceeded(r: SpawnResult): boolean {
 function backendDisplayName(backend: string | undefined): string {
   if (backend === "codex") return "Codex app-server";
   if (backend === "claude") return "Claude Code CLI";
+  if (backend === "kimi") return "Kimi Code CLI";
   return "Pi CLI";
 }
 
@@ -251,6 +252,9 @@ function workerUnavailableReason(w: Worker | undefined, name: string): string {
   }
   if ((w.backend ?? "pi") === "claude" && !String(w.claudeSessionId || "").trim()) {
     return `员工 "${name}" 缺少 Claude session 绑定；为避免新开空白 session，已拒绝派活。请先修复 claudeSessionId。`;
+  }
+  if ((w.backend ?? "pi") === "kimi" && w.kimiSessionInitialized && !String(w.kimiSessionId || "").trim()) {
+    return `员工 "${name}" 缺少 Kimi session 绑定；请先修复 kimiSessionId 或重新招募。`;
   }
   return "";
 }
@@ -272,6 +276,7 @@ function recoverWorkerFromRegistrySnapshot(workerId: string): Worker | undefined
       "model",
       "thinking",
       "codexThreadId",
+      "codexThreadInitialized",
       "codexServerUrl",
       "codexApprovalPolicy",
       "codexSandbox",
@@ -285,6 +290,10 @@ function recoverWorkerFromRegistrySnapshot(workerId: string): Worker | undefined
       "claudeAllowedTools",
       "claudeDisallowedTools",
       "claudeBare",
+      "kimiSessionId",
+      "kimiSessionInitialized",
+      "kimiCwd",
+      "kimiCommand",
       "sessionFile",
     ] as const;
     for (const field of fields) {
@@ -309,6 +318,7 @@ function recoverWorkerFromRegistrySnapshot(workerId: string): Worker | undefined
     model: backend === "codex" ? normalizeCodexModel(snapshot.model) : snapshot.model,
     thinking: snapshot.thinking,
     codexThreadId: snapshot.codexThreadId,
+    codexThreadInitialized: snapshot.codexThreadInitialized,
     codexServerUrl: snapshot.codexServerUrl,
     codexApprovalPolicy: snapshot.codexApprovalPolicy,
     codexSandbox: snapshot.codexSandbox,
@@ -322,6 +332,10 @@ function recoverWorkerFromRegistrySnapshot(workerId: string): Worker | undefined
     claudeAllowedTools: snapshot.claudeAllowedTools,
     claudeDisallowedTools: snapshot.claudeDisallowedTools,
     claudeBare: snapshot.claudeBare,
+    kimiSessionId: snapshot.kimiSessionId,
+    kimiSessionInitialized: snapshot.kimiSessionInitialized,
+    kimiCwd: snapshot.kimiCwd,
+    kimiCommand: snapshot.kimiCommand,
     status: snapshot.status || "idle",
     hired: snapshot.hired || new Date().toISOString().slice(0, 10),
     projects: [],
@@ -1240,8 +1254,8 @@ export default function (pi: ExtensionAPI) {
         }),
       ),
       backend: Type.Optional(
-        StringEnum(["pi", "codex", "claude"] as const, {
-          description: "员工后端。pi=当前 Pi CLI 子进程；codex=本机 Codex app-server thread；claude=本机 Claude Code CLI session。",
+        StringEnum(["pi", "codex", "claude", "kimi"] as const, {
+          description: "员工后端。pi=当前 Pi CLI 子进程；codex=本机 Codex app-server thread；claude=本机 Claude Code CLI session；kimi=本机 Kimi Code CLI session。",
           default: "pi",
         }),
       ),
@@ -1268,6 +1282,7 @@ export default function (pi: ExtensionAPI) {
       claudeAllowedTools: Type.Optional(Type.String({ description: "Claude Code --allowedTools，逗号或空格分隔。" })),
       claudeDisallowedTools: Type.Optional(Type.String({ description: "Claude Code --disallowedTools，逗号或空格分隔。" })),
       claudeBare: Type.Optional(Type.Boolean({ description: "是否启用 Claude --bare。默认 false，通常不建议开启以免绕过本机定制配置。", default: false })),
+      kimiCommand: Type.Optional(Type.String({ description: "Kimi Code CLI 命令，默认优先使用 ~/.kimi-code/bin/kimi，否则 kimi。" })),
     }),
     async execute(_tcid, params) {
       try {
@@ -1293,7 +1308,7 @@ export default function (pi: ExtensionAPI) {
         if (backend === "codex") {
           model = normalizeCodexModel(model);
         }
-        if ((backend === "codex" || backend === "claude") && workers.has(params.name) && workers.get(params.name)?.status !== "fired") {
+        if ((backend === "codex" || backend === "claude" || backend === "kimi") && workers.has(params.name) && workers.get(params.name)?.status !== "fired") {
           throw new Error(`员工 "${params.name}" 已存在`);
         }
 
@@ -1325,6 +1340,7 @@ export default function (pi: ExtensionAPI) {
           codexOptions = {
             backend: "codex",
             codexThreadId: created.threadId,
+            codexThreadInitialized: false,
             codexServerUrl: params.codexServerUrl || created.serverUrl,
             codexApprovalPolicy: params.codexApprovalPolicy ?? "never",
             codexSandbox: params.codexSandbox ?? "danger-full-access",
@@ -1347,7 +1363,17 @@ export default function (pi: ExtensionAPI) {
           };
         }
 
-        const w = hire(params.name, params.role as WorkerRole, model, thinking, { backend, ...codexOptions, ...claudeOptions });
+        let kimiOptions: any = {};
+        if (backend === "kimi") {
+          kimiOptions = {
+            backend: "kimi",
+            kimiSessionInitialized: false,
+            kimiCwd: process.cwd(),
+            kimiCommand: params.kimiCommand,
+          };
+        }
+
+        const w = hire(params.name, params.role as WorkerRole, model, thinking, { backend, ...codexOptions, ...claudeOptions, ...kimiOptions });
         const cfgLines: string[] = [
           `🎉 **${w.id}** 已入职！`,
           `- 职位: ${w.role}`,
@@ -1361,13 +1387,15 @@ export default function (pi: ExtensionAPI) {
         if (w.claudeSessionId) cfgLines.push(`- Claude session: ${w.claudeSessionId}`);
         if (w.claudeCommand) cfgLines.push(`- Claude command: ${w.claudeCommand}`);
         if (w.claudePermissionMode) cfgLines.push(`- Claude permission: ${w.claudePermissionMode}`);
+        if (w.kimiSessionId) cfgLines.push(`- Kimi session: ${w.kimiSessionId}`);
+        if (w.kimiCommand) cfgLines.push(`- Kimi command: ${w.kimiCommand}`);
         cfgLines.push(`- 状态: 待命中`);
         cfgLines.push(``);
         cfgLines.push(`现在可以用「派活」给 ${w.id} 分配任务。`);
 
         return {
           content: [{ type: "text", text: cfgLines.join("\n") }],
-          details: { worker: { id: w.id, role: w.role, backend: w.backend, model: w.model, thinking: w.thinking, hired: w.hired, codexThreadId: w.codexThreadId, codexServerUrl: w.codexServerUrl, claudeSessionId: w.claudeSessionId, claudeCwd: w.claudeCwd } },
+          details: { worker: { id: w.id, role: w.role, backend: w.backend, model: w.model, thinking: w.thinking, hired: w.hired, codexThreadId: w.codexThreadId, codexServerUrl: w.codexServerUrl, claudeSessionId: w.claudeSessionId, claudeCwd: w.claudeCwd, kimiSessionId: w.kimiSessionId, kimiCwd: w.kimiCwd } },
         };
       } catch (e: any) {
         return {
@@ -1619,6 +1647,10 @@ export default function (pi: ExtensionAPI) {
       claudeAllowedTools: Type.Optional(Type.String({ description: "Claude Code --allowedTools，逗号或空格分隔。" })),
       claudeDisallowedTools: Type.Optional(Type.String({ description: "Claude Code --disallowedTools，逗号或空格分隔。" })),
       claudeBare: Type.Optional(Type.Boolean({ description: "是否启用 Claude --bare。" })),
+      kimiSessionId: Type.Optional(Type.String({ description: "Kimi Code session id。谨慎修改；用于把员工重新指向已有 Kimi session。" })),
+      kimiSessionInitialized: Type.Optional(Type.Boolean({ description: "Kimi session 是否已经初始化；已存在的 session 应设为 true。" })),
+      kimiCwd: Type.Optional(Type.String({ description: "Kimi session 绑定的工作目录；默认第一次任务所在目录。" })),
+      kimiCommand: Type.Optional(Type.String({ description: "Kimi Code CLI 命令，默认 ~/.kimi-code/bin/kimi 或 kimi。" })),
     }),
     async execute(_tcid, params) {
       try {
@@ -1710,6 +1742,27 @@ export default function (pi: ExtensionAPI) {
           if ((w.backend ?? "pi") !== "claude") throw new Error("claudeBare 只适用于 Claude 员工");
           patch.claudeBare = params.claudeBare;
           changes.push(`Claude bare: ${w.claudeBare ? "true" : "false"} → ${patch.claudeBare ? "true" : "false"}`);
+        }
+        if (params.kimiSessionId !== undefined) {
+          if ((w.backend ?? "pi") !== "kimi") throw new Error("kimiSessionId 只适用于 Kimi 员工");
+          patch.kimiSessionId = params.kimiSessionId || null;
+          patch.kimiSessionInitialized = Boolean(params.kimiSessionInitialized);
+          changes.push(`Kimi session: ${w.kimiSessionId || "—"} → ${patch.kimiSessionId || "—"}`);
+        }
+        if (params.kimiSessionInitialized !== undefined && params.kimiSessionId === undefined) {
+          if ((w.backend ?? "pi") !== "kimi") throw new Error("kimiSessionInitialized 只适用于 Kimi 员工");
+          patch.kimiSessionInitialized = params.kimiSessionInitialized;
+          changes.push(`Kimi initialized: ${w.kimiSessionInitialized ? "true" : "false"} → ${patch.kimiSessionInitialized ? "true" : "false"}`);
+        }
+        if (params.kimiCwd !== undefined) {
+          if ((w.backend ?? "pi") !== "kimi") throw new Error("kimiCwd 只适用于 Kimi 员工");
+          patch.kimiCwd = params.kimiCwd || null;
+          changes.push(`Kimi cwd: ${w.kimiCwd || "—"} → ${patch.kimiCwd || "—"}`);
+        }
+        if (params.kimiCommand !== undefined) {
+          if ((w.backend ?? "pi") !== "kimi") throw new Error("kimiCommand 只适用于 Kimi 员工");
+          patch.kimiCommand = params.kimiCommand || undefined;
+          changes.push(`Kimi command: ${w.kimiCommand || "~/.kimi-code/bin/kimi"} → ${patch.kimiCommand || "~/.kimi-code/bin/kimi"}`);
         }
 
         if (changes.length === 0) {
@@ -3405,8 +3458,8 @@ export default function (pi: ExtensionAPI) {
       name: Type.Optional(Type.String({ description: "profile 名称，如 codex-coder" })),
       description: Type.Optional(Type.String({ description: "profile 描述" })),
       backend: Type.Optional(
-        StringEnum(["pi", "codex"] as const, {
-          description: "后端：pi=临时 Pi session，codex=临时 Codex app-server thread",
+        StringEnum(["pi", "codex", "claude"] as const, {
+          description: "后端：pi=临时 Pi session，codex=临时 Codex app-server thread，claude=临时 Claude Code CLI session",
           default: "pi",
         }),
       ),
@@ -3418,6 +3471,16 @@ export default function (pi: ExtensionAPI) {
       maxTurns: Type.Optional(Type.Number({ description: "最大轮数预留字段，默认 1" })),
       defaultWait: Type.Optional(Type.Boolean({ description: "未显式指定时是否等待结果返回，默认 true" })),
       timeoutMs: Type.Optional(Type.Number({ description: "默认等待超时；不填/0=不超时" })),
+      claudeCommand: Type.Optional(Type.String({ description: "Claude Code CLI 命令，默认 claude" })),
+      claudePermissionMode: Type.Optional(
+        StringEnum(["acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"] as const, {
+          description: "Claude Code permission mode；外包建议 bypassPermissions，避免人工确认。",
+        }),
+      ),
+      claudeTools: Type.Optional(Type.String({ description: "Claude Code --tools 参数，例如 default 或 Read,Bash,Grep" })),
+      claudeAllowedTools: Type.Optional(Type.Array(Type.String({ description: "Claude Code 允许工具" }))),
+      claudeDisallowedTools: Type.Optional(Type.Array(Type.String({ description: "Claude Code 禁用工具" }))),
+      claudeBare: Type.Optional(Type.Boolean({ description: "是否启用 Claude --bare；默认 false" })),
     }),
     async execute(_tcid, params) {
       try {
@@ -3435,6 +3498,12 @@ export default function (pi: ExtensionAPI) {
             maxTurns: params.maxTurns,
             defaultWait: params.defaultWait,
             timeoutMs: params.timeoutMs,
+            claudeCommand: params.claudeCommand,
+            claudePermissionMode: params.claudePermissionMode,
+            claudeTools: params.claudeTools,
+            claudeAllowedTools: params.claudeAllowedTools,
+            claudeDisallowedTools: params.claudeDisallowedTools,
+            claudeBare: params.claudeBare,
             actor: "factory_outsource_profiles",
           });
           return {

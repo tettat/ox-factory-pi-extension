@@ -21,6 +21,7 @@ import {
 } from "./jobs.mjs";
 import { runCodexWorkerStreaming, steerCodexWorker } from "./codex-backend.mjs";
 import { runClaudeWorkerStreaming } from "./claude-backend.mjs";
+import { runKimiWorkerStreaming } from "./kimi-backend.mjs";
 import { buildWorkerSystemPrompt, buildWorkerTaskPrompt } from "./worker-prompts.mjs";
 import { scoreUserEmotion } from "./quality-metrics.mjs";
 
@@ -120,6 +121,7 @@ export interface SpawnResult {
   codexThreadId?: string;
   codexTurnId?: string;
   claudeSessionId?: string;
+  kimiSessionId?: string;
 }
 
 export interface SpawnOptions {
@@ -180,7 +182,7 @@ function shouldSkipUserEmotionScore(job: any): boolean {
 export async function spawnWorker(options: SpawnOptions): Promise<SpawnResult> {
   const { worker, task, project, cwd, additionalContext, signal, onProgress } = options;
 
-  if ((worker.backend ?? "pi") === "codex" || (worker.backend ?? "pi") === "claude") {
+  if ((worker.backend ?? "pi") === "codex" || (worker.backend ?? "pi") === "claude" || (worker.backend ?? "pi") === "kimi") {
     return spawnWorkerStreaming(options, (event) => {
       if (event.type === "text") onProgress?.(event.text.slice(0, 100));
     });
@@ -319,7 +321,8 @@ export type StreamEvent =
   | { type: "tool_end"; name: string; result?: unknown; isError?: boolean }
   | { type: "codex_thread"; threadId: string; text?: string }
   | { type: "claude_session"; sessionId: string; text?: string }
-  | { type: "done"; turns: number; inputTokens: number; cachedInputTokens?: number; outputTokens: number; reasoningOutputTokens?: number; totalTokens?: number; model?: string; exitCode?: number; stopReason?: string; text?: string; codexThreadId?: string; codexTurnId?: string; claudeSessionId?: string }
+  | { type: "kimi_session"; sessionId: string; text?: string }
+  | { type: "done"; turns: number; inputTokens: number; cachedInputTokens?: number; outputTokens: number; reasoningOutputTokens?: number; totalTokens?: number; model?: string; exitCode?: number; stopReason?: string; text?: string; codexThreadId?: string; codexTurnId?: string; claudeSessionId?: string; kimiSessionId?: string }
   | { type: "error"; message: string };
 
 export async function spawnWorkerStreaming(
@@ -347,6 +350,23 @@ export async function spawnWorkerStreaming(
 
   if ((worker.backend ?? "pi") === "claude") {
     return runClaudeWorkerStreaming(
+      {
+        worker,
+        task,
+        project,
+        cwd,
+        additionalContext,
+        signal,
+        agentDef: getAgentDef(worker.role),
+        workersDir: getWorkersDir(),
+        onWorkerPatch: (patch: Partial<Worker>) => updateWorkerConfig(worker.id, patch),
+      },
+      onEvent,
+    ) as Promise<SpawnResult>;
+  }
+
+  if ((worker.backend ?? "pi") === "kimi") {
+    return runKimiWorkerStreaming(
       {
         worker,
         task,
@@ -625,6 +645,7 @@ export function startWorkerJob(
       codexThreadId: result.codexThreadId,
       codexTurnId: result.codexTurnId,
       claudeSessionId: result.claudeSessionId,
+      kimiSessionId: result.kimiSessionId,
       summary: result.output ? result.output.slice(0, 1000) : "",
       fullOutput: result.output || "",
     };

@@ -2241,3 +2241,89 @@ img { max-width: 100%; }
 .metric__note:hover { opacity: 1; background: var(--bg-hover); }
 .trend-kpi__label { display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap; }
 .chart-card__title { display: inline-flex; align-items: center; gap: 4px; }
+
+/* ---- 声音提醒设置 ---- */
+.notification-settings {
+  padding: 18px;
+}
+.notification-settings__grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  margin-top: 16px;
+}
+.notification-settings__field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.notification-settings__field--switch {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border: 1px solid var(--border-faint);
+  border-radius: var(--r-2);
+  background: var(--bg-surface-soft);
+}
+.notification-settings__label {
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-weight: 650;
+}
+.notification-settings__checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.notification-settings__check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-faint);
+  border-radius: 999px;
+  background: var(--bg-surface-soft);
+  font-size: 12px;
+}
+.notification-settings__note {
+  margin-top: 14px;
+  padding: 10px 12px;
+  border: 1px dashed var(--border-soft);
+  border-radius: var(--r-2);
+  background: var(--bg-subtle);
+}
+.notification-settings__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 16px;
+}
+.kv {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+.kv__row {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-faint);
+  border-radius: var(--r-2);
+  background: var(--bg-surface-soft);
+}
+.kv__label {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.kv__value {
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-align: right;
+  word-break: break-all;
+}
+@media (max-width: 768px) {
+  .notification-settings__grid { grid-template-columns: 1fr; }
+}

@@ -84,6 +84,11 @@ import {
 } from "./compaction.mjs";
 import { buildFactoryQualityReport } from "./quality-metrics.mjs";
 import {
+  buildJobNotifications,
+  readNotificationSettings,
+  writeNotificationSettings,
+} from "./notifications.mjs";
+import {
   listWorkerResponsibilities,
   summarizeResponsibilities,
 } from "./responsibilities.mjs";
@@ -95,7 +100,6 @@ const __dirname = dirname(__filename);
 const WEB_DIR = join(__dirname, "web");
 const VERSION = "phase-1-0.1.0";
 const REPO_ROOT = resolve(__dirname, "..", "..", "..");
-const AVATAR_DIR = resolve(process.env.OX_FACTORY_AVATAR_DIR || "/tmp/ox-factory-avatars");
 const QUALITY_CACHE_TTL_MS = 30_000;
 const JOB_DETAIL_REPLY_MAX_CHARS = 200_000;
 const qualityMetricsCache = new Map();
@@ -702,6 +706,14 @@ function buildRouter({ workersDir }) {
         return errorResponse(res, 400, `读取请求体失败: ${err.message}`);
       }
     }
+    if ((method === "POST" || method === "PATCH") && pathname === "/api/notification-settings") {
+      try {
+        const body = await readJsonBody(req);
+        return await handleNotificationSettingsMutation(workersDir, res, body);
+      } catch (err) {
+        return errorResponse(res, 400, `读取请求体失败: ${err.message}`);
+      }
+    }
     if ((method === "PATCH" || method === "POST") && pathname.startsWith("/api/task-requests/")) {
       try {
         const body = await readJsonBody(req);
@@ -760,7 +772,7 @@ function buildRouter({ workersDir }) {
     }
     if (method !== "GET") {
       res.writeHead(405, {
-        "allow": "GET, OPTIONS, POST /api/talk/*, POST /api/main-agent/talk, POST /api/task-requests, POST/PATCH /api/outsource/runs, PATCH /api/task-requests/*, POST /api/task-requests/*/cancel, PATCH /api/talk-requests/*, POST /api/talk-requests/*/cancel, POST /api/jobs/*/read, POST /api/jobs/*/cancel, PATCH /api/jobs/*, POST /api/messages/*/read, POST /api/workers/*/messages/read, POST /api/workers/*/read",
+        "allow": "GET, OPTIONS, POST /api/talk/*, POST /api/main-agent/talk, POST /api/task-requests, POST/PATCH /api/outsource/runs, POST/PATCH /api/notification-settings, PATCH /api/task-requests/*, POST /api/task-requests/*/cancel, PATCH /api/talk-requests/*, POST /api/talk-requests/*/cancel, POST /api/jobs/*/read, POST /api/jobs/*/cancel, PATCH /api/jobs/*, POST /api/messages/*/read, POST /api/workers/*/messages/read, POST /api/workers/*/read",
         "content-type": "application/json; charset=utf-8",
         "cache-control": "no-store",
       });
@@ -770,7 +782,7 @@ function buildRouter({ workersDir }) {
 
     try {
       if (pathname === "/api/health") return handleHealth(res);
-      if (pathname.startsWith("/api/avatars/")) return await handleAvatarAsset(res, pathname);
+      if (pathname.startsWith("/api/avatars/")) return await handleAvatarAsset(workersDir, res, pathname);
       if (pathname === "/api/overview") return await handleOverview(workersDir, res);
       if (pathname === "/api/workers") return await handleWorkers(workersDir, res);
       if (pathname.startsWith("/api/workers/")) {
@@ -787,6 +799,8 @@ function buildRouter({ workersDir }) {
       if (pathname === "/api/tokens/trend") return await handleTokensTrend(workersDir, res, url);
       if (pathname === "/api/compactions") return await handleCompactions(workersDir, res, url);
       if (pathname === "/api/quality-metrics") return await handleQualityMetrics(workersDir, res, url);
+      if (pathname === "/api/notification-settings") return await handleNotificationSettings(workersDir, res);
+      if (pathname === "/api/notifications") return await handleNotifications(workersDir, res, url);
       if (pathname === "/api/permissions") return await handlePermissions(workersDir, res);
       if (pathname === "/api/messages") return await handleMessages(workersDir, res, url);
       if (pathname === "/api/task-requests" || pathname.startsWith("/api/task-requests/")) {
@@ -1136,7 +1150,7 @@ async function handleJobs(workersDir, res, url) {
 function jobDetailEventDisplayText(event) {
   if (!event) return "";
   if (event.type === "text" || event.type === "thinking") return event.text || "";
-  if (["tool", "tool_start", "tool_output", "tool_end", "done", "codex_thread", "claude_session"].includes(event.type)) {
+  if (["tool", "tool_start", "tool_output", "tool_end", "done", "codex_thread", "claude_session", "kimi_session"].includes(event.type)) {
     return formatJobEvent(event);
   }
   return event.text || event.message || formatJobEvent(event);
@@ -1292,6 +1306,34 @@ async function handleQualityMetrics(workersDir, res, url) {
   return jsonResponse(res, 200, {
     ...report,
     cache: { hit: false, ttlMs: QUALITY_CACHE_TTL_MS },
+  });
+}
+
+async function handleNotificationSettings(workersDir, res) {
+  return jsonResponse(res, 200, {
+    generatedAt: new Date().toISOString(),
+    settings: readNotificationSettings(workersDir),
+  });
+}
+
+async function handleNotificationSettingsMutation(workersDir, res, body) {
+  const settings = writeNotificationSettings(workersDir, body?.settings || body || {});
+  return jsonResponse(res, 200, {
+    ok: true,
+    generatedAt: new Date().toISOString(),
+    settings,
+  });
+}
+
+async function handleNotifications(workersDir, res, url) {
+  const since = url.searchParams.get("since") || "";
+  const limit = Math.min(200, Math.max(1, Number(url.searchParams.get("limit")) || 50));
+  const settings = readNotificationSettings(workersDir);
+  const jobs = listJobs(workersDir, { limit: 100000 });
+  return jsonResponse(res, 200, {
+    generatedAt: new Date().toISOString(),
+    settings,
+    notifications: buildJobNotifications(jobs, settings, { since, limit }),
   });
 }
 
@@ -2382,7 +2424,11 @@ const MIME = {
   ".md": "text/markdown; charset=utf-8",
 };
 
-async function handleAvatarAsset(res, pathname) {
+function avatarDirForWorkers(workersDir) {
+  return resolve(process.env.OX_FACTORY_AVATAR_DIR || join(workersDir, "avatars"));
+}
+
+async function handleAvatarAsset(workersDir, res, pathname) {
   let name = "";
   try {
     name = decodeURIComponent(pathname.slice("/api/avatars/".length));
@@ -2392,8 +2438,9 @@ async function handleAvatarAsset(res, pathname) {
   if (!name || name.includes("/") || name.includes("\\") || name === "." || name === "..") {
     return notFound(res, "Invalid avatar path");
   }
-  const filePath = resolve(AVATAR_DIR, name);
-  if (!filePath.startsWith(`${AVATAR_DIR}${sep}`)) return notFound(res, "Invalid avatar path");
+  const avatarDir = avatarDirForWorkers(workersDir);
+  const filePath = resolve(avatarDir, name);
+  if (!filePath.startsWith(`${avatarDir}${sep}`)) return notFound(res, "Invalid avatar path");
   if (!existsSync(filePath) || !statSync(filePath).isFile()) return notFound(res, "Avatar not found");
   return serveFile(res, filePath);
 }

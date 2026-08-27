@@ -9,6 +9,8 @@
   const REFRESH_DEBOUNCE_MS = 200;
   const DRAWER_OPEN_CLASS = "drawer--open";
   const LANG_STORAGE_KEY = "oxFactoryLang";
+  const NOTIFICATION_LAST_SEEN_KEY = "oxFactoryNotificationsLastSeen";
+  const NOTIFICATION_SPOKEN_IDS_KEY = "oxFactoryNotificationsSpokenIds";
   const I18N = {
     zh: {
       "app.title": "牛马工厂 · 驾驶舱",
@@ -35,6 +37,7 @@
       "nav.report": "日报",
       "nav.permissions": "权限",
       "nav.outsource": "外包",
+      "nav.notifications": "提醒",
       "topbar.updatedAt": "更新于",
       "toast.refreshed": "已刷新",
     },
@@ -63,6 +66,7 @@
       "nav.report": "Report",
       "nav.permissions": "Permissions",
       "nav.outsource": "Outsource",
+      "nav.notifications": "Alerts",
       "topbar.updatedAt": "Updated",
       "toast.refreshed": "Refreshed",
     },
@@ -72,6 +76,9 @@
     workers: [],
     jobs: [],
     taskRequests: [],
+    notificationSettings: null,
+    notificationPollTimer: null,
+    notificationPollInFlight: false,
     currentPage: "overview",
     drawerJob: null,
     tokensDate: null,
@@ -519,6 +526,155 @@
     return Array.isArray(value) ? value.filter(isRecord) : [];
   }
 
+  // ---- 声音提醒（第一版：浏览器 Web Speech API + 轮询 /api/notifications） ----
+  function nowIso() {
+    return new Date().toISOString();
+  }
+
+  function getNotificationLastSeen() {
+    try {
+      const saved = localStorage.getItem(NOTIFICATION_LAST_SEEN_KEY);
+      if (saved && !Number.isNaN(new Date(saved).getTime())) return saved;
+      const initial = nowIso();
+      localStorage.setItem(NOTIFICATION_LAST_SEEN_KEY, initial);
+      return initial;
+    } catch {
+      return nowIso();
+    }
+  }
+
+  function setNotificationLastSeen(value = nowIso()) {
+    try { localStorage.setItem(NOTIFICATION_LAST_SEEN_KEY, value); } catch {}
+  }
+
+  function readSpokenNotificationIds() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(NOTIFICATION_SPOKEN_IDS_KEY) || "[]");
+      return new Set(Array.isArray(parsed) ? parsed.map(String) : []);
+    } catch {
+      return new Set();
+    }
+  }
+
+  function selectNotificationVoice() {
+    if (!("speechSynthesis" in window) || typeof window.speechSynthesis.getVoices !== "function") return null;
+    const voices = window.speechSynthesis.getVoices() || [];
+    if (!voices.length) return null;
+    const femaleHints = /(female|woman|girl|xiaoxiao|xiaoyi|xiaobei|xiaoni|xiaozhen|tingting|mei[- ]?jia|sin[- ]?ji|yuna|hanhan|huihui|yaoyao|晓晓|晓伊|婷婷|美佳|女声)/i;
+    const zhVoices = voices.filter((voice) =>
+      /^zh\b/i.test(voice.lang || "") || /chinese|mandarin|cantonese|中文|普通话|粤语/i.test(voice.name || ""),
+    );
+    return zhVoices.find((voice) => femaleHints.test(`${voice.name} ${voice.lang}`))
+      || voices.find((voice) => femaleHints.test(`${voice.name} ${voice.lang}`))
+      || zhVoices[0]
+      || voices[0]
+      || null;
+  }
+
+  function rememberSpokenNotificationId(id) {
+    if (!id) return;
+    const ids = readSpokenNotificationIds();
+    ids.add(String(id));
+    const list = [...ids].slice(-500);
+    try { localStorage.setItem(NOTIFICATION_SPOKEN_IDS_KEY, JSON.stringify(list)); } catch {}
+  }
+
+  function speakNotification(text) {
+    const message = String(text || "").trim();
+    if (!message) return false;
+    if (!("speechSynthesis" in window) || typeof SpeechSynthesisUtterance === "undefined") {
+      toast("当前浏览器不支持语音提醒", "error");
+      return false;
+    }
+    try {
+      const utterance = new SpeechSynthesisUtterance(message);
+      utterance.lang = "zh-CN";
+      utterance.rate = 1;
+      utterance.pitch = 1.08;
+      const voice = selectNotificationVoice();
+      if (voice) {
+        utterance.voice = voice;
+        utterance.lang = voice.lang || utterance.lang;
+      }
+      window.speechSynthesis.cancel();
+      window.speechSynthesis.speak(utterance);
+      return true;
+    } catch (err) {
+      toast(`播放提醒失败：${String(err?.message || err)}`, "error");
+      return false;
+    }
+  }
+
+  function notificationPollIntervalMs(settings = STATE.notificationSettings) {
+    const ms = Number(settings?.pollIntervalMs || 5000);
+    if (!Number.isFinite(ms)) return 5000;
+    return Math.min(60000, Math.max(1000, Math.round(ms)));
+  }
+
+  function scheduleNotificationPolling() {
+    if (STATE.notificationPollTimer) {
+      clearInterval(STATE.notificationPollTimer);
+      STATE.notificationPollTimer = null;
+    }
+    if (!STATE.notificationSettings?.enabled) return;
+    const interval = notificationPollIntervalMs();
+    STATE.notificationPollTimer = setInterval(() => {
+      void pollNotifications();
+    }, interval);
+  }
+
+  async function loadNotificationSettings() {
+    const res = await api("/api/notification-settings");
+    if (!res.ok) return res;
+    STATE.notificationSettings = res.data?.settings || null;
+    scheduleNotificationPolling();
+    return res;
+  }
+
+  async function saveNotificationSettings(settings, opts = {}) {
+    const wasEnabled = Boolean(STATE.notificationSettings?.enabled);
+    const res = await api("/api/notification-settings", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ settings }),
+    });
+    if (!res.ok) return res;
+    STATE.notificationSettings = res.data?.settings || null;
+    if (!wasEnabled && STATE.notificationSettings?.enabled) {
+      // 开启时从“现在”开始提醒，避免把历史完成任务一口气读出来。
+      setNotificationLastSeen(nowIso());
+    }
+    if (opts.resetLastSeen) setNotificationLastSeen(nowIso());
+    scheduleNotificationPolling();
+    return res;
+  }
+
+  async function pollNotifications() {
+    const settings = STATE.notificationSettings;
+    if (!settings?.enabled || STATE.notificationPollInFlight) return;
+    STATE.notificationPollInFlight = true;
+    try {
+      const since = getNotificationLastSeen();
+      const res = await api(`/api/notifications?since=${encodeURIComponent(since)}&limit=50`);
+      if (!res.ok) return;
+      if (res.data?.settings) STATE.notificationSettings = res.data.settings;
+      const notifications = recordList(res.data?.notifications);
+      const spoken = readSpokenNotificationIds();
+      let latestAt = since;
+      for (const item of notifications) {
+        if (item.at && String(item.at).localeCompare(String(latestAt)) > 0) latestAt = item.at;
+        if (!item.id || spoken.has(String(item.id))) continue;
+        if (speakNotification(item.message || `${item.worker || "员工"} 任务完成`)) {
+          rememberSpokenNotificationId(item.id);
+          spoken.add(String(item.id));
+        }
+      }
+      if (latestAt !== since) setNotificationLastSeen(latestAt);
+    } finally {
+      STATE.notificationPollInFlight = false;
+    }
+  }
+
   // ---- 渲染状态徽章 ----
   const STATUS_KEYS = ["queued", "running", "orphan-running", "done", "stale", "failed", "aborted"];
   const STATUS_LABELS = {
@@ -757,6 +913,13 @@
       el("div", { class: "kpi__label", text: label }),
       el("div", { class: "kpi__value", text: value }),
       el("div", { class: "kpi__sub", text: sub }),
+    ]);
+  }
+
+  function kvRow(label, value) {
+    return el("div", { class: "kv__row" }, [
+      el("span", { class: "kv__label", text: label }),
+      el("span", { class: "kv__value", text: value == null ? "—" : String(value) }),
     ]);
   }
 
@@ -2628,6 +2791,7 @@
     if (ev.type === "started") return "开始";
     if (ev.type === "codex_thread") return "线程";
     if (ev.type === "claude_session") return "会话";
+    if (ev.type === "kimi_session") return "会话";
     return ev.type || "事件";
   }
 
@@ -3401,7 +3565,7 @@
     }
 
     const section = el("section", { class: "section section--quality" }, [
-      sectionHead("上下文 / 回复质量观测", "回溯 jobs/events/session：会话轮次、上下文估算、压缩次数、输入/输出长度、耗时、工具调用、情绪评分"),
+      sectionHead("上下文 / 回复质量观测", "回溯 jobs/events/session：当前上下文估算、历史文件体量、压缩次数、输入/输出长度、耗时、工具调用、情绪评分"),
     ]);
     section.appendChild(el("div", { class: "filters quality-filters" }, [
       el("div", { class: "filters__group" }, [
@@ -3475,7 +3639,8 @@
                 el("thead", {}, [el("tr", {}, [
                   el("th", { text: "员工" }),
                   sortableNumericTh("会话轮次"),
-                  sortableNumericTh("上下文估算"),
+                  sortableNumericTh("当前上下文"),
+                  sortableNumericTh("历史文件"),
                   sortableNumericTh("压缩"),
                   sortableNumericTh("样本"),
                   sortableNumericTh("平均输入"),
@@ -3487,7 +3652,8 @@
                 el("tbody", {}, workers.map((w) => el("tr", {}, [
                   el("td", { class: "td--mono", text: w.worker || "—" }),
                   numericTd(w.session?.userTurns || 0, String(w.session?.userTurns || 0)),
-                  numericTd(w.session?.estimatedContextTokens || 0, fmtNumber(w.session?.estimatedContextTokens || 0)),
+                  numericTd(w.session?.activeContextTokens ?? w.session?.estimatedContextTokens ?? 0, fmtNumber(w.session?.activeContextTokens ?? w.session?.estimatedContextTokens ?? 0)),
+                  numericTd(w.session?.sessionFileTokens || 0, fmtNumber(w.session?.sessionFileTokens || 0)),
                   numericTd(w.session?.compactionCount || 0, String(w.session?.compactionCount || 0)),
                   numericTd(w.jobs?.count || 0, String(w.jobs?.count || 0)),
                   numericTd(w.jobs?.avgInputChars || 0, fmtNumber(w.jobs?.avgInputChars || 0)),
@@ -3584,7 +3750,7 @@
     { key: "toolCalls",           label: "工具调用",       fmt: (n) => String(Math.round(n)) },
     { key: "responseMs",          label: "耗时 (ms)",      fmt: fmtNumber },
     { key: "elapsedMs",           label: "elapsedMs",      fmt: fmtNumber },
-    { key: "sessionContextTokens",label: "上下文估算 token",fmt: fmtNumber },
+    { key: "sessionContextTokens",label: "当前上下文 token",fmt: fmtNumber },
     { key: "sessionUserTurns",    label: "会话轮次",       fmt: (n) => String(Math.round(n)) },
     { key: "sessionCompactions",  label: "压缩次数",       fmt: (n) => String(Math.round(n)) },
     { key: "turns",               label: "Turn 数",        fmt: (n) => String(Math.round(n)) },
@@ -3762,7 +3928,7 @@
     grid.appendChild(chartScatter("工具调用 → 输出字符", turns, "toolCalls", "outputChars", "工具调用数", "输出字符", { titleNote: SUBAGENT_TOOL_NOTE }));
     grid.appendChild(chartScatter("输入 token → 输出 token", turns, "inputTokens", "outputTokens", "输入 token", "输出 token"));
     grid.appendChild(chartScatter("耗时 ms → 输出字符", turns, "responseMs", "outputChars", "耗时 (ms)", "输出字符"));
-    grid.appendChild(chartScatter("上下文估算 → 输出 token", turns, "sessionContextTokens", "outputTokens", "sessionContextTokens", "输出 token"));
+    grid.appendChild(chartScatter("当前上下文 → 输出 token", turns, "sessionContextTokens", "outputTokens", "sessionContextTokens", "输出 token"));
     grid.appendChild(chartScatter("会话轮次 → 输出字符", turns, "sessionUserTurns", "outputChars", "sessionUserTurns", "输出字符"));
     grid.appendChild(chartLine("时间序列：输入/输出 token", turns, "createdAt", [
       { key: "inputTokens", label: "输入", color: "var(--seg-input)" },
@@ -3965,7 +4131,7 @@
       `job <code>${esc((d.jobId || "").slice(-6))}</code>`,
       `输入 ${esc(fmtNumber(d.inputChars || 0))} / 输出 ${esc(fmtNumber(d.outputChars || 0))} 字符`,
       `耗时 ${esc(fmtDurationMs(d.responseMs || 0))} · 工具 ${esc(String(d.toolCalls || 0))}`,
-      `上下文 ${esc(fmtNumber(d.sessionContextTokens || 0))} · 压缩 ${esc(String(d.sessionCompactions || 0))}`,
+      `当前上下文 ${esc(fmtNumber(d.sessionContextTokens || 0))} · 压缩 ${esc(String(d.sessionCompactions || 0))}`,
       d.emotionScore != null ? `情绪 ${esc(String(d.emotionScore))}${d.emotionLabel ? ` · ${esc(d.emotionLabel)}` : ""}` : "",
       `任务：${esc((d.taskPreview || "—").slice(0, 80))}`,
     ].filter(Boolean);
@@ -4120,6 +4286,155 @@
         ]))),
       ]));
     }
+  }
+
+  function statusCheckbox(id, label, checked) {
+    return el("label", { class: "notification-settings__check" }, [
+      el("input", { id, type: "checkbox", checked: Boolean(checked) }),
+      el("span", { text: label }),
+    ]);
+  }
+
+  function notificationSettingsFromForm(form, current) {
+    const statuses = [];
+    if ($("#notificationStatusDone", form)?.checked) statuses.push("done");
+    if ($("#notificationStatusFailed", form)?.checked) statuses.push("failed");
+    const workers = String($("#notificationWorkers", form)?.value || "")
+      .split(/[,，\n]/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    return {
+      ...(current || {}),
+      enabled: Boolean($("#notificationEnabled", form)?.checked),
+      pollIntervalMs: Number($("#notificationPollInterval", form)?.value || 5000),
+      jobTerminal: {
+        ...(current?.jobTerminal || {}),
+        enabled: true,
+        statuses: statuses.length ? statuses : ["done"],
+        workers,
+        template: String($("#notificationTemplate", form)?.value || "{worker} 任务完成").trim() || "{worker} 任务完成",
+        failureTemplate: String($("#notificationFailureTemplate", form)?.value || "{worker} 任务失败").trim() || "{worker} 任务失败",
+      },
+    };
+  }
+
+  async function renderNotificationsSettings() {
+    const res = await loadNotificationSettings();
+    const wrap = el("div", { class: "page page--notifications" });
+    wrap.appendChild(el("section", { class: "section" }, [
+      sectionHead("声音提醒", "浏览器本地 TTS；只对配置命中的非 steer job 终态进行提醒。"),
+    ]));
+
+    if (!res.ok) {
+      wrap.appendChild(errorBox("加载提醒配置失败", res.detail));
+      return wrap;
+    }
+
+    const settings = STATE.notificationSettings || res.data?.settings || {};
+    const rule = settings.jobTerminal || {};
+    const statuses = new Set(Array.isArray(rule.statuses) ? rule.statuses : []);
+    const form = el("form", { class: "card notification-settings" }, [
+      cardHead("任务完成提醒", "第一版使用 Web Speech API。浏览器可能要求先点击一次“测试播放/启用声音”。"),
+      el("div", { class: "notification-settings__grid" }, [
+        el("label", { class: "notification-settings__field notification-settings__field--switch" }, [
+          el("span", { class: "notification-settings__label", text: "启用声音提醒" }),
+          el("input", { id: "notificationEnabled", type: "checkbox", checked: Boolean(settings.enabled) }),
+        ]),
+        el("label", { class: "notification-settings__field" }, [
+          el("span", { class: "notification-settings__label", text: "轮询间隔（毫秒）" }),
+          el("input", {
+            class: "input",
+            id: "notificationPollInterval",
+            type: "number",
+            min: "1000",
+            max: "60000",
+            step: "500",
+            value: String(settings.pollIntervalMs || 5000),
+          }),
+        ]),
+        el("div", { class: "notification-settings__field" }, [
+          el("span", { class: "notification-settings__label", text: "提醒状态" }),
+          el("div", { class: "notification-settings__checks" }, [
+            statusCheckbox("notificationStatusDone", "完成 done", statuses.has("done")),
+            statusCheckbox("notificationStatusFailed", "失败 failed", statuses.has("failed")),
+          ]),
+        ]),
+        el("label", { class: "notification-settings__field" }, [
+          el("span", { class: "notification-settings__label", text: "员工白名单（空=全员，逗号分隔）" }),
+          el("input", {
+            class: "input",
+            id: "notificationWorkers",
+            type: "text",
+            value: Array.isArray(rule.workers) ? rule.workers.join(", ") : "",
+            placeholder: "派派, 阿哲",
+          }),
+        ]),
+        el("label", { class: "notification-settings__field" }, [
+          el("span", { class: "notification-settings__label", text: "完成文案模板" }),
+          el("input", {
+            class: "input",
+            id: "notificationTemplate",
+            type: "text",
+            value: rule.template || "{worker} 任务完成",
+          }),
+        ]),
+        el("label", { class: "notification-settings__field" }, [
+          el("span", { class: "notification-settings__label", text: "失败文案模板" }),
+          el("input", {
+            class: "input",
+            id: "notificationFailureTemplate",
+            type: "text",
+            value: rule.failureTemplate || "{worker} 任务失败",
+          }),
+        ]),
+      ]),
+      el("div", { class: "notification-settings__note muted" }, [
+        "变量支持：{worker}、{project}、{status}、{statusText}、{kind}、{source}、{assignedBy}。默认排除 steer / compact / 情绪评分 / system。网页关闭时不会播放声音。",
+      ]),
+      el("div", { class: "notification-settings__actions" }, [
+        el("button", { class: "btn", type: "submit", text: "保存配置" }),
+        el("button", {
+          class: "btn btn--ghost",
+          type: "button",
+          text: "测试播放",
+          onclick: () => speakNotification("派派 任务完成"),
+        }),
+        el("button", {
+          class: "btn btn--ghost",
+          type: "button",
+          text: "从现在开始提醒",
+          onclick: () => {
+            setNotificationLastSeen(nowIso());
+            try { localStorage.setItem(NOTIFICATION_SPOKEN_IDS_KEY, "[]"); } catch {}
+            toast("已重置提醒水位线", "success");
+          },
+        }),
+      ]),
+    ]);
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const next = notificationSettingsFromForm(form, STATE.notificationSettings || settings);
+      const saved = await saveNotificationSettings(next);
+      if (!saved.ok) {
+        toast("保存提醒配置失败", "error");
+        return;
+      }
+      toast("提醒配置已保存", "success");
+    });
+
+    wrap.appendChild(el("section", { class: "section" }, [form]));
+    wrap.appendChild(el("section", { class: "section" }, [
+      el("div", { class: "card" }, [
+        cardHead("当前状态", "配置保存在 workers/config/notifications.json，本地运行数据不进版本管理。"),
+        el("div", { class: "kv" }, [
+          kvRow("浏览器语音", ("speechSynthesis" in window) ? "可用" : "不可用"),
+          kvRow("当前水位线", getNotificationLastSeen()),
+          kvRow("轮询状态", settings.enabled ? `开启 · ${notificationPollIntervalMs(settings)}ms` : "关闭"),
+        ]),
+      ]),
+    ]));
+    return wrap;
   }
 
   async function renderMessages() {
@@ -4456,6 +4771,11 @@ async function route() {
         if (isStale()) return;
         main.innerHTML = "";
         main.appendChild(node);
+      } else if (route === "notifications") {
+        const node = await renderNotificationsSettings();
+        if (isStale()) return;
+        main.innerHTML = "";
+        main.appendChild(node);
       } else if (route === "outsource") {
         const node = await renderOutsource();
         if (isStale()) return;
@@ -4539,6 +4859,9 @@ async function route() {
     } else if (route === "permissions") {
       const node = await renderPermissions();
       const m = $("#main"); m.innerHTML = ""; m.appendChild(node);
+    } else if (route === "notifications") {
+      const node = await renderNotificationsSettings();
+      const m = $("#main"); m.innerHTML = ""; m.appendChild(node);
     } else if (route === "outsource") {
       const node = await renderOutsource();
       const m = $("#main"); m.innerHTML = ""; m.appendChild(node);
@@ -4567,6 +4890,7 @@ async function route() {
   document.addEventListener("DOMContentLoaded", () => {
     bind();
     applyStaticI18n();
+    void loadNotificationSettings();
     route();
   });
 })();

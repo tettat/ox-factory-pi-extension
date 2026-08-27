@@ -335,6 +335,7 @@ export function formatJobEvent(event) {
   }
   if (event.type === "codex_thread") return `[codex:thread] ${event.threadId || event.text || ""}`;
   if (event.type === "claude_session") return `[claude:session] ${event.sessionId || event.text || ""}`;
+  if (event.type === "kimi_session") return `[kimi:session] ${event.sessionId || event.text || ""}`;
   if (event.type === "error") return `[error] ${event.message || event.text || ""}`;
   if (event.type === "late_event_after_terminal") {
     return `[late event after terminal] ${event.originalType || "unknown"} ignored because job is ${event.terminalStatus || "terminal"}`;
@@ -382,6 +383,8 @@ export function compactJobTimelineEvents(events = []) {
   const compacted = [];
   let textBuffer = "";
   let textTime = null;
+  let thinkingBuffer = "";
+  let thinkingTime = null;
   let activeTool = null;
 
   const flushText = () => {
@@ -390,11 +393,19 @@ export function compactJobTimelineEvents(events = []) {
     textBuffer = "";
     textTime = null;
   };
+  const flushThinking = () => {
+    if (!thinkingBuffer) return;
+    compacted.push({ time: thinkingTime, type: "thinking", text: thinkingBuffer });
+    thinkingBuffer = "";
+    thinkingTime = null;
+  };
   const flushTool = () => {
     if (!activeTool) return;
     compacted.push(activeTool);
     activeTool = null;
   };
+  const isThinkingDelimiterText = (event) =>
+    event.type === "text" && ["<think>", "</think>"].includes(String(event.text || "").trim());
   const sameTool = (event) => {
     if (!activeTool) return false;
     if (!event.name || !activeTool.name) return true;
@@ -421,7 +432,19 @@ export function compactJobTimelineEvents(events = []) {
   };
 
   for (const event of events) {
+    if (isThinkingDelimiterText(event)) {
+      flushThinking();
+      continue;
+    }
+    if (event.type === "thinking") {
+      flushText();
+      flushTool();
+      if (!thinkingBuffer) thinkingTime = event.time || null;
+      thinkingBuffer += event.text || "";
+      continue;
+    }
     if (event.type === "text") {
+      flushThinking();
       flushTool();
       if (!textBuffer) textTime = event.time || null;
       textBuffer += event.text || "";
@@ -429,18 +452,21 @@ export function compactJobTimelineEvents(events = []) {
     }
     if (event.type === "tool_start") {
       flushText();
+      flushThinking();
       flushTool();
       ensureTool(event);
       continue;
     }
     if (event.type === "tool_output") {
       flushText();
+      flushThinking();
       const tool = ensureTool(event);
       tool.output += event.text || "";
       continue;
     }
     if (event.type === "tool_end") {
       flushText();
+      flushThinking();
       const tool = ensureTool(event);
       tool.result = event.result;
       tool.isError = Boolean(event.isError);
@@ -450,11 +476,13 @@ export function compactJobTimelineEvents(events = []) {
     }
 
     flushText();
+    flushThinking();
     flushTool();
     compacted.push(event.type === "done" && event.text ? { ...event, text: "" } : event);
   }
 
   flushText();
+  flushThinking();
   flushTool();
   return compacted;
 }

@@ -57,6 +57,13 @@ import {
   writeQualityMonitorConfig,
 } from "../quality-metrics.mjs";
 import {
+  buildJobNotifications,
+  notificationSettingsFile,
+  readNotificationSettings,
+  shouldNotifyJob,
+  writeNotificationSettings,
+} from "../notifications.mjs";
+import {
   grantPermission,
   hasPermission,
   localAdminsFile,
@@ -129,6 +136,7 @@ import {
   extractCodexThreadTokenUsage,
   assertCodexThreadBinding,
   reconcileCodexThreadId,
+  canReplaceMissingCodexThread,
   assertWorkerThinkingSupported,
   normalizeCodexEffort,
   normalizeCodexModel,
@@ -144,6 +152,11 @@ import {
   buildWorkerSystemPrompt,
   buildWorkerTaskPrompt,
 } from "../worker-prompts.mjs";
+
+import {
+  buildKimiCliArgs,
+  kimiStreamLineToEvents,
+} from "../kimi-backend.mjs";
 import {
   markdownPreviewText,
 } from "../markdown-preview.mjs";
@@ -427,6 +440,24 @@ test("compactJobTimelineEvents merges streamed text and tool chunks for web disp
   assert.equal(formatJobEvent(compacted[2]), "[done] 1 rounds, input 10, output 20");
 });
 
+test("compactJobTimelineEvents merges streamed thinking chunks and drops think delimiters", () => {
+  const compacted = compactJobTimelineEvents([
+    { time: "2026-07-13T00:00:00.000Z", type: "thinking", text: "先看" },
+    { time: "2026-07-13T00:00:00.100Z", type: "thinking", text: "数据" },
+    { time: "2026-07-13T00:00:00.200Z", type: "text", text: "</think>" },
+    { time: "2026-07-13T00:00:01.000Z", type: "tool_start", name: "bash", args: { command: "echo ok" } },
+    { time: "2026-07-13T00:00:01.100Z", type: "tool_end", name: "bash", result: { output: "ok\n" } },
+    { time: "2026-07-13T00:00:02.000Z", type: "thinking", text: "继续" },
+    { time: "2026-07-13T00:00:02.100Z", type: "thinking", text: "判断" },
+    { time: "2026-07-13T00:00:02.200Z", type: "text", text: "最终回复" },
+  ]);
+
+  assert.deepEqual(compacted.map((e) => e.type), ["thinking", "tool", "thinking", "text"]);
+  assert.equal(compacted[0].text, "先看数据");
+  assert.equal(compacted[2].text, "继续判断");
+  assert.equal(compacted[3].text, "最终回复");
+});
+
 test("codex backend maps worker thinking levels to Codex reasoning effort", () => {
   assert.equal(normalizeCodexEffort("off"), "none");
   assert.equal(normalizeCodexEffort("minimal"), "low");
@@ -472,8 +503,60 @@ test("codex backend refuses to run workers without a persisted thread binding", 
   );
 });
 
+test("codex backend can replace a missing rollout for an uninitialized fresh hire", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-codex-empty-thread-"));
+  try {
+    const failed = createJob(workersDir, {
+      worker: "园子",
+      project: "talk",
+      task: "hello",
+      cwd: workersDir,
+      sessionFile: join(workersDir, "sessions", "园子.jsonl"),
+    });
+    updateJob(failed, { status: "failed" });
+
+    assert.equal(
+      canReplaceMissingCodexThread({
+        id: "园子",
+        backend: "codex",
+        codexThreadId: "empty-thread-without-rollout",
+        codexThreadInitialized: false,
+      }, workersDir),
+      true,
+    );
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("codex backend refuses to replace a missing rollout when worker has successful history", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-codex-existing-thread-"));
+  try {
+    const done = createJob(workersDir, {
+      worker: "园子",
+      project: "talk",
+      task: "prior successful work",
+      cwd: workersDir,
+      sessionFile: join(workersDir, "sessions", "园子.jsonl"),
+    });
+    updateJob(done, { status: "done" });
+
+    assert.equal(
+      canReplaceMissingCodexThread({
+        id: "园子",
+        backend: "codex",
+        codexThreadId: "real-thread-that-should-not-be-replaced",
+      }, workersDir),
+      false,
+    );
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
 test("codex backend persists the actual resumed thread id when app-server canonicalizes it", () => {
   const patches = [];
+  const callbackObservedThreadIds = [];
   const worker = {
     id: "WorkerJ",
     model: "gpt-5.5",
@@ -481,10 +564,15 @@ test("codex backend persists the actual resumed thread id when app-server canoni
     codexServerUrl: "ws://127.0.0.1:48177",
   };
 
-  const threadId = reconcileCodexThreadId(worker, "actual-thread", (patch) => patches.push(patch));
+  const threadId = reconcileCodexThreadId(worker, "actual-thread", (patch) => {
+    callbackObservedThreadIds.push(worker.codexThreadId);
+    patches.push(patch);
+    Object.assign(worker, patch);
+  });
 
   assert.equal(threadId, "actual-thread");
   assert.equal(worker.codexThreadId, "actual-thread");
+  assert.deepEqual(callbackObservedThreadIds, ["seed-thread"]);
   assert.deepEqual(patches, [{
     codexThreadId: "actual-thread",
     codexServerUrl: "ws://127.0.0.1:48177",
@@ -1347,6 +1435,42 @@ test("outsource profiles are configurable white-paper agent definitions", () => 
     assert.equal(getOutsourceProfile(workersDir, "codex-coder").model, "5.5");
     assert.equal(listOutsourceProfiles(workersDir).length, 1);
     assert.ok(existsSync(outsourceProfilesFile(workersDir)));
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("outsource profiles support Claude Code backend options", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-outsource-claude-profile-test-"));
+  try {
+    const profile = upsertOutsourceProfile(workersDir, {
+      name: "cc-bag",
+      description: "匿名 Claude Code 外包",
+      backend: "claude",
+      model: "sonnet",
+      thinking: "low",
+      claudePermissionMode: "bypassPermissions",
+      claudeTools: "Read,Bash,Grep",
+      claudeAllowedTools: "Read,Bash",
+      claudeDisallowedTools: "Edit,Write",
+      claudeBare: true,
+      claudeCommand: "claude",
+    });
+
+    assert.equal(profile.backend, "claude");
+    assert.equal(profile.model, "sonnet");
+    assert.equal(profile.thinking, "low");
+    assert.equal(profile.claudePermissionMode, "bypassPermissions");
+    assert.equal(profile.claudeTools, "Read,Bash,Grep");
+    assert.deepEqual(profile.claudeAllowedTools, ["Read", "Bash"]);
+    assert.deepEqual(profile.claudeDisallowedTools, ["Edit", "Write"]);
+    assert.equal(profile.claudeBare, true);
+    assert.equal(profile.claudeCommand, "claude");
+    assert.equal(getOutsourceProfile(workersDir, "cc-bag").backend, "claude");
+
+    const runnerSource = readFileSync(join(testDir, "../outsource-runner.mjs"), "utf8");
+    assert.match(runnerSource, /runClaudeWorkerStreaming/);
+    assert.match(runnerSource, /backend === "claude"/);
   } finally {
     rmSync(workersDir, { recursive: true, force: true });
   }
@@ -2690,6 +2814,22 @@ test("worker list cards show talk reply preview instead of jobs and token chips"
   assert.doesNotMatch(appSource, /worker-card__stat--tokens/);
 });
 
+test("web UI exposes browser TTS notification settings", () => {
+  const html = readFileSync(join(testDir, "../web/index.html"), "utf8");
+  const appSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
+  const styleSource = readFileSync(join(testDir, "../web/styles.css"), "utf8");
+
+  assert.match(html, /#\/notifications/);
+  assert.match(appSource, /renderNotificationsSettings/);
+  assert.match(appSource, /function kvRow/);
+  assert.match(appSource, /speechSynthesis/);
+  assert.match(appSource, /selectNotificationVoice/);
+  assert.match(appSource, /xiaoxiao|tingting|mei/);
+  assert.ok(appSource.includes('api("/api/notification-settings"'));
+  assert.ok(appSource.includes("api(`/api/notifications?since="));
+  assert.match(styleSource, /notification-settings/);
+});
+
 test("worker avatar can be configured and is exposed to web views", () => {
   const typesSource = readFileSync(join(testDir, "../types.ts"), "utf8");
   const registrySource = readFileSync(join(testDir, "../registry.ts"), "utf8");
@@ -2974,7 +3114,9 @@ test("quality metric tables expose sortable numeric columns", () => {
   assert.match(webAppSource, /function sortTableByHeader/);
   assert.match(webAppSource, /data:\s*\{\s*sortValue:/);
   assert.match(webAppSource, /sortableNumericTh\("会话轮次"\)/);
-  assert.match(webAppSource, /sortableNumericTh\("上下文估算"\)/);
+  assert.match(webAppSource, /sortableNumericTh\("当前上下文"\)/);
+  assert.match(webAppSource, /sortableNumericTh\("历史文件"\)/);
+  assert.match(webAppSource, /sessionFileTokens/);
   assert.match(webAppSource, /sortableNumericTh\("压缩"\)/);
   assert.match(webAppSource, /sortableNumericTh\("平均耗时"\)/);
   assert.match(webAppSource, /sortableNumericTh\("情绪"\)/);
@@ -2983,6 +3125,78 @@ test("quality metric tables expose sortable numeric columns", () => {
   assert.match(webAppSource, /sortableNumericTh\("上下文"\)/);
   assert.match(styleSource, /\.table__sort-btn/);
   assert.match(styleSource, /\.table__sort-indicator/);
+});
+
+
+
+test("kimi backend builds resume prompt args without unsupported auto flags", () => {
+  const args = buildKimiCliArgs({
+    worker: {
+      id: "小月",
+      role: "programmer",
+      backend: "kimi",
+      model: "moonshot-v1",
+      kimiSessionId: "session_demo",
+      kimiSessionInitialized: true,
+    },
+    taskContent: "完成一个页面",
+  });
+
+  assert.deepEqual(args, ["-r", "session_demo", "--output-format", "stream-json", "--model", "moonshot-v1", "-p", "完成一个页面"]);
+  assert.equal(args.includes("--auto"), false);
+  assert.equal(args.includes("--yolo"), false);
+});
+
+test("kimi backend converts stream-json assistant/tool/meta lines into factory stream events", () => {
+  const state = { output: "", sessionId: "", observedSessionId: false, turns: 0 };
+
+  assert.deepEqual(
+    kimiStreamLineToEvents('{"role":"assistant","tool_calls":[{"type":"function","id":"tool_1","function":{"name":"Write","arguments":"{\\"path\\":\\"hello.txt\\",\\"content\\":\\"ok\\"}"}}]}', state),
+    [{ type: "tool_start", name: "Write", args: { path: "hello.txt", content: "ok" } }],
+  );
+
+  assert.deepEqual(
+    kimiStreamLineToEvents('{"role":"tool","tool_call_id":"tool_1","content":"Wrote 2 bytes to hello.txt"}', state),
+    [{ type: "tool_end", name: "tool_1", result: "Wrote 2 bytes to hello.txt", isError: false }],
+  );
+
+  assert.deepEqual(
+    kimiStreamLineToEvents('{"role":"assistant","content":"done"}', state),
+    [{ type: "text", text: "done" }],
+  );
+  assert.equal(state.output, "done");
+  assert.equal(state.turns, 1);
+
+  assert.deepEqual(
+    kimiStreamLineToEvents('{"role":"meta","type":"session.resume_hint","session_id":"session_abc","command":"kimi -r session_abc"}', state),
+    [{ type: "kimi_session", sessionId: "session_abc", text: "Kimi session: session_abc" }],
+  );
+  assert.equal(state.sessionId, "session_abc");
+  assert.equal(state.observedSessionId, true);
+});
+
+test("kimi backend tolerates raw non-json stdout lines", () => {
+  const state = { output: "", sessionId: "", observedSessionId: false, turns: 0 };
+  assert.deepEqual(
+    kimiStreamLineToEvents('/private/tmp/kimi-tool-smoke', state),
+    [{ type: "tool_output", name: "kimi", text: "/private/tmp/kimi-tool-smoke\n" }],
+  );
+});
+
+test("factory source exposes Kimi as a first-class worker backend", () => {
+  const indexSource = readFileSync(join(testDir, "../index.ts"), "utf8");
+  const spawnerSource = readFileSync(join(testDir, "../spawner.ts"), "utf8");
+  const registrySource = readFileSync(join(testDir, "../registry.ts"), "utf8");
+  const typesSource = readFileSync(join(testDir, "../types.ts"), "utf8");
+  const handbookSource = readFileSync(join(testDir, "../worker-prompts.mjs"), "utf8");
+
+  assert.match(typesSource, /WorkerBackend = "pi" \| "codex" \| "claude" \| "kimi"/);
+  assert.match(indexSource, /StringEnum\(\["pi", "codex", "claude", "kimi"\]/);
+  assert.match(indexSource, /kimiCommand/);
+  assert.match(spawnerSource, /runKimiWorkerStreaming/);
+  assert.match(spawnerSource, /backend \?\? "pi"\) === "kimi"/);
+  assert.match(registrySource, /kimiSessionId/);
+  assert.match(handbookSource, /Kimi Code/);
 });
 
 test("one-click installer installs the Pi extension and configures DeepSeek defaults", () => {
@@ -3693,6 +3907,31 @@ test("compaction report CLI prints shadow comparison records", () => {
   }
 });
 
+test("quality report estimates active context from latest compaction boundary", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-quality-active-context-test-"));
+  try {
+    mkdirSync(join(workersDir, "sessions"), { recursive: true });
+    const veryLongHistory = "旧历史".repeat(2000);
+    const keptMessage = "保留消息";
+    const summary = "压缩摘要";
+    writeFileSync(join(workersDir, "sessions", "WorkerC.jsonl"), [
+      JSON.stringify({ type: "message", id: "old1", parentId: null, timestamp: "2026-07-07T08:00:00Z", message: { role: "user", content: veryLongHistory } }),
+      JSON.stringify({ type: "message", id: "keep1", parentId: "old1", timestamp: "2026-07-07T09:00:00Z", message: { role: "user", content: keptMessage } }),
+      JSON.stringify({ type: "compaction", id: "cmp1", parentId: "keep1", timestamp: "2026-07-07T09:30:00Z", summary, tokensBefore: 12345, firstKeptEntryId: "keep1" }),
+    ].join("\n") + "\n", "utf8");
+
+    const report = buildFactoryQualityReport({ workersDir, worker: "WorkerC", limit: 20 });
+    const session = report.workers[0].session;
+    assert.equal(session.compactionCount, 1);
+    assert.equal(session.latestTokensBefore, 12345);
+    assert.ok(session.sessionFileTokens > session.activeContextTokens * 10);
+    assert.ok(session.activeContextTokens < 20);
+    assert.equal(session.estimatedContextTokens, session.activeContextTokens);
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
 test("quality report correlates context, compactions, input/output, latency and tools", () => {
   const workersDir = mkdtempSync(join(tmpdir(), "ox-quality-report-test-"));
   try {
@@ -4278,4 +4517,74 @@ test("outsource run list/detail include fullOutput via serializeOutsourceRun", a
   } finally {
     rmSync(workersDir, { recursive: true, force: true });
   }
+});
+
+test("notification settings are opt-in and persisted under workers config", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-notification-settings-"));
+  try {
+    const initial = readNotificationSettings(workersDir);
+    assert.equal(initial.enabled, false);
+    assert.equal(initial.jobTerminal.enabled, true);
+    assert.deepEqual(initial.jobTerminal.statuses, ["done"]);
+
+    const written = writeNotificationSettings(workersDir, {
+      enabled: true,
+      pollIntervalMs: 250,
+      jobTerminal: {
+        statuses: ["done", "failed", "unknown"],
+        workers: ["派派"],
+        excludedKinds: ["steer"],
+        excludedSources: ["system"],
+        template: "{worker} 完成了 {project}",
+        failureTemplate: "{worker} 挂了",
+      },
+    });
+
+    assert.equal(written.enabled, true);
+    assert.equal(written.pollIntervalMs, 1000, "轮询间隔下限应防止前端过度请求");
+    assert.deepEqual(written.jobTerminal.statuses, ["done", "failed"]);
+    assert.ok(existsSync(notificationSettingsFile(workersDir)));
+
+    const reread = readNotificationSettings(workersDir);
+    assert.deepEqual(reread, written);
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("job notifications only include configured non-steer terminal jobs", () => {
+  const settings = {
+    enabled: true,
+    jobTerminal: {
+      statuses: ["done"],
+      workers: ["派派"],
+      excludedKinds: ["steer"],
+      excludedSources: ["quality_emotion"],
+      template: "{worker} 任务完成",
+    },
+  };
+  const base = {
+    id: "job-1",
+    worker: "派派",
+    status: "done",
+    kind: "talk",
+    source: "web",
+    project: "talk",
+    finishedAt: "2026-07-22T10:00:00.000Z",
+  };
+
+  assert.equal(shouldNotifyJob(base, settings), true);
+  assert.equal(shouldNotifyJob({ ...base, kind: "steer" }, settings), false);
+  assert.equal(shouldNotifyJob({ ...base, source: "quality_emotion" }, settings), false);
+  assert.equal(shouldNotifyJob({ ...base, status: "failed" }, settings), false);
+  assert.equal(shouldNotifyJob({ ...base, worker: "八村" }, settings), false);
+
+  const notifications = buildJobNotifications([
+    { ...base, id: "old", finishedAt: "2026-07-22T09:59:59.000Z" },
+    base,
+    { ...base, id: "steer", kind: "steer", finishedAt: "2026-07-22T10:01:00.000Z" },
+  ], settings, { since: "2026-07-22T09:59:59.500Z" });
+
+  assert.deepEqual(notifications.map((n) => n.id), ["job:job-1:done"]);
+  assert.equal(notifications[0].message, "派派 任务完成");
 });

@@ -7,6 +7,7 @@ function clean(value) {
 function backendDisplayName(backend) {
   if (backend === "codex") return "Codex";
   if (backend === "claude") return "Claude Code";
+  if (backend === "kimi") return "Kimi Code";
   return "Pi";
 }
 
