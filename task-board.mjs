@@ -250,6 +250,21 @@ function requireTask(workersDir, taskId) {
   return task;
 }
 
+function assertValidParentLink(workersDir, taskId, parentTaskId) {
+  let currentId = clean(parentTaskId);
+  if (!currentId) return;
+  const projection = readProjection(workersDir);
+  const visited = new Set();
+  while (currentId) {
+    if (currentId === taskId) throw new Error("任务父子关系形成循环");
+    if (visited.has(currentId)) throw new Error("现有任务父子关系包含循环");
+    visited.add(currentId);
+    const current = projection.byId.get(currentId);
+    if (!current) throw new Error(`parent task not found: ${currentId}`);
+    currentId = clean(current.parentTaskId);
+  }
+}
+
 export class FactoryTaskConflictError extends Error {
   constructor(taskId, expectedRevision, currentRevision) {
     super(`任务 ${taskId} revision 冲突：期望 ${expectedRevision}，当前 ${currentRevision}`);
@@ -287,6 +302,7 @@ function appendTaskEvent(workersDir, task, type, { actor, patch, execution, at =
 export function createFactoryTask(workersDir, input = {}) {
   const at = nowIso(input.now || new Date());
   const task = baseTask(input, at);
+  assertValidParentLink(workersDir, task.id, task.parentTaskId);
   const fd = acquireTaskLock(workersDir, task.id);
   try {
     if (readProjection(workersDir).byId.has(task.id)) throw new Error(`factory task already exists: ${task.id}`);
@@ -406,6 +422,9 @@ export function updateFactoryTask(workersDir, taskId, input = {}) {
     const task = requireTask(workersDir, id);
     assertRevision(task, input.expectedRevision);
     const normalized = normalizeTaskPatch(task, input);
+    if (Object.hasOwn(normalized, "parentTaskId")) {
+      assertValidParentLink(workersDir, task.id, normalized.parentTaskId);
+    }
     const execution = normalized.execution;
     delete normalized.execution;
     if (Object.keys(normalized).length === 0 && !execution) return task;
@@ -428,17 +447,29 @@ export function splitFactoryTask(workersDir, parentTaskId, { children, actor = "
   try {
     const parent = requireTask(workersDir, id);
     assertRevision(parent, expectedRevision);
-    const created = children.map((child) => createFactoryTask(workersDir, {
-      ...child,
-      project: Object.hasOwn(child || {}, "project") ? child.project : parent.project,
-      status: child?.status || "TODO",
-      parentTaskId: parent.id,
-      creator: actor,
-      now,
-    }));
+    const at = nowIso(now || new Date());
+    const prepared = children.map((child) => {
+      const input = {
+        ...child,
+        project: Object.hasOwn(child || {}, "project") ? child.project : parent.project,
+        status: child?.status || "TODO",
+        parentTaskId: parent.id,
+        creator: actor,
+        now: at,
+      };
+      const preview = baseTask(input, at);
+      return { ...input, id: preview.id };
+    });
+    const existingIds = readProjection(workersDir).byId;
+    const childIds = new Set();
+    for (const child of prepared) {
+      if (childIds.has(child.id) || existingIds.has(child.id)) throw new Error(`factory task already exists: ${child.id}`);
+      childIds.add(child.id);
+    }
+    const created = prepared.map((child) => createFactoryTask(workersDir, child));
     appendTaskEvent(workersDir, parent, "task:split", {
       actor,
-      at: now,
+      at,
       data: { childTaskIds: created.map((child) => child.id) },
     });
     return created;
@@ -546,6 +577,17 @@ function assertExecutionKey(task, executionKey) {
   return key;
 }
 
+function assertExecutionLinks(task, { requestId, jobId } = {}) {
+  const request = clean(requestId);
+  const job = clean(jobId);
+  if (request && task.execution?.taskRequestId && task.execution.taskRequestId !== request) {
+    throw new Error(`任务已关联其他 request: ${task.execution.taskRequestId}`);
+  }
+  if (job && task.execution?.jobId && task.execution.jobId !== job) {
+    throw new Error(`任务已关联其他 job: ${task.execution.jobId}`);
+  }
+}
+
 export function linkFactoryTaskRequest(workersDir, taskId, options = {}) {
   const id = clean(taskId);
   const fd = acquireTaskLock(workersDir, id);
@@ -554,7 +596,9 @@ export function linkFactoryTaskRequest(workersDir, taskId, options = {}) {
     assertExecutionKey(task, options.executionKey);
     const requestId = clean(options.requestId);
     if (!requestId) throw new Error("requestId 不能为空");
-    if (task.execution?.taskRequestId === requestId && task.execution?.state === "queued") return task;
+    if (TERMINAL_EXECUTION_STATES.has(task.execution?.state)) return task;
+    if (task.execution?.taskRequestId === requestId && ["queued", "running"].includes(task.execution?.state)) return task;
+    assertExecutionLinks(task, { requestId });
     return appendTaskEvent(workersDir, task, "task:request-linked", {
       actor: options.actor,
       at: options.now,
@@ -581,8 +625,9 @@ export function markFactoryTaskQueued(workersDir, taskId, options = {}) {
     const jobId = clean(options.jobId);
     if (!requestId) throw new Error("requestId 不能为空");
     if (!jobId) throw new Error("jobId 不能为空");
-    if (["running", "succeeded", "failed", "cancelled"].includes(task.execution?.state)
-      && task.execution?.jobId === jobId) return task;
+    if (TERMINAL_EXECUTION_STATES.has(task.execution?.state)) return task;
+    assertExecutionLinks(task, { requestId, jobId });
+    if (task.execution?.state === "running" && task.execution?.jobId === jobId) return task;
     if (task.execution?.state === "queued" && task.execution?.jobId === jobId) return task;
     return appendTaskEvent(workersDir, task, "task:request-linked", {
       actor: options.actor,
@@ -609,6 +654,8 @@ export function markFactoryTaskRunning(workersDir, taskId, options = {}) {
     assertExecutionKey(task, options.executionKey);
     const jobId = clean(options.jobId);
     if (!jobId) throw new Error("jobId 不能为空");
+    if (TERMINAL_EXECUTION_STATES.has(task.execution?.state)) return task;
+    assertExecutionLinks(task, { requestId: options.requestId, jobId });
     if (task.execution?.state === "running" && task.execution?.jobId === jobId) return task;
     return appendTaskEvent(workersDir, task, "task:running", {
       actor: options.actor,
@@ -637,7 +684,8 @@ export function settleFactoryTaskExecution(workersDir, taskId, options = {}) {
     assertExecutionKey(task, options.executionKey);
     const state = clean(options.state);
     if (!TERMINAL_EXECUTION_STATES.has(state)) throw new Error(`不支持的执行终态: ${state}`);
-    if (TERMINAL_EXECUTION_STATES.has(task.execution?.state) && task.execution?.state === state) return task;
+    if (TERMINAL_EXECUTION_STATES.has(task.execution?.state)) return task;
+    assertExecutionLinks(task, { jobId: options.jobId });
     const at = nowIso(options.now || new Date());
     return appendTaskEvent(workersDir, task, "task:settled", {
       actor: options.actor,

@@ -2426,10 +2426,13 @@ test("ox web command starts and opens the local dashboard", () => {
 
 test("web health advertises feature flags used by ox-web stale detection", () => {
   const webServerSource = readFileSync(join(testDir, "../web-server.mjs"), "utf8");
+  const indexSource = readFileSync(join(testDir, "../index.ts"), "utf8");
 
   assert.match(webServerSource, /features:\s*\{/);
   assert.match(webServerSource, /taskRequests:\s*true/);
+  assert.match(webServerSource, /factoryTasks:\s*true/);
   assert.match(webServerSource, /compactJobTimeline:\s*true/);
+  assert.match(indexSource, /parsed\?\.features\?\.taskRequests[\s\S]{0,120}parsed\?\.features\?\.factoryTasks/);
 });
 
 test("web talk requests are event-sourced and do not create jobs in web-server", () => {

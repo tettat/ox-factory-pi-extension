@@ -669,15 +669,29 @@ export function buildWorkersView(workersDir, jobs, tokenReport, messages, regist
 // ---------------------------------------------------------------------------
 // 路由
 // ---------------------------------------------------------------------------
+function isTrustedMutationOrigin(req) {
+  const origin = String(req.headers.origin || "").trim();
+  if (!origin) return true;
+  try {
+    return new URL(origin).host.toLowerCase() === String(req.headers.host || "").trim().toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
 export function buildRouter({ workersDir }) {
   return async function handle(req, res) {
     const url = new URL(req.url, `http://${req.headers.host || "127.0.0.1"}`);
     const pathname = url.pathname;
     const method = (req.method || "GET").toUpperCase();
 
+    if (["POST", "PATCH", "DELETE"].includes(method) && !isTrustedMutationOrigin(req)) {
+      return errorResponse(res, 403, "拒绝跨站写入本地牛马工厂");
+    }
     if (method === "OPTIONS") {
+      if (!isTrustedMutationOrigin(req)) return errorResponse(res, 403, "拒绝跨站预检请求");
       res.writeHead(204, {
-        "access-control-allow-origin": "*",
+        "access-control-allow-origin": req.headers.origin || "*",
         "access-control-allow-methods": "GET,OPTIONS,POST,PATCH,DELETE",
         "access-control-allow-headers": "content-type",
       });
@@ -915,6 +929,7 @@ function handleHealth(res) {
     phase: "1",
     features: {
       taskRequests: true,
+      factoryTasks: true,
       compactJobTimeline: true,
       mainAgentTalk: true,
       workerTalkRequests: true,
@@ -1603,6 +1618,9 @@ export async function handleFactoryTaskMutation(workersDir, res, pathname, metho
   const actor = factoryTaskActor(body);
 
   if (method === "POST" && !id) {
+    if (body.runNow === true && !String(body.assignee || "").trim()) {
+      return badRequest(res, "创建后立即执行需要先指定负责人");
+    }
     ensureFactoryTaskAssignee(workersDir, body.assignee, actor);
     let task = createFactoryTask(workersDir, { ...body, creator: actor });
     let request = null;

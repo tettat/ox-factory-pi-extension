@@ -472,20 +472,37 @@ async function checkOxWebDashboard(url: string): Promise<{ baseHealthy: boolean;
   if (!baseHealthy) {
     return { baseHealthy: false, requiredApisHealthy: false, healthy: false, detail: "health endpoint is not ox-factory" };
   }
-  let featureAdvertised = false;
+  let requiredFeaturesAdvertised = false;
   try {
     const parsed = JSON.parse(health.body);
-    featureAdvertised = Boolean(parsed?.features?.taskRequests);
+    requiredFeaturesAdvertised = Boolean(
+      parsed?.features?.taskRequests
+      && parsed?.features?.factoryTasks,
+    );
   } catch {
-    featureAdvertised = false;
+    requiredFeaturesAdvertised = false;
   }
-  const taskRequests = await httpGetText(`${url}/api/task-requests?limit=1`);
-  const requiredApisHealthy = featureAdvertised || taskRequests.statusCode === 200;
+  const [taskRequests, factoryTasks] = await Promise.all([
+    httpGetText(`${url}/api/task-requests?limit=1`),
+    httpGetText(`${url}/api/factory-tasks?limit=1`),
+  ]);
+  let requiredEndpointsHealthy = false;
+  try {
+    const taskRequestsBody = JSON.parse(taskRequests.body);
+    const factoryTasksBody = JSON.parse(factoryTasks.body);
+    requiredEndpointsHealthy = taskRequests.statusCode === 200
+      && factoryTasks.statusCode === 200
+      && Array.isArray(taskRequestsBody?.requests)
+      && Array.isArray(factoryTasksBody?.tasks);
+  } catch {
+    requiredEndpointsHealthy = false;
+  }
+  const requiredApisHealthy = requiredFeaturesAdvertised && requiredEndpointsHealthy;
   return {
     baseHealthy,
     requiredApisHealthy,
     healthy: baseHealthy && requiredApisHealthy,
-    detail: requiredApisHealthy ? "ok" : "missing required /api/task-requests; web server process is stale",
+    detail: requiredApisHealthy ? "ok" : "missing required taskRequests/factoryTasks features or endpoints; web server process is stale",
   };
 }
 
@@ -2624,9 +2641,12 @@ export default function (pi: ExtensionAPI) {
         );
         if (sourceFactoryTaskId && sourceFactoryTaskExecutionKey) {
           try {
+            const executionState = result.stopReason === "aborted"
+              ? "cancelled"
+              : success ? "succeeded" : "failed";
             settleFactoryTaskExecution(getWorkersDir(), sourceFactoryTaskId, {
               executionKey: sourceFactoryTaskExecutionKey,
-              state: success ? "succeeded" : "failed",
+              state: executionState,
               jobId: job.id,
               summary: summary.slice(0, 8000),
               error: success ? "" : (result.errorMessage || result.stderr || "worker job failed"),
@@ -3846,6 +3866,9 @@ export default function (pi: ExtensionAPI) {
     async execute(_tcid, params) {
       try {
         const actor = factoryTaskActor(params.actor);
+        if (params.runNow && !String(params.assignee || "").trim()) {
+          throw new Error("创建后立即执行需要先指定负责人");
+        }
         if (params.assignee) assertFactoryTaskAssignment(actor, params.assignee);
         let task = createFactoryTask(getWorkersDir(), { ...params, creator: actor });
         let request: any = null;

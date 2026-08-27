@@ -157,6 +157,35 @@ test("factory task board splits independently assignable children and archives s
   });
 });
 
+test("factory task board rejects orphan and cyclic parent links", () => {
+  withWorkersDir((workersDir) => {
+    assert.throws(
+      () => createFactoryTask(workersDir, { title: "孤儿任务", parentTaskId: "missing" }),
+      /parent task not found/,
+    );
+    const first = createFactoryTask(workersDir, { title: "父任务" });
+    const second = createFactoryTask(workersDir, { title: "子任务" });
+    updateFactoryTask(workersDir, second.id, { parentTaskId: first.id });
+    assert.throws(
+      () => updateFactoryTask(workersDir, first.id, { parentTaskId: second.id }),
+      /父子关系形成循环/,
+    );
+  });
+});
+
+test("factory task split validates the full batch before writing children", () => {
+  withWorkersDir((workersDir) => {
+    const parent = createFactoryTask(workersDir, { title: "批量拆分" });
+    assert.throws(() => splitFactoryTask(workersDir, parent.id, {
+      children: [
+        { title: "本不该留下" },
+        { title: "非法优先级", priority: "impossible" },
+      ],
+    }), /不支持的 priority/);
+    assert.deepEqual(listFactoryTasks(workersDir).map((task) => task.id), [parent.id]);
+  });
+});
+
 test("factory task board tracks scheduled and idempotent execution evidence without changing display status", () => {
   withWorkersDir((workersDir) => {
     const now = new Date("2026-08-27T10:00:00.000Z");
@@ -217,6 +246,91 @@ test("factory task board tracks scheduled and idempotent execution evidence with
   });
 });
 
+test("factory task terminal evidence is monotonic under late duplicate lifecycle callbacks", () => {
+  withWorkersDir((workersDir) => {
+    const task = createFactoryTask(workersDir, { title: "终态不可回退", assignee: "阿哲" });
+    const dispatching = beginFactoryTaskDispatch(workersDir, task.id, { executionKey: "fexec-monotonic" });
+    linkFactoryTaskRequest(workersDir, task.id, {
+      executionKey: dispatching.execution.executionKey,
+      requestId: "wtask-monotonic",
+    });
+    markFactoryTaskQueued(workersDir, task.id, {
+      executionKey: dispatching.execution.executionKey,
+      requestId: "wtask-monotonic",
+      jobId: "job-monotonic",
+    });
+    markFactoryTaskRunning(workersDir, task.id, {
+      executionKey: dispatching.execution.executionKey,
+      requestId: "wtask-monotonic",
+      jobId: "job-monotonic",
+    });
+    const settled = settleFactoryTaskExecution(workersDir, task.id, {
+      executionKey: dispatching.execution.executionKey,
+      state: "succeeded",
+      jobId: "job-monotonic",
+      summary: "first terminal result wins",
+    });
+
+    linkFactoryTaskRequest(workersDir, task.id, {
+      executionKey: dispatching.execution.executionKey,
+      requestId: "wtask-monotonic",
+    });
+    markFactoryTaskQueued(workersDir, task.id, {
+      executionKey: dispatching.execution.executionKey,
+      requestId: "wtask-monotonic",
+      jobId: "job-monotonic",
+    });
+    markFactoryTaskRunning(workersDir, task.id, {
+      executionKey: dispatching.execution.executionKey,
+      requestId: "wtask-monotonic",
+      jobId: "job-monotonic",
+    });
+    settleFactoryTaskExecution(workersDir, task.id, {
+      executionKey: dispatching.execution.executionKey,
+      state: "failed",
+      jobId: "job-monotonic",
+      error: "late callback",
+    });
+
+    const current = getFactoryTask(workersDir, task.id, { includeEvents: true });
+    assert.equal(current.execution.state, "succeeded");
+    assert.equal(current.execution.resultSummary, "first terminal result wins");
+    assert.equal(current.revision, settled.revision);
+  });
+});
+
+test("factory task execution linkage rejects a second job for the same execution key", () => {
+  withWorkersDir((workersDir) => {
+    const task = createFactoryTask(workersDir, { title: "单执行单 Job", assignee: "阿哲" });
+    const dispatching = beginFactoryTaskDispatch(workersDir, task.id, { executionKey: "fexec-one-job" });
+    linkFactoryTaskRequest(workersDir, task.id, {
+      executionKey: dispatching.execution.executionKey,
+      requestId: "wtask-one-job",
+    });
+    markFactoryTaskQueued(workersDir, task.id, {
+      executionKey: dispatching.execution.executionKey,
+      requestId: "wtask-one-job",
+      jobId: "job-first",
+    });
+
+    assert.throws(() => markFactoryTaskQueued(workersDir, task.id, {
+      executionKey: dispatching.execution.executionKey,
+      requestId: "wtask-one-job",
+      jobId: "job-second",
+    }), /已关联其他 job/);
+    assert.throws(() => markFactoryTaskRunning(workersDir, task.id, {
+      executionKey: dispatching.execution.executionKey,
+      requestId: "wtask-one-job",
+      jobId: "job-second",
+    }), /已关联其他 job/);
+    assert.throws(() => settleFactoryTaskExecution(workersDir, task.id, {
+      executionKey: dispatching.execution.executionKey,
+      state: "succeeded",
+      jobId: "job-second",
+    }), /已关联其他 job/);
+  });
+});
+
 test("factory extension exposes board tools and links worker job lifecycle to factory tasks", () => {
   const indexSource = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
   const handbookSource = readFileSync(new URL("../factory-handbook.mjs", import.meta.url), "utf8");
@@ -236,6 +350,7 @@ test("factory extension exposes board tools and links worker job lifecycle to fa
   assert.match(indexSource, /markFactoryTaskQueued/);
   assert.match(indexSource, /markFactoryTaskRunning/);
   assert.match(indexSource, /settleFactoryTaskExecution/);
+  assert.match(indexSource, /result\.stopReason === "aborted"[\s\S]{0,120}"cancelled"/);
   assert.match(indexSource, /sourceFactoryTaskId/);
   assert.match(indexSource, /dispatchFactoryTask/);
   assert.match(handbookSource, /全局任务看板/);
@@ -367,6 +482,22 @@ test("factory task dispatcher supports explicit immediate runs and stable assign
 test("factory task web API supports CRUD, filters, split, archive, and revision conflicts", async () => {
   await withWorkersDirAsync(async (workersDir) => {
     await withTaskApi(workersDir, async (baseUrl) => {
+      const crossOriginResponse = await fetch(`${baseUrl}/api/factory-tasks`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: "https://evil.example" },
+        body: JSON.stringify({ title: "跨站写入", actor: "用户" }),
+      });
+      assert.equal(crossOriginResponse.status, 403);
+      assert.equal(listFactoryTasks(workersDir, { limit: 100 }).length, 0);
+
+      const invalidRunResponse = await fetch(`${baseUrl}/api/factory-tasks`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "不能留下半成品", runNow: true, actor: "用户" }),
+      });
+      assert.equal(invalidRunResponse.status, 400);
+      assert.equal(listFactoryTasks(workersDir, { limit: 100 }).length, 0);
+
       const createdResponse = await fetch(`${baseUrl}/api/factory-tasks`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -431,6 +562,27 @@ test("factory task web API supports CRUD, filters, split, archive, and revision 
   });
 });
 
+test("cancelling a pending linked task request settles the board execution", async () => {
+  await withWorkersDirAsync(async (workersDir) => {
+    const task = createFactoryTask(workersDir, { title: "取消派活", assignee: "阿哲" });
+    const dispatched = dispatchFactoryTask(workersDir, task.id, { actor: "用户", force: true });
+    assert.equal(dispatched.task.execution.state, "queued");
+
+    await withTaskApi(workersDir, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/task-requests/${encodeURIComponent(dispatched.request.id)}/cancel`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ from: "用户", reason: "不再需要" }),
+      });
+      assert.equal(response.status, 200);
+    });
+
+    const current = getFactoryTask(workersDir, task.id);
+    assert.equal(current.execution.state, "cancelled");
+    assert.equal(current.execution.error, "不再需要");
+  });
+});
+
 test("factory task scheduler waits for startup grace, batches scans, and stops cleanly", async () => {
   await withWorkersDirAsync(async (workersDir) => {
     let calls = 0;
@@ -459,6 +611,63 @@ test("factory task scheduler waits for startup grace, batches scans, and stops c
   });
 });
 
+test("factory task scheduled execution keeps one request and a complete lifecycle trail", () => {
+  withWorkersDir((workersDir) => {
+    const task = createFactoryTask(workersDir, {
+      title: "端到端调度",
+      project: "talk",
+      status: "进行中",
+      assignee: "阿哲",
+      triggerAt: "2026-08-27T09:59:00.000Z",
+      creator: "用户",
+    });
+
+    const firstScan = dispatchDueFactoryTasks(workersDir, {
+      now: new Date("2026-08-27T10:00:00.000Z"),
+      actor: "web-scheduler",
+    });
+    assert.equal(firstScan.dispatched.length, 1);
+    const request = firstScan.dispatched[0].request;
+    const executionKey = firstScan.dispatched[0].task.execution.executionKey;
+
+    markFactoryTaskQueued(workersDir, task.id, {
+      executionKey,
+      requestId: request.id,
+      jobId: "job-e2e",
+      actor: "pi",
+    });
+    markFactoryTaskRunning(workersDir, task.id, {
+      executionKey,
+      requestId: request.id,
+      jobId: "job-e2e",
+      actor: "pi",
+    });
+    const settled = settleFactoryTaskExecution(workersDir, task.id, {
+      executionKey,
+      state: "succeeded",
+      jobId: "job-e2e",
+      summary: "交付待用户验收",
+      actor: "pi",
+    });
+
+    const repeatedScan = dispatchDueFactoryTasks(workersDir, {
+      now: new Date("2026-08-27T10:05:00.000Z"),
+      actor: "web-scheduler",
+    });
+    const detail = getFactoryTask(workersDir, task.id, { includeEvents: true });
+    assert.equal(repeatedScan.dispatched.length, 0);
+    assert.equal(listWorkerTaskRequests(workersDir, { limit: 100 }).length, 1);
+    assert.equal(settled.execution.state, "succeeded");
+    assert.equal(settled.status, "进行中");
+    assert.equal(detail.execution.taskRequestId, request.id);
+    assert.equal(detail.execution.jobId, "job-e2e");
+    assert.deepEqual(
+      detail.events.slice(-4).map((event) => event.type),
+      ["task:request-linked", "task:request-linked", "task:running", "task:settled"],
+    );
+  });
+});
+
 test("factory task web UI exposes a global accessible Kanban board", () => {
   const appSource = readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
   const htmlSource = readFileSync(new URL("../web/index.html", import.meta.url), "utf8");
@@ -468,6 +677,8 @@ test("factory task web UI exposes a global accessible Kanban board", () => {
   assert.match(htmlSource, /data-i18n="nav\.tasks"/);
   assert.match(appSource, /async function renderFactoryTaskBoard/);
   assert.match(appSource, /function factoryTaskCard/);
+  assert.match(appSource, /factoryTaskPriorityRank/);
+  assert.match(appSource, /factory-task-card--archived/);
   assert.match(appSource, /async function moveFactoryTask/);
   assert.match(appSource, /draggable:\s*"true"/);
   assert.match(appSource, /ondragstart:/);
@@ -476,9 +687,14 @@ test("factory task web UI exposes a global accessible Kanban board", () => {
   assert.match(appSource, /openNewFactoryTaskDrawer/);
   assert.match(appSource, /openFactoryTaskDrawer/);
   assert.match(appSource, /saveFactoryTaskForm/);
+  assert.match(appSource, /runAfterSave/);
+  assert.match(appSource, /任务已保存，但启动执行失败/);
   assert.match(appSource, /splitFactoryTaskFromDrawer/);
   assert.match(appSource, /runFactoryTaskFromDrawer/);
+  assert.match(appSource, /cancelFactoryTaskExecutionFromDrawer/);
   assert.match(appSource, /archiveFactoryTaskFromDrawer/);
+  assert.match(appSource, /factoryTaskEventText/);
+  assert.match(appSource, /执行证据/);
   assert.match(appSource, /factoryTaskProjectFilter/);
   assert.match(appSource, /factoryTaskStatusFilter/);
   assert.match(appSource, /factoryTaskAssigneeFilter/);

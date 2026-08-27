@@ -1,6 +1,5 @@
 import {
   beginFactoryTaskDispatch,
-  getFactoryTask,
   linkFactoryTaskRequest,
   listDueFactoryTasks,
 } from "./task-board.mjs";
@@ -49,9 +48,7 @@ function linkExistingOrNewRequest(workersDir, task, dispatching, options) {
 }
 
 export function dispatchFactoryTask(workersDir, taskId, options = {}) {
-  const task = getFactoryTask(workersDir, taskId);
-  if (!task) throw new Error(`factory task not found: ${taskId}`);
-  const dispatching = beginFactoryTaskDispatch(workersDir, task.id, {
+  const dispatching = beginFactoryTaskDispatch(workersDir, taskId, {
     actor: options.actor || "factory-task-dispatcher",
     now: options.now,
     leaseMs: options.leaseMs,
@@ -59,7 +56,7 @@ export function dispatchFactoryTask(workersDir, taskId, options = {}) {
     expectedRevision: options.expectedRevision,
     force: options.force === true,
   });
-  return linkExistingOrNewRequest(workersDir, task, dispatching, options);
+  return linkExistingOrNewRequest(workersDir, dispatching, dispatching, options);
 }
 
 export function dispatchDueFactoryTasks(workersDir, options = {}) {

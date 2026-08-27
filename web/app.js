@@ -4197,10 +4197,14 @@
     return ({ low: "低", normal: "普通", high: "高", urgent: "紧急" })[priority] || priority || "普通";
   }
 
+  function factoryTaskPriorityRank(priority) {
+    return ({ urgent: 0, high: 1, normal: 2, low: 3 })[priority] ?? 2;
+  }
+
   function factoryTaskCard(task) {
     const executionState = task.execution?.state || "idle";
     return el("article", {
-      class: `factory-task-card factory-task-card--${task.priority || "normal"}`,
+      class: `factory-task-card factory-task-card--${task.priority || "normal"}${task.archivedAt ? " factory-task-card--archived" : ""}`,
       tabindex: "0",
       role: "button",
       draggable: "true",
@@ -4226,6 +4230,7 @@
     }, [
       el("div", { class: "factory-task-card__head" }, [
         el("span", { class: `factory-task-card__priority factory-task-card__priority--${task.priority || "normal"}`, text: factoryTaskPriorityLabel(task.priority) }),
+        task.archivedAt ? el("span", { class: "factory-task-card__archived", text: "已归档" }) : null,
         el("span", { class: `factory-task-card__execution factory-task-card__execution--${executionState}`, text: factoryTaskExecutionLabel(executionState) }),
       ]),
       el("h3", { class: "factory-task-card__title", text: task.title }),
@@ -4261,6 +4266,11 @@
   }
 
   function factoryTaskColumn(status, tasks) {
+    const orderedTasks = tasks.slice().sort((a, b) => {
+      const priority = factoryTaskPriorityRank(a.priority) - factoryTaskPriorityRank(b.priority);
+      if (priority) return priority;
+      return String(b.updatedAt || "").localeCompare(String(a.updatedAt || ""));
+    });
     return el("section", {
       class: "factory-board__column",
       data: { status },
@@ -4285,8 +4295,8 @@
         ]),
         el("span", { class: "factory-board__count", text: String(tasks.length), title: `${tasks.length} 个任务` }),
       ]),
-      el("div", { class: "factory-board__cards" }, tasks.length
-        ? tasks.map(factoryTaskCard)
+      el("div", { class: "factory-board__cards" }, orderedTasks.length
+        ? orderedTasks.map(factoryTaskCard)
         : [el("div", { class: "factory-board__empty", text: "拖动任务到这里" })]),
     ]);
   }
@@ -4401,6 +4411,23 @@
   function factoryTaskForm(task = null) {
     const isNew = !task;
     const record = task || { priority: "normal", status: "TODO", mode: "auto", labels: [] };
+    const assigneeSelect = el("select", { class: "input", name: "assignee" }, [
+      el("option", { value: "", text: "未指派" }),
+      ...STATE.workers.map((worker) => el("option", { value: worker.name, text: worker.name, selected: worker.name === record.assignee })),
+    ]);
+    const triggerInput = el("input", { class: "input", name: "triggerAt", type: "datetime-local", value: toDatetimeLocal(record.triggerAt) });
+    const runAfterSaveInput = el("input", {
+      name: "runNow",
+      type: "checkbox",
+      checked: isNew,
+      disabled: !record.assignee || Boolean(record.triggerAt) || Boolean(record.archivedAt),
+    });
+    const syncRunAfterSave = () => {
+      if (triggerInput.value) runAfterSaveInput.checked = false;
+      runAfterSaveInput.disabled = !assigneeSelect.value || Boolean(triggerInput.value) || Boolean(record.archivedAt);
+    };
+    assigneeSelect.addEventListener("change", syncRunAfterSave);
+    triggerInput.addEventListener("change", syncRunAfterSave);
     const form = el("form", { class: "factory-task-form", id: "factoryTaskForm" }, [
       el("label", { class: "factory-task-form__field factory-task-form__field--wide" }, [
         el("span", { text: "标题" }),
@@ -4425,10 +4452,7 @@
       ]),
       el("label", { class: "factory-task-form__field" }, [
         el("span", { text: "负责人" }),
-        el("select", { class: "input", name: "assignee" }, [
-          el("option", { value: "", text: "未指派" }),
-          ...STATE.workers.map((worker) => el("option", { value: worker.name, text: worker.name, selected: worker.name === record.assignee })),
-        ]),
+        assigneeSelect,
       ]),
       el("label", { class: "factory-task-form__field" }, [
         el("span", { text: "优先级" }),
@@ -4440,16 +4464,17 @@
       ]),
       el("label", { class: "factory-task-form__field" }, [
         el("span", { text: "触发时间" }),
-        el("input", { class: "input", name: "triggerAt", type: "datetime-local", value: toDatetimeLocal(record.triggerAt) }),
+        triggerInput,
       ]),
       el("label", { class: "factory-task-form__field" }, [
         el("span", { text: "执行方式" }),
         el("select", { class: "input", name: "mode" }, ["auto", "queue", "steer", "now"].map((value) => el("option", { value, text: value, selected: value === record.mode }))),
       ]),
-      isNew ? el("label", { class: "factory-task-filter-check factory-task-form__field--wide" }, [
-        el("input", { name: "runNow", type: "checkbox" }),
-        el("span", { text: "创建后立即执行（需要负责人）" }),
-      ]) : null,
+      el("label", { class: "factory-task-filter-check factory-task-form__field--wide" }, [
+        runAfterSaveInput,
+        el("span", { text: isNew ? "指派后立即通知负责人并执行" : "保存后立即通知负责人并执行" }),
+      ]),
+      el("p", { class: "factory-task-form__hint factory-task-form__field--wide", text: "设置触发时间后改为到期执行；取消勾选可只登记负责人，不启动 Job。" }),
       el("div", { class: "factory-task-form__actions factory-task-form__field--wide" }, [
         el("button", { class: "btn btn--primary", type: "submit", text: isNew ? "创建任务" : "保存修改" }),
       ]),
@@ -4485,6 +4510,7 @@
     submit.disabled = true;
     submit.textContent = task ? "保存中…" : "创建中…";
     const payload = factoryTaskFormPayload(form);
+    const runAfterSave = payload.runNow;
     if (task) {
       payload.expectedRevision = task.revision;
       delete payload.runNow;
@@ -4501,7 +4527,21 @@
       if (res.status === 409 && task) void openFactoryTaskDrawer(task.id);
       return;
     }
-    toast(task ? "任务已更新" : "任务已创建", "success");
+    if (task && runAfterSave) {
+      const updated = res.data.task;
+      const runRes = await api(`/api/factory-tasks/${encodeURIComponent(updated.id)}/run`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ actor: "用户", mode: updated.mode, expectedRevision: updated.revision }),
+      });
+      if (!runRes.ok) {
+        toast("任务已保存，但启动执行失败", "error");
+        await refreshFactoryTaskBoard();
+        void openFactoryTaskDrawer(updated.id);
+        return;
+      }
+    }
+    toast(runAfterSave ? "任务已保存并提交执行" : task ? "任务已更新" : "任务已创建", "success");
     closeDrawer();
     await refreshFactoryTaskBoard();
   }
@@ -4551,6 +4591,39 @@
     await refreshFactoryTaskBoard();
   }
 
+  async function cancelFactoryTaskExecutionFromDrawer(task) {
+    const jobId = task.execution?.jobId;
+    const requestId = task.execution?.taskRequestId;
+    if (!jobId && !requestId) { toast("当前执行还没有可取消的 Job 或请求", "error"); return; }
+    const path = jobId
+      ? `/api/jobs/${encodeURIComponent(jobId)}/cancel`
+      : `/api/task-requests/${encodeURIComponent(requestId)}/cancel`;
+    const res = await api(path, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ actor: "用户", from: "用户", reason: "用户从任务看板停止执行" }),
+    });
+    if (!res.ok) { toast("停止执行失败", "error"); return; }
+    toast("已提交停止执行请求", "success");
+    await refreshFactoryTaskBoard();
+    void openFactoryTaskDrawer(task.id);
+  }
+
+  function factoryTaskEventText(event) {
+    if (event.type === "task:created") return event.task?.title || "已创建任务";
+    if (event.patch?.status) return `状态 → ${event.patch.status}`;
+    if (event.patch) {
+      const fields = Object.keys(event.patch).filter((key) => key !== "updatedAt");
+      if (fields.length) return `更新 ${fields.join("、")}`;
+    }
+    if (event.data?.childTaskIds?.length) return `拆分 ${event.data.childTaskIds.length} 个子任务`;
+    if (event.data?.jobLinked) return "已关联员工 Job";
+    if (event.execution?.resultSummary) return event.execution.resultSummary;
+    if (event.execution?.error) return event.execution.error;
+    if (event.execution?.state) return `执行状态 → ${factoryTaskExecutionLabel(event.execution.state)}`;
+    return "—";
+  }
+
   async function openFactoryTaskDrawer(id) {
     openDrawer(el("div", { class: "skeleton skeleton--row" }), { eyebrow: "TASK", title: "加载中…" });
     const res = await api(`/api/factory-tasks/${encodeURIComponent(id)}`);
@@ -4567,10 +4640,23 @@
       ]),
       factoryTaskForm(task),
       el("section", { class: "factory-task-detail__actions" }, [
-        el("button", { class: "btn", type: "button", text: "立即执行", disabled: !task.assignee, onclick: () => runFactoryTaskFromDrawer(task) }),
+        el("button", { class: "btn", type: "button", text: "立即执行", disabled: !task.assignee || Boolean(task.archivedAt), onclick: () => runFactoryTaskFromDrawer(task) }),
+        ["dispatching", "queued", "running"].includes(task.execution?.state) && (task.execution?.jobId || task.execution?.taskRequestId)
+          ? el("button", { class: "btn btn--danger", type: "button", text: "停止执行", onclick: () => cancelFactoryTaskExecutionFromDrawer(task) })
+          : null,
         el("button", { class: task.archivedAt ? "btn" : "btn btn--danger", type: "button", text: task.archivedAt ? "恢复任务" : "归档任务", onclick: () => archiveFactoryTaskFromDrawer(task) }),
         task.execution?.jobId ? el("button", { class: "btn btn--ghost", type: "button", text: `查看 Job ${String(task.execution.jobId).slice(-6)}`, onclick: () => openJobDrawer(task.execution.jobId) }) : null,
         task.execution?.taskRequestId ? el("a", { class: "btn btn--ghost", href: `#/task-requests/${encodeURIComponent(task.execution.taskRequestId)}`, text: "查看派活请求" }) : null,
+      ]),
+      el("section", { class: "factory-task-detail__evidence" }, [
+        el("h4", { text: "执行证据" }),
+        el("dl", { class: "factory-task-evidence" }, [
+          el("dt", { text: "Execution Key" }), el("dd", { text: task.execution?.executionKey || "—" }),
+          el("dt", { text: "Request" }), el("dd", { text: task.execution?.taskRequestId || "—" }),
+          el("dt", { text: "Job" }), el("dd", { text: task.execution?.jobId || "—" }),
+          el("dt", { text: "开始 / 结束" }), el("dd", { text: `${fmtTime(task.execution?.startedAt)} / ${fmtTime(task.execution?.finishedAt)}` }),
+          el("dt", { text: "结果" }), el("dd", { text: task.execution?.resultSummary || task.execution?.error || "—" }),
+        ]),
       ]),
       el("section", { class: "factory-task-detail__split" }, [
         el("h4", { text: "拆分子任务" }),
@@ -4586,7 +4672,7 @@
           el("span", { class: "timeline__time", text: fmtTime(event.at) }),
           el("span", { class: "timeline__type", text: event.type }),
           el("span", { class: "timeline__name", text: event.actor || "—" }),
-          el("span", { class: "timeline__text", text: event.data?.jobLinked ? "已关联员工 Job" : event.execution?.resultSummary || event.execution?.error || "—" }),
+          el("span", { class: "timeline__text", text: factoryTaskEventText(event) }),
         ]))),
       ]),
     ]);

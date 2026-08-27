@@ -1,6 +1,8 @@
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 
+import { settleFactoryTaskExecution } from "./task-board.mjs";
+
 const REQUEST_EVENT_TYPES = new Set(["request"]);
 const TERMINAL_STATUSES = new Set(["accepted", "failed", "cancelled", "reported"]);
 const DEFAULT_PROCESSING_TIMEOUT_MS = 120_000;
@@ -403,6 +405,24 @@ export function cancelWorkerTaskRequest(workersDir, { requestId, reason, from = 
     cancelledAt: nowIso(),
   };
   appendJsonl(workerTaskRequestsFile(workersDir), event);
+  if (request.factoryTaskId && request.executionKey) {
+    try {
+      settleFactoryTaskExecution(workersDir, request.factoryTaskId, {
+        executionKey: request.executionKey,
+        state: "cancelled",
+        jobId: request.jobId,
+        error: event.reason,
+        actor: event.from,
+      });
+    } catch (error) {
+      appendJsonl(workerTaskRequestsFile(workersDir), {
+        type: "factory_task_sync_failed",
+        requestId: request.id,
+        at: nowIso(),
+        error: error?.message || String(error),
+      });
+    }
+  }
   return getWorkerTaskRequest(workersDir, request.id);
 }
 
