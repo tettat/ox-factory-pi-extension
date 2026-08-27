@@ -15,6 +15,7 @@ import {
   listDueFactoryTasks,
   listFactoryTaskStatuses,
   listFactoryTasks,
+  markFactoryTaskQueued,
   markFactoryTaskRunning,
   restoreFactoryTask,
   settleFactoryTaskExecution,
@@ -158,6 +159,15 @@ test("factory task board tracks scheduled and idempotent execution evidence with
     assert.equal(linked.execution.state, "queued");
     assert.equal(linked.execution.taskRequestId, "wtask-1");
 
+    const queued = markFactoryTaskQueued(workersDir, task.id, {
+      executionKey: dispatching.execution.executionKey,
+      requestId: "wtask-1",
+      jobId: "job-1",
+      actor: "pi",
+    });
+    assert.equal(queued.execution.state, "queued");
+    assert.equal(queued.execution.jobId, "job-1");
+
     const running = markFactoryTaskRunning(workersDir, task.id, {
       executionKey: dispatching.execution.executionKey,
       requestId: "wtask-1",
@@ -178,6 +188,31 @@ test("factory task board tracks scheduled and idempotent execution evidence with
     assert.equal(done.status, "待验收");
     assert.deepEqual(listDueFactoryTasks(workersDir, { now }), []);
   });
+});
+
+test("factory extension exposes board tools and links worker job lifecycle to factory tasks", () => {
+  const indexSource = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
+  const handbookSource = readFileSync(new URL("../factory-handbook.mjs", import.meta.url), "utf8");
+
+  for (const tool of [
+    "factory_task_create",
+    "factory_task_list",
+    "factory_task_get",
+    "factory_task_update",
+    "factory_task_split",
+    "factory_task_archive",
+    "factory_task_run",
+    "factory_task_assign",
+  ]) {
+    assert.match(indexSource, new RegExp(`name:\\s*"${tool}"`));
+  }
+  assert.match(indexSource, /markFactoryTaskQueued/);
+  assert.match(indexSource, /markFactoryTaskRunning/);
+  assert.match(indexSource, /settleFactoryTaskExecution/);
+  assert.match(indexSource, /sourceFactoryTaskId/);
+  assert.match(indexSource, /dispatchFactoryTask/);
+  assert.match(handbookSource, /全局任务看板/);
+  assert.match(handbookSource, /factory_task_update/);
 });
 
 test("factory task board recovers only expired dispatch leases", () => {

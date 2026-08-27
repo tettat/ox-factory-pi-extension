@@ -158,6 +158,19 @@ import {
   recoverStaleWorkerTaskRequests,
 } from "./task-requests.mjs";
 import {
+  archiveFactoryTask,
+  createFactoryTask,
+  getFactoryTask,
+  listFactoryTasks,
+  markFactoryTaskQueued,
+  markFactoryTaskRunning,
+  restoreFactoryTask,
+  settleFactoryTaskExecution,
+  splitFactoryTask,
+  updateFactoryTask,
+} from "./task-board.mjs";
+import { dispatchFactoryTask } from "./task-dispatcher.mjs";
+import {
   formatOutsourceProfiles,
   formatOutsourceRuns,
   getOutsourceProfile,
@@ -210,6 +223,16 @@ const ProjectWorktreeStatusSchema = StringEnum(
 const ProjectMemberStatusSchema = StringEnum(
   ["active", "inactive"] as const,
   { description: "项目成员关系状态", default: "active" },
+);
+
+const FactoryTaskPrioritySchema = StringEnum(
+  ["low", "normal", "high", "urgent"] as const,
+  { description: "看板任务优先级", default: "normal" },
+);
+
+const FactoryTaskModeSchema = StringEnum(
+  ["auto", "queue", "steer", "now"] as const,
+  { description: "执行方式：auto=空闲立即/忙则排队；queue=排队；steer=优先插入；now=仅空闲执行", default: "auto" },
 );
 
 const WorkerManualStatusSchema = StringEnum(
@@ -601,6 +624,7 @@ type PendingWorkerJob = {
   job: any;
   controller: AbortController;
   onEvent?: (event: StreamEvent) => void;
+  onStarted?: (job: any) => void;
   resolve: (result: SpawnResult) => void;
   reject: (error: unknown) => void;
 };
@@ -827,6 +851,7 @@ async function drainWorkerJobQueue(workerId: string) {
 
   try {
     const handle = startWorkerJob({ ...item.options, signal: item.controller.signal }, item.job, item.onEvent);
+    item.onStarted?.(readJob(item.job));
     const result = await handle.promise;
     item.resolve(result);
   } catch (error) {
@@ -850,13 +875,16 @@ function startWorkerJobQueued(
   options: SpawnOptions,
   job: any,
   onEvent?: (event: StreamEvent) => void,
+  onStarted?: (job: any) => void,
 ): { job: any; promise: Promise<SpawnResult> } {
   const workerId = options.worker.id;
   if (
     job.deliveryMode === "steer" &&
     canSteerActiveCodexTurn(options.worker)
   ) {
-    return startWorkerJob(options, job, onEvent);
+    const handle = startWorkerJob(options, job, onEvent);
+    onStarted?.(readJob(job));
+    return handle;
   }
 
   const promise = new Promise<SpawnResult>((resolve, reject) => {
@@ -866,7 +894,7 @@ function startWorkerJobQueued(
       if (options.signal.aborted) abort();
       else options.signal.addEventListener("abort", abort, { once: true });
     }
-    const item: PendingWorkerJob = { options, job, controller, onEvent, resolve, reject };
+    const item: PendingWorkerJob = { options, job, controller, onEvent, onStarted, resolve, reject };
     const queue = workerJobQueues.get(workerId) ?? [];
     if (job.deliveryMode === "steer") {
       const firstPlainQueue = queue.findIndex((queued) => queued.job.deliveryMode !== "steer");
@@ -1127,37 +1155,44 @@ export default function (pi: ExtensionAPI) {
             claimedBy: `pi:${process.pid}`,
           });
           if (!claimed) continue;
+          const failClaimed = (message: string) => {
+            const failed = failWorkerTaskRequest(getWorkersDir(), {
+              requestId: request.id,
+              error: message,
+            });
+            if (claimed.factoryTaskId && claimed.executionKey) {
+              try {
+                settleFactoryTaskExecution(getWorkersDir(), claimed.factoryTaskId, {
+                  executionKey: claimed.executionKey,
+                  state: "failed",
+                  error: message,
+                  actor: `pi:${process.pid}`,
+                });
+              } catch {
+                // Request failure remains authoritative even if auxiliary board evidence cannot be written.
+              }
+            }
+            return failed;
+          };
           const from = String(claimed.from || "用户").trim() || "用户";
           const targetWorkerId = String(claimed.to || "").trim();
           const task = String(claimed.task || "").trim();
           if (!targetWorkerId || targetWorkerId === "*") {
-            failWorkerTaskRequest(getWorkersDir(), {
-              requestId: request.id,
-              error: "派活目标不能为空，且暂不支持广播目标 *",
-            });
+            failClaimed("派活目标不能为空，且暂不支持广播目标 *");
             continue;
           }
           if (!hasPermission(getWorkersDir(), { subject: from, action: "work:assign", target: targetWorkerId })) {
-            failWorkerTaskRequest(getWorkersDir(), {
-              requestId: request.id,
-              error: `${from} 没有权限对 ${targetWorkerId} 执行 work:assign`,
-            });
+            failClaimed(`${from} 没有权限对 ${targetWorkerId} 执行 work:assign`);
             continue;
           }
           const worker = recoverWorkerFromRegistrySnapshot(targetWorkerId);
           const availability = workerCanAcceptWork(worker, targetWorkerId);
           if (!availability.ok) {
-            failWorkerTaskRequest(getWorkersDir(), {
-              requestId: request.id,
-              error: availability.reason || `员工 ${targetWorkerId} 当前不可接活`,
-            });
+            failClaimed(availability.reason || `员工 ${targetWorkerId} 当前不可接活`);
             continue;
           }
           if (!task) {
-            failWorkerTaskRequest(getWorkersDir(), {
-              requestId: request.id,
-              error: "派活任务为空",
-            });
+            failClaimed("派活任务为空");
             continue;
           }
 
@@ -1169,6 +1204,8 @@ export default function (pi: ExtensionAPI) {
             mode: claimed.mode || "auto",
             kind: "assigned-task",
             sourceTaskRequestId: claimed.id,
+            sourceFactoryTaskId: claimed.factoryTaskId,
+            sourceFactoryTaskExecutionKey: claimed.executionKey,
             assignedBy: from,
             returnTo: from,
             source: "worker_task_assign",
@@ -1180,11 +1217,27 @@ export default function (pi: ExtensionAPI) {
             deliveryMode,
             placement,
           });
+          if (claimed.factoryTaskId && claimed.executionKey) {
+            markFactoryTaskQueued(getWorkersDir(), claimed.factoryTaskId, {
+              executionKey: claimed.executionKey,
+              requestId: claimed.id,
+              jobId: job.id,
+              actor: `pi:${process.pid}`,
+            });
+          }
         } catch (error: any) {
-          failWorkerTaskRequest(getWorkersDir(), {
-            requestId: request.id,
-            error: error?.message || String(error),
-          });
+          const message = error?.message || String(error);
+          failWorkerTaskRequest(getWorkersDir(), { requestId: request.id, error: message });
+          if (request.factoryTaskId && request.executionKey) {
+            try {
+              settleFactoryTaskExecution(getWorkersDir(), request.factoryTaskId, {
+                executionKey: request.executionKey,
+                state: "failed",
+                error: message,
+                actor: `pi:${process.pid}`,
+              });
+            } catch {}
+          }
         }
       }
     } finally {
@@ -2455,6 +2508,8 @@ export default function (pi: ExtensionAPI) {
     kind = "command",
     sourceMessageId,
     sourceTaskRequestId,
+    sourceFactoryTaskId,
+    sourceFactoryTaskExecutionKey,
     assignedBy,
     returnTo,
     source,
@@ -2468,6 +2523,8 @@ export default function (pi: ExtensionAPI) {
     kind?: string;
     sourceMessageId?: string;
     sourceTaskRequestId?: string;
+    sourceFactoryTaskId?: string;
+    sourceFactoryTaskExecutionKey?: string;
     assignedBy?: string;
     returnTo?: string;
     source?: string;
@@ -2502,6 +2559,8 @@ export default function (pi: ExtensionAPI) {
       queuedBehind: busy ? (deliveryMode === "steer" ? runningJob?.id : openBefore[openBefore.length - 1]?.id) : undefined,
       sourceMessageId,
       sourceTaskRequestId,
+      sourceFactoryTaskId,
+      sourceFactoryTaskExecutionKey,
       assignedBy,
       returnTo,
       source,
@@ -2514,10 +2573,12 @@ export default function (pi: ExtensionAPI) {
     if (sourceMessageId) {
       appendJobEvent(job, { type: "message_wake", messageId: sourceMessageId, text: `wake from message ${sourceMessageId}` });
     }
-    if (sourceTaskRequestId || assignedBy) {
+    if (sourceTaskRequestId || sourceFactoryTaskId || assignedBy) {
       appendJobEvent(job, {
         type: "assigned_task",
         taskRequestId: sourceTaskRequestId,
+        factoryTaskId: sourceFactoryTaskId,
+        executionKey: sourceFactoryTaskExecutionKey,
         assignedBy,
         returnTo,
         text: `assigned by ${assignedBy || "unknown"}${sourceTaskRequestId ? ` via ${sourceTaskRequestId}` : ""}`,
@@ -2531,10 +2592,29 @@ export default function (pi: ExtensionAPI) {
     const handle = startWorkerJobQueued(
       { worker, task, project, cwd, signal: undefined as any, deliveryMode },
       job,
+      undefined,
+      () => {
+        if (!sourceFactoryTaskId || !sourceFactoryTaskExecutionKey) return;
+        try {
+          markFactoryTaskRunning(getWorkersDir(), sourceFactoryTaskId, {
+            executionKey: sourceFactoryTaskExecutionKey,
+            requestId: sourceTaskRequestId,
+            jobId: job.id,
+            actor: `pi:${process.pid}`,
+          });
+        } catch (error: any) {
+          appendJobEvent(job, {
+            type: "factory_task_link_failed",
+            factoryTaskId: sourceFactoryTaskId,
+            message: error?.message || String(error),
+          });
+        }
+      },
     );
     handle.promise
       .then((result) => {
         const success = spawnSucceeded(result);
+        const summary = (result.output || result.errorMessage || result.stderr || "").trim();
         recordProject(
           worker.id,
           project,
@@ -2542,8 +2622,25 @@ export default function (pi: ExtensionAPI) {
           success ? "success" : "failed",
           (result.output || result.errorMessage || result.stderr || "").slice(0, 500),
         );
+        if (sourceFactoryTaskId && sourceFactoryTaskExecutionKey) {
+          try {
+            settleFactoryTaskExecution(getWorkersDir(), sourceFactoryTaskId, {
+              executionKey: sourceFactoryTaskExecutionKey,
+              state: success ? "succeeded" : "failed",
+              jobId: job.id,
+              summary: summary.slice(0, 8000),
+              error: success ? "" : (result.errorMessage || result.stderr || "worker job failed"),
+              actor: `pi:${process.pid}`,
+            });
+          } catch (error: any) {
+            appendJobEvent(job, {
+              type: "factory_task_settle_failed",
+              factoryTaskId: sourceFactoryTaskId,
+              message: error?.message || String(error),
+            });
+          }
+        }
         if (sourceTaskRequestId && (returnTo || assignedBy)) {
-          const summary = (result.output || result.errorMessage || result.stderr || "").trim();
           const content = [
             success ? "✅ 派活任务已完成" : "❌ 派活任务执行失败",
             "",
@@ -2587,8 +2684,20 @@ export default function (pi: ExtensionAPI) {
           }
         }
       })
-      .catch(() => {
-        /* job failure is already persisted by startWorkerJob */
+      .catch((error: any) => {
+        if (sourceFactoryTaskId && sourceFactoryTaskExecutionKey) {
+          try {
+            settleFactoryTaskExecution(getWorkersDir(), sourceFactoryTaskId, {
+              executionKey: sourceFactoryTaskExecutionKey,
+              state: "failed",
+              jobId: job.id,
+              error: error?.message || String(error),
+              actor: `pi:${process.pid}`,
+            });
+          } catch {
+            /* job failure is already persisted by startWorkerJob */
+          }
+        }
       });
 
     const placement = !busy
@@ -3694,27 +3803,269 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ═══════════════════════════════════════════════════════
-  // factory_task_* — 授权式员工派活
+  // factory_task_* — 全局任务看板 + 授权式员工派活
   // ═══════════════════════════════════════════════════════
+  const factoryTaskActor = (value?: string) => String(value || "用户").trim() || "用户";
+  const assertFactoryTaskAssignment = (actor: string, assignee: string) => {
+    if (!assignee) return;
+    if (!hasPermission(getWorkersDir(), { subject: actor, action: "work:assign", target: assignee })) {
+      throw new Error(`${actor} 没有权限对 ${assignee} 执行 work:assign`);
+    }
+  };
+  const formatFactoryTaskBrief = (task: any) => [
+    `- id: \`${task.id}\``,
+    `- title: ${task.title}`,
+    `- status: ${task.status}`,
+    `- project: ${task.project || "—"}`,
+    `- assignee: ${task.assignee || "—"}`,
+    `- priority: ${task.priority}`,
+    `- execution: ${task.execution?.state || "idle"}`,
+    `- revision: ${task.revision}`,
+  ].join("\n");
+
+  pi.registerTool({
+    name: "factory_task_create",
+    label: "创建看板任务",
+    description: "在全工厂共享任务看板创建任务。status 是自由文本，无需预先注册；project 只是筛选字段。可只建卡、定时执行或立即执行。",
+    parameters: Type.Object({
+      title: Type.String({ description: "任务标题" }),
+      description: Type.Optional(Type.String({ description: "任务说明" })),
+      context: Type.Optional(Type.String({ description: "长期保存的背景、约束和交接上下文" })),
+      project: Type.Optional(Type.String({ description: "项目筛选键" })),
+      status: Type.Optional(Type.String({ description: "人类可见状态，自由文本，默认 TODO" })),
+      assignee: Type.Optional(Type.String({ description: "负责人；设置后需要 work:assign 权限" })),
+      priority: Type.Optional(FactoryTaskPrioritySchema),
+      labels: Type.Optional(Type.Array(Type.String({ description: "任务标签" }))),
+      triggerAt: Type.Optional(Type.String({ description: "一次性触发时间，ISO 8601；不使用 cron" })),
+      mode: Type.Optional(FactoryTaskModeSchema),
+      parentTaskId: Type.Optional(Type.String({ description: "可选父任务 ID" })),
+      actor: Type.Optional(Type.String({ description: "操作者，默认用户" })),
+      runNow: Type.Optional(Type.Boolean({ description: "是否创建后立即执行，默认 false" })),
+      cwd: Type.Optional(Type.String({ description: "执行工作目录" })),
+    }),
+    async execute(_tcid, params) {
+      try {
+        const actor = factoryTaskActor(params.actor);
+        if (params.assignee) assertFactoryTaskAssignment(actor, params.assignee);
+        let task = createFactoryTask(getWorkersDir(), { ...params, creator: actor });
+        let request: any = null;
+        if (params.runNow) {
+          const dispatched = dispatchFactoryTask(getWorkersDir(), task.id, {
+            actor,
+            from: actor,
+            cwd: params.cwd || process.cwd(),
+            force: true,
+          });
+          request = dispatched.request;
+          await drainWorkerTaskRequests(lastSessionCtx);
+          task = getFactoryTask(getWorkersDir(), task.id) || task;
+        }
+        return {
+          content: [{ type: "text", text: [`✅ 已创建全局看板任务`, "", formatFactoryTaskBrief(task), request ? `- request: \`${request.id}\`` : ""].filter(Boolean).join("\n") }],
+          details: { task, request },
+        };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `❌ 创建看板任务失败: ${e.message}` }], isError: true, details: {} };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "factory_task_list",
+    label: "查询任务看板",
+    description: "查询全工厂共享任务；默认包含所有项目、所有当前状态，但不含归档任务。",
+    parameters: Type.Object({
+      project: Type.Optional(Type.String({ description: "按项目筛选" })),
+      status: Type.Optional(Type.String({ description: "按自由状态筛选" })),
+      assignee: Type.Optional(Type.String({ description: "按负责人筛选" })),
+      priority: Type.Optional(FactoryTaskPrioritySchema),
+      executionState: Type.Optional(Type.String({ description: "按内部执行状态筛选" })),
+      query: Type.Optional(Type.String({ description: "搜索标题、正文、上下文、标签" })),
+      includeArchived: Type.Optional(Type.Boolean({ description: "是否包含归档任务，默认 false" })),
+      limit: Type.Optional(Type.Number({ description: "最多返回数量，默认 100" })),
+    }),
+    async execute(_tcid, params) {
+      try {
+        const tasks = listFactoryTasks(getWorkersDir(), { ...params, limit: params.limit || 100 }).reverse();
+        const text = tasks.length
+          ? ["## 全局任务看板", "", ...tasks.map((task: any) => `- \`${task.id}\` · **${task.status}** · ${task.title} · ${task.project || "无项目"} · ${task.assignee || "未指派"} · ${task.execution?.state || "idle"}`)].join("\n")
+          : "暂无匹配的看板任务。";
+        return { content: [{ type: "text", text }], details: { tasks } };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `❌ 查询看板任务失败: ${e.message}` }], isError: true, details: {} };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "factory_task_get",
+    label: "查看看板任务",
+    description: "查看看板任务详情、子任务、执行证据和完整事件时间线。",
+    parameters: Type.Object({ taskId: Type.String({ description: "任务 ID" }) }),
+    async execute(_tcid, params) {
+      const task = getFactoryTask(getWorkersDir(), params.taskId, { includeEvents: true });
+      if (!task) return { content: [{ type: "text", text: `❌ 未找到看板任务 ${params.taskId}` }], isError: true, details: {} };
+      const body = [
+        `## ${task.title}`,
+        "",
+        formatFactoryTaskBrief(task),
+        task.description ? `\n### 说明\n${task.description}` : "",
+        task.context ? `\n### 上下文\n${task.context}` : "",
+        task.childTaskIds?.length ? `\n### 子任务\n${task.childTaskIds.map((id: string) => `- \`${id}\``).join("\n")}` : "",
+        `\n### 事件\n${(task.events || []).map((event: any) => `- ${event.at} · ${event.type} · ${event.actor || "—"}`).join("\n")}`,
+      ].filter(Boolean).join("\n");
+      return { content: [{ type: "text", text: body }], details: { task } };
+    },
+  });
+
+  pi.registerTool({
+    name: "factory_task_update",
+    label: "更新看板任务",
+    description: "更新任务的人类状态、上下文、项目、负责人等。写入任意新 status 即创建新的看板列；不会因为改状态而隐式执行。",
+    parameters: Type.Object({
+      taskId: Type.String({ description: "任务 ID" }),
+      title: Type.Optional(Type.String()),
+      description: Type.Optional(Type.String()),
+      context: Type.Optional(Type.String()),
+      project: Type.Optional(Type.String()),
+      status: Type.Optional(Type.String({ description: "自由的人类可见状态" })),
+      assignee: Type.Optional(Type.String()),
+      priority: Type.Optional(FactoryTaskPrioritySchema),
+      labels: Type.Optional(Type.Array(Type.String())),
+      triggerAt: Type.Optional(Type.String({ description: "ISO 8601；传空字符串可取消计划" })),
+      mode: Type.Optional(FactoryTaskModeSchema),
+      parentTaskId: Type.Optional(Type.String()),
+      actor: Type.Optional(Type.String({ description: "操作者，默认用户" })),
+      expectedRevision: Type.Optional(Type.Number({ description: "乐观并发 revision" })),
+    }),
+    async execute(_tcid, params) {
+      try {
+        const actor = factoryTaskActor(params.actor);
+        const current = getFactoryTask(getWorkersDir(), params.taskId);
+        if (!current) throw new Error(`未找到看板任务 ${params.taskId}`);
+        const nextAssignee = params.assignee !== undefined ? params.assignee : current.assignee;
+        if (params.assignee !== undefined || params.triggerAt !== undefined) assertFactoryTaskAssignment(actor, nextAssignee);
+        const task = updateFactoryTask(getWorkersDir(), params.taskId, { ...params, updatedBy: actor });
+        return { content: [{ type: "text", text: [`✅ 已更新看板任务`, "", formatFactoryTaskBrief(task)].join("\n") }], details: { task } };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `❌ 更新看板任务失败: ${e.message}` }], isError: true, details: {} };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "factory_task_split",
+    label: "拆分看板任务",
+    description: "把一个任务拆成多个可独立指派和流转的子任务。",
+    parameters: Type.Object({
+      taskId: Type.String({ description: "父任务 ID" }),
+      actor: Type.Optional(Type.String({ description: "操作者，默认用户" })),
+      expectedRevision: Type.Optional(Type.Number()),
+      children: Type.Array(Type.Object({
+        title: Type.String(),
+        description: Type.Optional(Type.String()),
+        context: Type.Optional(Type.String()),
+        project: Type.Optional(Type.String()),
+        status: Type.Optional(Type.String()),
+        assignee: Type.Optional(Type.String()),
+        priority: Type.Optional(FactoryTaskPrioritySchema),
+        labels: Type.Optional(Type.Array(Type.String())),
+        triggerAt: Type.Optional(Type.String()),
+        mode: Type.Optional(FactoryTaskModeSchema),
+      })),
+    }),
+    async execute(_tcid, params) {
+      try {
+        const actor = factoryTaskActor(params.actor);
+        for (const child of params.children) if (child.assignee) assertFactoryTaskAssignment(actor, child.assignee);
+        const children = splitFactoryTask(getWorkersDir(), params.taskId, { ...params, actor });
+        return {
+          content: [{ type: "text", text: [`✅ 已拆分 ${children.length} 个子任务`, "", ...children.map((task: any) => `- \`${task.id}\` · ${task.status} · ${task.title} · ${task.assignee || "未指派"}`)].join("\n") }],
+          details: { children },
+        };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `❌ 拆分任务失败: ${e.message}` }], isError: true, details: {} };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "factory_task_archive",
+    label: "归档看板任务",
+    description: "归档或恢复看板任务。完成和归档是独立概念。",
+    parameters: Type.Object({
+      taskId: Type.String(),
+      action: Type.Optional(StringEnum(["archive", "restore"] as const, { default: "archive" })),
+      actor: Type.Optional(Type.String()),
+      expectedRevision: Type.Optional(Type.Number()),
+    }),
+    async execute(_tcid, params) {
+      try {
+        const options = { actor: factoryTaskActor(params.actor), expectedRevision: params.expectedRevision };
+        const task = params.action === "restore"
+          ? restoreFactoryTask(getWorkersDir(), params.taskId, options)
+          : archiveFactoryTask(getWorkersDir(), params.taskId, options);
+        return { content: [{ type: "text", text: `${params.action === "restore" ? "✅ 已恢复" : "📦 已归档"} ${task.title} (\`${task.id}\`)` }], details: { task } };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `❌ 归档操作失败: ${e.message}` }], isError: true, details: {} };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "factory_task_run",
+    label: "执行看板任务",
+    description: "立即执行一个已经有负责人的看板任务；通过 worker-task request 和正常 Pi 员工 job 链路运行。",
+    parameters: Type.Object({
+      taskId: Type.String(),
+      actor: Type.Optional(Type.String({ description: "派活来源，默认用户" })),
+      mode: Type.Optional(FactoryTaskModeSchema),
+      cwd: Type.Optional(Type.String()),
+      expectedRevision: Type.Optional(Type.Number()),
+    }),
+    async execute(_tcid, params) {
+      try {
+        const actor = factoryTaskActor(params.actor);
+        const task = getFactoryTask(getWorkersDir(), params.taskId);
+        if (!task) throw new Error(`未找到看板任务 ${params.taskId}`);
+        assertFactoryTaskAssignment(actor, task.assignee);
+        const dispatched = dispatchFactoryTask(getWorkersDir(), task.id, {
+          actor,
+          from: actor,
+          cwd: params.cwd || process.cwd(),
+          mode: params.mode || task.mode,
+          expectedRevision: params.expectedRevision,
+          force: true,
+        });
+        await drainWorkerTaskRequests(lastSessionCtx);
+        const current = getFactoryTask(getWorkersDir(), task.id) || dispatched.task;
+        const request = getWorkerTaskRequest(getWorkersDir(), dispatched.request.id) || dispatched.request;
+        return { content: [{ type: "text", text: [`▶ 已请求执行看板任务`, "", formatFactoryTaskBrief(current), `- request: \`${request.id}\``, request.jobId ? `- job: \`${request.jobId}\`` : ""].filter(Boolean).join("\n") }], details: { task: current, request } };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `❌ 执行看板任务失败: ${e.message}` }], isError: true, details: {} };
+      }
+    },
+  });
+
   pi.registerTool({
     name: "factory_task_assign",
-    label: "员工派活",
+    label: "创建并指派任务",
     description: [
-      "让一个来源（用户/员工/秘书）授权式派具体任务给另一个员工。",
-      "和发送消息不同：派活会写入 worker task request intent，由 Pi 主进程检查 work:assign 权限后创建员工 job。",
-      "目标员工忙碌时按 mode 排队或 steer；job 完成后系统会自动把结果消息回给派活来源。",
+      "兼容原有员工派活，同时把任务写入全局看板。",
+      "没有 triggerAt 时立即通过 worker-task request 执行；有未来 triggerAt 时由 Web 调度器到期后执行。",
+      "目标员工忙碌时继续沿用 queue/steer/now 语义，执行结果会链接回看板任务。",
     ].join(" "),
     parameters: Type.Object({
       from: Type.Optional(Type.String({ description: "派活来源，默认用户；普通员工需要对目标有 work:assign 权限" })),
       to: Type.String({ description: "目标员工姓名" }),
       task: Type.String({ description: "要目标员工执行的具体任务" }),
+      title: Type.Optional(Type.String({ description: "看板标题；默认取 task 第一行" })),
       project: Type.Optional(Type.String({ description: "项目名称，默认 factory-task" })),
-      mode: Type.Optional(
-        StringEnum(["auto", "queue", "steer", "now"] as const, {
-          description: "auto=空闲立即/忙则排队；queue=明确排队；steer=优先插队/可用时注入 Codex active turn；now=仅空闲才执行",
-          default: "auto",
-        }),
-      ),
+      status: Type.Optional(Type.String({ description: "人类可见状态，默认 TODO" })),
+      priority: Type.Optional(FactoryTaskPrioritySchema),
+      labels: Type.Optional(Type.Array(Type.String())),
+      triggerAt: Type.Optional(Type.String({ description: "未来的一次性触发时间，ISO 8601" })),
+      mode: Type.Optional(FactoryTaskModeSchema),
       cwd: Type.Optional(Type.String({ description: "工作目录，默认当前目录" })),
     }),
     async execute(_tcid, params) {
@@ -3724,35 +4075,48 @@ export default function (pi: ExtensionAPI) {
         if (!hasPermission(getWorkersDir(), { subject: from, action: "work:assign", target: to })) {
           return { content: [{ type: "text", text: `❌ ${from} 没有权限对 ${to} 执行 work:assign` }], isError: true, details: {} };
         }
-        const request = createWorkerTaskRequest(getWorkersDir(), {
-          from,
-          to,
-          task: params.task,
+        let boardTask = createFactoryTask(getWorkersDir(), {
+          title: String(params.title || params.task).trim().split("\n")[0].slice(0, 240),
+          description: params.task,
           project: params.project || "factory-task",
-          cwd: params.cwd || process.cwd(),
+          status: params.status || "TODO",
+          assignee: to,
+          priority: params.priority,
+          labels: params.labels,
+          triggerAt: params.triggerAt,
           mode: params.mode || "auto",
-          source: "factory-tool",
+          creator: from,
         });
-        await drainWorkerTaskRequests(lastSessionCtx);
-        const current = getWorkerTaskRequest(getWorkersDir(), request.id) || request;
+        const scheduledForFuture = boardTask.triggerAt && Date.parse(boardTask.triggerAt) > Date.now();
+        let request: any = null;
+        if (!scheduledForFuture) {
+          const dispatched = dispatchFactoryTask(getWorkersDir(), boardTask.id, {
+            actor: from,
+            from,
+            cwd: params.cwd || process.cwd(),
+            mode: params.mode || "auto",
+            force: !boardTask.triggerAt,
+          });
+          request = dispatched.request;
+          await drainWorkerTaskRequests(lastSessionCtx);
+          request = getWorkerTaskRequest(getWorkersDir(), request.id) || request;
+          boardTask = getFactoryTask(getWorkersDir(), boardTask.id) || boardTask;
+        }
         const lines = [
-          `🧩 已提交员工派活请求。`,
+          scheduledForFuture ? `🗓️ 已创建定时看板任务。` : `🧩 已创建并提交看板派活任务。`,
           ``,
-          `- request: \`${current.id}\``,
-          `- status: ${current.status}`,
-          `- from: ${current.from}`,
-          `- to: ${current.to}`,
-          `- mode: ${current.deliveryMode || current.mode}`,
-          current.jobId ? `- job: \`${current.jobId}\`` : null,
-          current.placement ? `- placement: ${current.placement}` : null,
-          current.error ? `- error: ${current.error}` : null,
+          formatFactoryTaskBrief(boardTask),
+          request ? `- request: \`${request.id}\`` : null,
+          request?.jobId ? `- job: \`${request.jobId}\`` : null,
+          request?.placement ? `- placement: ${request.placement}` : null,
+          request?.error ? `- error: ${request.error}` : null,
           ``,
-          `派活完成后，系统会自动把 job 结果作为 task_result 消息回给 ${current.from}。`,
+          scheduledForFuture ? `到期后 Web 调度器会沿正常 Pi 员工链路执行。` : `执行结果会自动回传给 ${from} 并记录在看板任务证据中。`,
         ].filter(Boolean);
         return {
           content: [{ type: "text", text: lines.join("\n") }],
-          isError: current.status === "failed" ? true : undefined,
-          details: { request: current },
+          isError: request?.status === "failed" ? true : undefined,
+          details: { task: boardTask, request },
         };
       } catch (e: any) {
         return { content: [{ type: "text", text: `❌ 派活失败: ${e.message}` }], isError: true, details: {} };

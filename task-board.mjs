@@ -571,6 +571,36 @@ export function linkFactoryTaskRequest(workersDir, taskId, options = {}) {
   }
 }
 
+export function markFactoryTaskQueued(workersDir, taskId, options = {}) {
+  const id = clean(taskId);
+  const fd = acquireTaskLock(workersDir, id);
+  try {
+    const task = requireTask(workersDir, id);
+    assertExecutionKey(task, options.executionKey);
+    const requestId = clean(options.requestId) || task.execution?.taskRequestId;
+    const jobId = clean(options.jobId);
+    if (!requestId) throw new Error("requestId 不能为空");
+    if (!jobId) throw new Error("jobId 不能为空");
+    if (["running", "succeeded", "failed", "cancelled"].includes(task.execution?.state)
+      && task.execution?.jobId === jobId) return task;
+    if (task.execution?.state === "queued" && task.execution?.jobId === jobId) return task;
+    return appendTaskEvent(workersDir, task, "task:request-linked", {
+      actor: options.actor,
+      at: options.now,
+      execution: {
+        state: "queued",
+        executionKey: task.execution.executionKey,
+        leaseUntil: null,
+        taskRequestId: requestId,
+        jobId,
+      },
+      data: { jobLinked: true },
+    });
+  } finally {
+    releaseTaskLock(workersDir, id, fd);
+  }
+}
+
 export function markFactoryTaskRunning(workersDir, taskId, options = {}) {
   const id = clean(taskId);
   const fd = acquireTaskLock(workersDir, id);
