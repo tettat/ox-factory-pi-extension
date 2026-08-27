@@ -65,8 +65,11 @@ function lockFile(workersDir, requestId) {
   return join(workersDir, ".locks", "worker-tasks", `${lockName(requestId)}.lock`);
 }
 
-function tryAcquireRequestLock(workersDir, requestId) {
-  const file = lockFile(workersDir, requestId);
+function executionLockFile(workersDir, executionKey) {
+  return join(workersDir, ".locks", "worker-task-executions", `${lockName(executionKey)}.lock`);
+}
+
+function tryAcquireFileLock(file) {
   mkdirSync(dirname(file), { recursive: true });
   try {
     return openSync(file, "wx");
@@ -84,6 +87,11 @@ function tryAcquireRequestLock(workersDir, requestId) {
     }
     return null;
   }
+}
+
+function tryAcquireRequestLock(workersDir, requestId) {
+  const file = lockFile(workersDir, requestId);
+  return tryAcquireFileLock(file);
 }
 
 function releaseRequestLock(workersDir, requestId, fd) {
@@ -106,26 +114,52 @@ export function createWorkerTaskRequest(workersDir, input) {
   const project = String(input?.project || "factory-task").trim() || "factory-task";
   const cwd = input?.cwd == null ? "" : String(input.cwd).trim();
   const mode = normalizeWorkerTaskMode(input?.mode || input?.deliveryMode || "auto");
+  const factoryTaskId = String(input?.factoryTaskId || "").trim();
+  const executionKey = String(input?.executionKey || "").trim();
   if (!from) throw new Error("from 不能为空");
   if (!to) throw new Error("to 不能为空");
   if (to === "*") throw new Error("派活暂不支持广播目标 *");
   if (!task) throw new Error("task 不能为空");
-  const request = {
-    type: "request",
-    protocolVersion: 1,
-    id: randomId(),
-    source,
-    from,
-    to,
-    task,
-    project,
-    cwd,
-    mode,
-    permissionAction: "work:assign",
-    createdAt: nowIso(),
+  const create = () => {
+    if (executionKey) {
+      const existing = findWorkerTaskRequestByExecutionKey(workersDir, executionKey);
+      if (existing) return existing;
+    }
+    const request = {
+      type: "request",
+      protocolVersion: 1,
+      id: randomId(),
+      source,
+      from,
+      to,
+      task,
+      project,
+      cwd,
+      mode,
+      permissionAction: "work:assign",
+      ...(factoryTaskId ? { factoryTaskId } : {}),
+      ...(executionKey ? { executionKey } : {}),
+      createdAt: nowIso(),
+    };
+    appendJsonl(workerTaskRequestsFile(workersDir), request);
+    return { ...request, status: "pending" };
   };
-  appendJsonl(workerTaskRequestsFile(workersDir), request);
-  return { ...request, status: "pending" };
+  if (!executionKey) return create();
+
+  const file = executionLockFile(workersDir, executionKey);
+  const fd = tryAcquireFileLock(file);
+  if (fd == null) {
+    const existing = findWorkerTaskRequestByExecutionKey(workersDir, executionKey);
+    if (existing) return existing;
+    throw new Error(`execution ${executionKey} 正在创建派活请求，请稍后重试`);
+  }
+  try {
+    return create();
+  } finally {
+    try { closeSync(fd); } finally {
+      try { unlinkSync(file); } catch {}
+    }
+  }
 }
 
 export function listWorkerTaskRequests(workersDir, { from, to, worker, limit = 200 } = {}) {
@@ -228,6 +262,13 @@ export function getWorkerTaskRequest(workersDir, requestId) {
   const id = String(requestId || "").trim();
   if (!id) return null;
   return listWorkerTaskRequests(workersDir, { limit: 10000 }).find((request) => request.id === id) || null;
+}
+
+export function findWorkerTaskRequestByExecutionKey(workersDir, executionKey) {
+  const key = String(executionKey || "").trim();
+  if (!key) return null;
+  return listWorkerTaskRequests(workersDir, { limit: 10000 })
+    .find((request) => request.executionKey === key) || null;
 }
 
 export function claimWorkerTaskRequest(workersDir, { requestId, claimedBy = "pi" } = {}) {
