@@ -105,3 +105,31 @@ test("vendored KaTeX emits HTML and MathML through the math bridge", () => {
   assert.match(html, /class="katex-html"/);
   assert.match(html, /md__math--inline/);
 });
+
+test("math support does not interpret common currency ranges as formulas", () => {
+  const first = prepare("Costs are $5 and $10 today.");
+  const second = prepare("Budget range: $5-$10.");
+
+  assert.equal(first.calls.length, 0);
+  assert.equal(second.calls.length, 0);
+  assert.equal(first.html, "Costs are $5 and $10 today.");
+  assert.equal(second.html, "Budget range: $5-$10.");
+});
+
+test("math support keeps an unfinished streamed formula as text until it closes", () => {
+  const unfinished = prepare("streaming $a_i");
+  const finished = prepare("streaming $a_i$");
+
+  assert.equal(unfinished.calls.length, 0);
+  assert.equal(unfinished.html, "streaming $a_i");
+  assert.equal(finished.calls.length, 1);
+  assert.match(finished.html, /data-tex="a_i"/);
+});
+
+test("math support ignores escaped dollar delimiters", () => {
+  const result = prepare("Literal \\$5 and formula $x$.");
+
+  assert.deepEqual(result.calls.map((call) => call.tex), ["x"]);
+  assert.match(result.html, /\\\$5/);
+  assert.match(result.html, /data-tex="x"/);
+});

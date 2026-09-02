@@ -35,7 +35,11 @@
     for (let i = start; i <= text.length - close.length; i++) {
       if (!allowNewline && text[i] === "\n") return -1;
       if (!text.startsWith(close, i) || isEscaped(text, i)) continue;
-      if (close === "$" && (text[i - 1] === "$" || text[i + 1] === "$")) continue;
+      if (close === "$") {
+        if (text[i - 1] === "$" || text[i + 1] === "$") continue;
+        if (/\s/.test(text[i - 1] || "")) continue;
+        if (/\d/.test(text[i + 1] || "")) continue;
+      }
       return i;
     }
     return -1;
@@ -131,7 +135,12 @@
       } else if (source.startsWith("\\(", i) && !isEscaped(source, i)) {
         open = "\\(";
         close = "\\)";
-      } else if (source[i] === "$" && source[i + 1] !== "$" && !isEscaped(source, i)) {
+      } else if (
+        source[i] === "$"
+        && source[i + 1] !== "$"
+        && !/\s/.test(source[i + 1] || "")
+        && !isEscaped(source, i)
+      ) {
         open = "$";
         close = "$";
       }
