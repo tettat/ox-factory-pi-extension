@@ -116,20 +116,48 @@ test("math support does not interpret common currency ranges as formulas", () =>
   assert.equal(second.html, "Budget range: $5-$10.");
 });
 
-test("math support keeps an unfinished streamed formula as text until it closes", () => {
-  const unfinished = prepare("streaming $a_i");
-  const finished = prepare("streaming $a_i$");
+test("math support keeps unfinished streamed formulas as text until they close", () => {
+  const cases = [
+    ["streaming $a_i", "streaming $a_i$"],
+    ["streaming $$\na_i\n", "streaming $$\na_i\n$$"],
+    ["streaming \\(a_i", "streaming \\(a_i\\)"],
+  ];
 
-  assert.equal(unfinished.calls.length, 0);
-  assert.equal(unfinished.html, "streaming $a_i");
-  assert.equal(finished.calls.length, 1);
-  assert.match(finished.html, /data-tex="a_i"/);
+  for (const [unfinishedSource, finishedSource] of cases) {
+    const unfinished = prepare(unfinishedSource);
+    const finished = prepare(finishedSource);
+    assert.equal(unfinished.calls.length, 0);
+    assert.equal(unfinished.html, unfinishedSource);
+    assert.equal(finished.calls.length, 1);
+    assert.equal(finished.calls[0].tex, "a_i");
+  }
 });
 
-test("math support ignores escaped dollar delimiters", () => {
-  const result = prepare("Literal \\$5 and formula $x$.");
+test("math support ignores escaped delimiters", () => {
+  const dollar = prepare("Literal \\$5 and formula $x$.");
+  const parenthesisSource = "\\\\(literal\\\\)";
+  const parenthesis = prepare(parenthesisSource);
 
-  assert.deepEqual(result.calls.map((call) => call.tex), ["x"]);
-  assert.match(result.html, /\\\$5/);
-  assert.match(result.html, /data-tex="x"/);
+  assert.deepEqual(dollar.calls.map((call) => call.tex), ["x"]);
+  assert.match(dollar.html, /\\\$5/);
+  assert.match(dollar.html, /data-tex="x"/);
+  assert.equal(parenthesis.calls.length, 0);
+  assert.equal(parenthesis.html, parenthesisSource);
+});
+
+test("vendored KaTeX trust boundary does not emit attacker-controlled links", () => {
+  const context = { console };
+  context.globalThis = context;
+  context.window = context;
+  context.self = context;
+  const katexSource = readFileSync(new URL("../web/vendor/katex/katex.min.js", import.meta.url), "utf8");
+  vm.runInNewContext(katexSource, context, { filename: "web/vendor/katex/katex.min.js" });
+  vm.runInNewContext(mathSource, context, { filename: "web/math-support.js" });
+
+  const source = "$\\href{javascript:alert(1)}{x}$";
+  const prepared = context.OxMath.prepare(source, context.katex);
+  const html = prepared.restore(prepared.text);
+
+  assert.doesNotMatch(html, /<a(?:\s|>)/i);
+  assert.doesNotMatch(html, /<img(?:\s|>)/i);
 });
