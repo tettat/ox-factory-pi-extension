@@ -37,10 +37,22 @@ node .pi/extensions/ox-factory/web-server.mjs \
 └── web/
     ├── index.html           # 单页骨架（顶部状态条 + 左侧导航 + 主区 + 抽屉 + Toast）
     ├── app.js               # 原生 JS：hash 路由 + fetch 包装 + 页面渲染
+    ├── math-support.js      # 公式分隔符扫描 + KaTeX 安全渲染桥
+    ├── vendor/katex/        # 本地 KaTeX 0.18.5、MIT 许可证与 WOFF2 字体
     └── styles.css           # 全部 CSS 变量 + 视觉规范 + 组件样式
 ```
 
-无 npm 依赖，不生成 lockfile；纯 Node 内置模块 + 复用现有 ox-factory 模块。
+无运行时 npm 安装依赖，不生成 lockfile；KaTeX 浏览器产物随插件本地提供，服务端仍只使用 Node 内置模块和现有 ox-factory 模块。
+
+## 消息中的数学公式
+
+详细消息正文支持本地 KaTeX 排版：
+
+- 行内公式：单美元分隔符，或反斜杠圆括号分隔符
+- 块级公式：双美元分隔符，或反斜杠方括号分隔符
+- 行内代码和代码围栏中的公式分隔符不会被渲染
+- KaTeX 不可用时自动退化为原始文本；单个错误公式不会阻断整条消息
+- KaTeX 使用 trust: false，资源全部从当前 Web 服务加载，不访问第三方 CDN
 
 ## 页面
 

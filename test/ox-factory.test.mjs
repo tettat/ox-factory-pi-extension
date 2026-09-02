@@ -4591,3 +4591,26 @@ test("job notifications only include configured non-steer terminal jobs", () => 
   assert.deepEqual(notifications.map((n) => n.id), ["job:job-1:done"]);
   assert.equal(notifications[0].message, "派派 任务完成");
 });
+
+test("web markdown loads local KaTeX assets before the dashboard app", () => {
+  const indexSource = readFileSync(join(testDir, "../web/index.html"), "utf8");
+  const serverSource = readFileSync(join(testDir, "../web-server.mjs"), "utf8");
+  const packageSource = readFileSync(join(testDir, "../package.json"), "utf8");
+  const katexCss = 'href="vendor/katex/katex.min.css"';
+  const katexScript = 'src="vendor/katex/katex.min.js"';
+  const mathScript = 'src="math-support.js"';
+  const appScript = 'src="app.js"';
+
+  assert.match(indexSource, /href="vendor\/katex\/katex\.min\.css"/);
+  assert.match(indexSource, /src="vendor\/katex\/katex\.min\.js"/);
+  assert.match(indexSource, /src="math-support\.js"/);
+  assert.ok(indexSource.indexOf(katexCss) < indexSource.indexOf(katexScript));
+  assert.ok(indexSource.indexOf(katexScript) < indexSource.indexOf(mathScript));
+  assert.ok(indexSource.indexOf(mathScript) < indexSource.indexOf(appScript));
+  assert.equal(existsSync(join(testDir, "../web/vendor/katex/katex.min.css")), true);
+  assert.equal(existsSync(join(testDir, "../web/vendor/katex/katex.min.js")), true);
+  assert.equal(existsSync(join(testDir, "../web/vendor/katex/LICENSE")), true);
+  assert.equal(existsSync(join(testDir, "../web/vendor/katex/fonts/KaTeX_Main-Regular.woff2")), true);
+  assert.match(serverSource, /"\.woff2":\s*"font\/woff2"/);
+  assert.match(packageSource, /node --check web\/math-support\.js/);
+});

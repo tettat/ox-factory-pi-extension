@@ -1,5 +1,5 @@
 // 牛马工厂本地 Web 协作驾驶舱
-// 纯原生 JS，无依赖；不引第三方库。
+// 纯原生 JS；数学公式由同源内置 KaTeX 渲染。
 // ---------------------------------------------------------------------------
 
 (() => {
@@ -208,7 +208,11 @@
   function md(text, options = {}) {
     if (text == null) return "";
     const compact = Boolean(options.compact);
-    const lines = String(text).replace(/\r\n?/g, "\n").split("\n");
+    const source = String(text).replace(/\r\n?/g, "\n");
+    const math = !compact && typeof globalThis.OxMath?.prepare === "function"
+      ? globalThis.OxMath.prepare(source, globalThis.katex)
+      : { text: source, restore: (html) => html };
+    const lines = math.text.split("\n");
     const out = [];
     let i = 0;
 
@@ -353,7 +357,7 @@
       out.push(`<p class="md__p">${inline(para.join(" "))}</p>`);
     }
 
-    const html = out.join("\n");
+    const html = math.restore(out.join("\n"));
     if (compact) {
       // 预览模式：去掉块级标签，保留 inline；超过 3 段用省略号
       const flat = html
