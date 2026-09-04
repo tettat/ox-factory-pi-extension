@@ -1,6 +1,10 @@
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { TALK_IMAGE_MAX_COUNT } from "./talk-attachments.mjs";
+import {
+  TALK_IMAGE_MAX_COUNT,
+  filterTalkAttachmentMentionsInText,
+  normalizeTalkAttachmentMentions,
+} from "./talk-attachments.mjs";
 
 function nowIso() {
   return new Date().toISOString();
@@ -116,6 +120,7 @@ export function createWebTalkRequest(workersDir, input) {
   const worker = String(input?.worker || "").trim();
   const message = String(input?.message || "").trim();
   const attachments = normalizeAttachments(input?.attachments);
+  const attachmentMentions = normalizeTalkAttachmentMentions(message, attachments, input?.attachmentMentions);
   const from = String(input?.from || "web").trim() || "web";
   const mode = normalizeWebTalkMode(input?.mode || input?.deliveryMode || "auto");
   if (!worker) throw new Error("worker 不能为空");
@@ -129,6 +134,7 @@ export function createWebTalkRequest(workersDir, input) {
     worker,
     message,
     attachments,
+    attachmentMentions,
     mode,
     createdAt: nowIso(),
   };
@@ -180,6 +186,7 @@ export function listWebTalkRequests(workersDir, { worker, limit = 200 } = {}) {
     } else if (event.type === "edited") {
       Object.assign(state, {
         message: Object.prototype.hasOwnProperty.call(event, "message") ? event.message : state.message,
+        attachmentMentions: Object.prototype.hasOwnProperty.call(event, "attachmentMentions") ? event.attachmentMentions : state.attachmentMentions,
         mode: event.mode || state.mode || "auto",
         editedAt: event.editedAt,
         editedBy: event.from || null,
@@ -279,11 +286,17 @@ export function editWebTalkRequest(workersDir, { requestId, message, mode, from 
   if (!nextMessage && (!request.attachments || request.attachments.length === 0)) {
     throw new Error("message 或 attachments 至少需要一个");
   }
+  const nextAttachmentMentions = normalizeTalkAttachmentMentions(
+    nextMessage,
+    request.attachments || [],
+    filterTalkAttachmentMentionsInText(nextMessage, request.attachmentMentions),
+  );
   const event = {
     type: "edited",
     requestId: request.id,
     from: String(from || "web").trim() || "web",
     message: nextMessage,
+    attachmentMentions: nextAttachmentMentions,
     mode: nextMode,
     editedAt: nowIso(),
   };

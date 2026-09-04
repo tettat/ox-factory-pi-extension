@@ -176,7 +176,6 @@ import {
   buildRouter,
   buildWorkersView,
   buildProjectStrips,
-  buildRouter,
   computeReliableFinishedAt,
   computeReliableElapsedMs,
   serializeOutsourceRun,
@@ -2509,7 +2508,8 @@ test("web talk requests are event-sourced and do not create jobs in web-server",
     assert.match(indexSource, /claimWebTalkRequest/);
     assert.match(indexSource, /const requestedMode = request\.mode === "queue" \|\| request\.mode === "steer" \? request\.mode : undefined/);
     assert.match(indexSource, /startTalkMessage\(w!, message, ctx, requestedMode, \{[\s\S]{0,160}attach: false,[\s\S]{0,160}notify: false,[\s\S]{0,160}attachments/);
-    assert.match(indexSource, /options:\s*\{ attach\?: boolean; notify\?: boolean; attachments\?: SpawnOptions\["attachments"\] \}/);
+    assert.match(indexSource, /attachments\?: SpawnOptions\["attachments"\]/);
+    assert.match(indexSource, /attachmentMentions\?: SpawnOptions\["attachmentMentions"\]/);
     assert.match(indexSource, /const notifyConsole = options\.notify !== false/);
     assert.match(indexSource, /if \(notifyConsole\) ctx\?\.ui\?\.notify/);
   } finally {
@@ -2630,6 +2630,16 @@ test("web talk supports image-only requests and preserves attachment metadata", 
     assert.equal(edited.message, "补充说明");
     assert.deepEqual(edited.attachments, [attachment]);
 
+    const mentioned = createWebTalkRequest(workersDir, {
+      worker: "DesignerB",
+      message: "请检查 @图片1 的按钮",
+      attachments: [attachment],
+      attachmentMentions: [{ attachmentId: attachment.id, token: "@图片1" }],
+    });
+    assert.deepEqual(mentioned.attachmentMentions, [
+      { attachmentId: attachment.id, token: "@图片1" },
+    ]);
+
     assert.throws(() => createWebTalkRequest(workersDir, {
       worker: "DesignerA",
       message: "",
@@ -2640,7 +2650,7 @@ test("web talk supports image-only requests and preserves attachment metadata", 
   }
 });
 
-test("web talk attachment API uploads, previews, and submits an image-only request", async () => {
+test("web talk attachment API uploads, previews, and submits an inline image mention", async () => {
   const workersDir = mkdtempSync(join(tmpdir(), "ox-web-talk-image-api-test-"));
   mkdirSync(join(workersDir, "sessions"), { recursive: true });
   writeFileSync(join(workersDir, "sessions", "DesignerA.jsonl"), "", "utf8");
@@ -2674,14 +2684,23 @@ test("web talk attachment API uploads, previews, and submits an image-only reque
     const talkResponse = await fetch(`${baseUrl}/api/talk/${encodeURIComponent("DesignerA")}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ message: "", attachmentIds: [upload.attachment.id], mode: "auto" }),
+      body: JSON.stringify({
+        message: "检查 @图片1 的按钮",
+        attachmentIds: [upload.attachment.id],
+        attachmentMentions: [{ attachmentId: upload.attachment.id, token: "@图片1" }],
+        mode: "auto",
+      }),
     });
     assert.equal(talkResponse.status, 202);
     const talk = await talkResponse.json();
-    assert.equal(talk.request.message, "");
+    assert.equal(talk.request.message, "检查 @图片1 的按钮");
     assert.equal(talk.request.attachments[0].id, upload.attachment.id);
+    assert.deepEqual(talk.request.attachmentMentions, [
+      { attachmentId: upload.attachment.id, token: "@图片1" },
+    ]);
     const persisted = getWebTalkRequest(workersDir, talk.request.id);
     assert.equal(persisted.attachments[0].id, upload.attachment.id);
+    assert.deepEqual(persisted.attachmentMentions, talk.request.attachmentMentions);
 
     const duplicateResponse = await fetch(`${baseUrl}/api/talk/${encodeURIComponent("DesignerA")}`, {
       method: "POST",
@@ -2696,20 +2715,24 @@ test("web talk attachment API uploads, previews, and submits an image-only reque
     assert.equal(workerDetailResponse.status, 200);
     const workerDetail = await workerDetailResponse.json();
     assert.equal(workerDetail.talkRequests[0].attachments[0].contentUrl, upload.attachment.contentUrl);
+    assert.deepEqual(workerDetail.talkRequests[0].attachmentMentions, talk.request.attachmentMentions);
 
     const job = createJob(workersDir, {
       worker: "DesignerA",
       kind: "talk",
       project: "talk",
-      task: "看图",
+      task: persisted.message,
       attachments: persisted.attachments,
+      attachmentMentions: persisted.attachmentMentions,
     });
     const jobsResponse = await fetch(`${baseUrl}/api/jobs?worker=${encodeURIComponent("DesignerA")}`);
     const jobs = await jobsResponse.json();
     assert.equal(jobs.jobs[0].attachments[0].id, upload.attachment.id);
+    assert.deepEqual(jobs.jobs[0].attachmentMentions, talk.request.attachmentMentions);
     const jobDetailResponse = await fetch(`${baseUrl}/api/jobs/${encodeURIComponent(job.id)}?markRead=0`);
     const jobDetail = await jobDetailResponse.json();
     assert.equal(jobDetail.attachments[0].contentUrl, upload.attachment.contentUrl);
+    assert.deepEqual(jobDetail.attachmentMentions, talk.request.attachmentMentions);
   } finally {
     await new Promise((resolve) => server.close(resolve));
     rmSync(workersDir, { recursive: true, force: true });
@@ -2740,10 +2763,65 @@ test("Codex talk input carries local images while unsupported backends are rejec
 
   const spawnerSource = readFileSync(join(testDir, "../spawner.ts"), "utf8");
   const codexSource = readFileSync(join(testDir, "../codex-backend.mjs"), "utf8");
-  assert.match(spawnerSource, /args\.push\(\.\.\.buildPiAttachmentArgs\(attachments\)\)/);
+  assert.match(spawnerSource, /args\.push\(\.\.\.buildPiAttachmentArgs\(orderedAttachments\)\)/);
   assert.match(spawnerSource, /runCodexWorkerStreaming\([\s\S]{0,240}attachments,/);
+  assert.match(spawnerSource, /orderTalkAttachmentsForMentions\(task, attachments, attachmentMentions\)/);
+  assert.match(spawnerSource, /buildPiAttachmentReferenceContext\(task, attachments, attachmentMentions\)/);
   assert.match(codexSource, /input:\s*buildCodexTurnInput\(/);
-  assert.match(codexSource, /export async function steerCodexWorker[\s\S]+input:\s*buildCodexTurnInput\(task, attachments\)/);
+  assert.match(codexSource, /buildCodexTurnInput\([\s\S]{0,180}attachments,[\s\S]{0,80}attachmentMentions/);
+  assert.match(codexSource, /export async function steerCodexWorker[\s\S]+input:\s*buildCodexTurnInput\(task, attachments, attachmentMentions\)/);
+});
+
+test("image mentions validate uploaded attachments and preserve positional relationships", async () => {
+  const attachmentModule = await import("../talk-attachments.mjs");
+  const attachments = [
+    { id: "timg_a_aaaaaaaaaaaaaaaa", path: "/tmp/a.png", mimeType: "image/png", name: "a.png", size: 10 },
+    { id: "timg_b_bbbbbbbbbbbbbbbb", path: "/tmp/b.png", mimeType: "image/png", name: "b.png", size: 11 },
+    { id: "timg_c_cccccccccccccccc", path: "/tmp/c.png", mimeType: "image/png", name: "c.png", size: 12 },
+  ];
+  const message = "先比较 @图片2，再看 @图片1，最后仍然引用 @图片2";
+  const mentions = attachmentModule.normalizeTalkAttachmentMentions?.(message, attachments, [
+    { attachmentId: attachments[1].id, token: "@图片2" },
+    { attachmentId: attachments[0].id, token: "@图片1" },
+  ]) ?? null;
+
+  assert.deepEqual(mentions, [
+    { attachmentId: attachments[1].id, token: "@图片2" },
+    { attachmentId: attachments[0].id, token: "@图片1" },
+  ]);
+  assert.deepEqual(attachmentModule.buildCodexTurnInput(message, attachments, mentions), [
+    { type: "text", text: "先比较 @图片2", text_elements: [] },
+    { type: "localImage", path: "/tmp/b.png" },
+    { type: "text", text: "，再看 @图片1", text_elements: [] },
+    { type: "localImage", path: "/tmp/a.png" },
+    { type: "text", text: "，最后仍然引用 @图片2", text_elements: [] },
+    { type: "localImage", path: "/tmp/c.png" },
+  ]);
+  assert.deepEqual(
+    attachmentModule.orderTalkAttachmentsForMentions?.(message, attachments, mentions) ?? null,
+    [attachments[1], attachments[0], attachments[2]],
+  );
+  assert.match(
+    attachmentModule.buildPiAttachmentReferenceContext?.(message, attachments, mentions) || "",
+    /@图片2.*第 1 张.*b\.png[\s\S]*@图片1.*第 2 张.*a\.png/,
+  );
+
+  assert.throws(() => attachmentModule.normalizeTalkAttachmentMentions?.(message, attachments, [
+    { attachmentId: "timg_unknown_1111111111111111", token: "@图片2" },
+  ]), /不属于本条消息/);
+  assert.throws(() => attachmentModule.normalizeTalkAttachmentMentions?.(message, attachments, [
+    { attachmentId: attachments[0].id, token: "@a.png" },
+  ]), /token/);
+  assert.throws(() => attachmentModule.normalizeTalkAttachmentMentions?.(message, attachments, [
+    { attachmentId: attachments[0].id, token: "@图片9" },
+  ]), /正文中不存在/);
+  assert.deepEqual(
+    attachmentModule.filterTalkAttachmentMentionsInText?.("只保留 @图片10", [
+      { attachmentId: attachments[0].id, token: "@图片1" },
+      { attachmentId: attachments[1].id, token: "@图片10" },
+    ]),
+    [{ attachmentId: attachments[1].id, token: "@图片10" }],
+  );
 });
 
 test("web talk composer exposes paste, picker, preview, and image history affordances", () => {
@@ -2756,8 +2834,16 @@ test("web talk composer exposes paste, picker, preview, and image history afford
   assert.match(appSource, /\/api\/talk-attachments/);
   assert.match(appSource, /talk-panel__attachment-preview/);
   assert.match(appSource, /talkAttachmentNodes/);
+  assert.match(appSource, /mentionToken:\s*`@图片\$\{nextImageMentionNumber\+\+\}`/);
+  assert.match(appSource, /function findTalkImageMentionTrigger/);
+  assert.match(appSource, /talk-panel__mention-menu/);
+  assert.match(appSource, /insertImageMention/);
+  assert.match(appSource, /attachmentMentions:\s*pendingImages/);
+  assert.match(appSource, /talkMessageNode\(j\.task, j\.attachmentMentions, j\.attachments\)/);
   assert.match(styleSource, /\.talk-panel__attachment-preview/);
   assert.match(styleSource, /\.talk-attachment__image/);
+  assert.match(styleSource, /\.talk-panel__mention-menu/);
+  assert.match(styleSource, /\.talk-inline-mention/);
   assert.match(serverSource, /POST.*\/api\/talk-attachments/);
   assert.match(serverSource, /handleTalkAttachmentUpload/);
   assert.match(serverSource, /handleTalkAttachmentContent/);

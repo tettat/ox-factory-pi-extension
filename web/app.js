@@ -2144,7 +2144,62 @@
     return `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
   }
 
-  function talkAttachmentNodes(attachments = [], { preview = false, onRemove } = {}) {
+  function escapeTalkMentionRegex(value) {
+    return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  function talkMessageHasMention(message, token) {
+    return new RegExp(`${escapeTalkMentionRegex(token)}(?!\\d)`, "u").test(String(message || ""));
+  }
+
+  function findTalkImageMentionTrigger(value, cursor) {
+    const text = String(value || "");
+    const end = Math.max(0, Math.min(Number(cursor) || 0, text.length));
+    const before = text.slice(0, end);
+    const match = /(^|[\s([{（])@([^\s@]*)$/u.exec(before);
+    if (!match) return null;
+    return {
+      start: before.length - match[0].length + match[1].length,
+      end,
+      query: match[2] || "",
+    };
+  }
+
+  function talkMessageNode(message, attachmentMentions = [], attachments = [], { compact = true } = {}) {
+    const wrap = el("div", { class: compact ? "talk-list__task talk-message" : "prose talk-message" });
+    const text = String(message || "");
+    const attachmentById = new Map((attachments || []).map((attachment) => [attachment.id, attachment]));
+    const mentionByToken = new Map((attachmentMentions || []).map((mention) => [mention.token, mention]));
+    const tokens = [...mentionByToken.keys()].sort((a, b) => b.length - a.length);
+    if (!tokens.length) {
+      wrap.textContent = text;
+      return wrap;
+    }
+    const matcher = new RegExp(`(${tokens.map(escapeTalkMentionRegex).join("|")})(?!\\d)`, "gu");
+    let cursor = 0;
+    for (const match of text.matchAll(matcher)) {
+      if (match.index > cursor) wrap.appendChild(document.createTextNode(text.slice(cursor, match.index)));
+      const mention = mentionByToken.get(match[0]);
+      const attachment = attachmentById.get(mention?.attachmentId);
+      if (attachment) {
+        wrap.appendChild(el("a", {
+          class: "talk-inline-mention",
+          href: talkAttachmentUrl(attachment),
+          target: "_blank",
+          rel: "noreferrer",
+          text: match[0],
+          title: `${match[0]} · ${attachment.name || "图片"}`,
+        }));
+      } else {
+        wrap.appendChild(document.createTextNode(match[0]));
+      }
+      cursor = match.index + match[0].length;
+    }
+    if (cursor < text.length) wrap.appendChild(document.createTextNode(text.slice(cursor)));
+    return wrap;
+  }
+
+  function talkAttachmentNodes(attachments = [], { preview = false, onRemove, onMention } = {}) {
     if (!Array.isArray(attachments) || attachments.length === 0) return null;
     return el("div", {
       class: `talk-attachments${preview ? " talk-panel__attachment-preview" : ""}`,
@@ -2166,6 +2221,13 @@
           }),
         ]) : null,
         el("figcaption", { class: "talk-attachment__caption" }, [
+          preview && attachment.mentionToken && onMention ? el("button", {
+            class: "talk-attachment__mention",
+            type: "button",
+            text: attachment.mentionToken,
+            title: `在光标处引用 ${attachment.name || "图片"}`,
+            onclick: () => onMention(index),
+          }) : null,
           el("span", { class: "talk-attachment__name", text: attachment.name || `图片 ${index + 1}` }),
           attachment.size != null ? el("span", { class: "talk-attachment__size", text: formatTalkAttachmentSize(attachment.size) }) : null,
         ]),
@@ -2217,6 +2279,9 @@
 
     // 输入区
     const pendingImages = [];
+    let nextImageMentionNumber = 1;
+    let mentionMenuActiveIndex = 0;
+    let mentionMenuOptions = [];
     const backend = String(d.backend || "pi").toLowerCase();
     const supportsImages = backend === "pi" || backend === "codex";
     const textarea = el("textarea", {
@@ -2232,6 +2297,11 @@
       multiple: "multiple",
       tabindex: "-1",
       "aria-hidden": "true",
+    });
+    const mentionMenu = el("div", {
+      class: "talk-panel__mention-menu",
+      role: "listbox",
+      hidden: "hidden",
     });
     const attachBtn = el("button", {
       class: "btn btn--ghost talk-panel__attach",
@@ -2262,14 +2332,14 @@
       el("option", { value: "steer", text: "插队 (steer)", ...(STATE.talkMode === "steer" ? { selected: "selected" } : {}) }),
     ]);
     const hintText = supportsImages
-      ? "**图片** 支持选择或粘贴（最多 6 张、每张 10 MiB） · **auto** 空闲马上起、忙碌排队 · **queue** 强制排队 · **steer** 优先插入 Codex active turn。"
+      ? "**图片** 支持选择或粘贴；输入 **@** 可引用已上传图片的位置（最多 6 张、每张 10 MiB） · **auto** 空闲马上起、忙碌排队 · **queue** 强制排队 · **steer** 优先插入 Codex active turn。"
       : `当前 **${backend}** 后端暂不支持图片 · **auto** 空闲马上起、忙碌排队 · **queue** 强制排队。`;
     const hint = el("p", { class: "muted talk-panel__hint", html: md(hintText, { compact: true, max: 320 }) });
 
     // 提示：API 调用状态
     const feedback = el("div", { class: "talk-panel__feedback", id: `talkFeedback-${worker}` });
     const sendRow = el("div", { class: "talk-panel__row" }, [
-      el("div", { class: "talk-panel__compose" }, [textarea, imageInput, attachmentPreview]),
+      el("div", { class: "talk-panel__compose" }, [textarea, imageInput, mentionMenu, attachmentPreview]),
       el("div", { class: "talk-panel__actions" }, [modeSel, attachBtn, sendBtn, feedback]),
     ]);
     card.appendChild(sendRow);
@@ -2289,16 +2359,84 @@
       return detail?.error?.message || detail?.detail || fallback;
     };
 
+    const hideMentionMenu = () => {
+      mentionMenu.hidden = true;
+      mentionMenu.innerHTML = "";
+      mentionMenuOptions = [];
+      mentionMenuActiveIndex = 0;
+    };
+
+    const insertImageMention = (item, trigger = findTalkImageMentionTrigger(textarea.value, textarea.selectionStart)) => {
+      const start = trigger?.start ?? textarea.selectionStart ?? textarea.value.length;
+      const end = trigger?.end ?? textarea.selectionEnd ?? start;
+      const before = textarea.value.slice(0, start);
+      const after = textarea.value.slice(end);
+      const trailingSpace = after.startsWith(" ") ? "" : " ";
+      textarea.value = `${before}${item.mentionToken}${trailingSpace}${after}`;
+      const nextCursor = before.length + item.mentionToken.length + trailingSpace.length;
+      textarea.setSelectionRange(nextCursor, nextCursor);
+      textarea.focus();
+      hideMentionMenu();
+      feedback.textContent = `已引用 ${item.mentionToken} · ${item.name}`;
+      feedback.className = "talk-panel__feedback";
+    };
+
+    const renderMentionMenu = () => {
+      const trigger = findTalkImageMentionTrigger(textarea.value, textarea.selectionStart);
+      if (!trigger) {
+        hideMentionMenu();
+        return;
+      }
+      const query = trigger.query.toLowerCase();
+      mentionMenuOptions = pendingImages.filter((item) =>
+        `${item.mentionToken} ${item.name}`.toLowerCase().includes(query),
+      );
+      mentionMenu.innerHTML = "";
+      mentionMenu.hidden = false;
+      if (!pendingImages.length) {
+        mentionMenu.appendChild(el("div", { class: "talk-panel__mention-empty", text: "请先上传或粘贴图片" }));
+        return;
+      }
+      if (!mentionMenuOptions.length) {
+        mentionMenu.appendChild(el("div", { class: "talk-panel__mention-empty", text: "没有匹配的已上传图片" }));
+        return;
+      }
+      mentionMenuActiveIndex = Math.min(mentionMenuActiveIndex, mentionMenuOptions.length - 1);
+      mentionMenu.appendChild(el("div", {}, mentionMenuOptions.map((item, index) => el("button", {
+        class: `talk-panel__mention-option${index === mentionMenuActiveIndex ? " is-active" : ""}`,
+        type: "button",
+        role: "option",
+        "aria-selected": index === mentionMenuActiveIndex ? "true" : "false",
+        onmousedown: (event) => {
+          event.preventDefault();
+          insertImageMention(item, trigger);
+        },
+      }, [
+        el("img", { class: "talk-panel__mention-thumb", src: item.previewUrl, alt: "" }),
+        el("span", { class: "talk-panel__mention-copy" }, [
+          el("strong", { text: item.mentionToken }),
+          el("span", { text: item.name }),
+        ]),
+      ]))));
+    };
+
     const renderPendingImages = () => {
       attachmentPreview.innerHTML = "";
       attachmentPreview.hidden = pendingImages.length === 0;
       if (!pendingImages.length) return;
       attachmentPreview.appendChild(talkAttachmentNodes(pendingImages, {
         preview: true,
+        onMention: (index) => insertImageMention(pendingImages[index], null),
         onRemove: (index) => {
           const [removed] = pendingImages.splice(index, 1);
           if (removed?.previewUrl) URL.revokeObjectURL(removed.previewUrl);
+          if (removed?.mentionToken) {
+            textarea.value = textarea.value
+              .replace(new RegExp(`${escapeTalkMentionRegex(removed.mentionToken)}(?!\\d)\\s?`, "gu"), "");
+          }
+          if (!pendingImages.length) nextImageMentionNumber = 1;
           renderPendingImages();
+          renderMentionMenu();
         },
       }));
     };
@@ -2327,6 +2465,7 @@
           name: file.name || `粘贴图片-${pendingImages.length + 1}.png`,
           size: file.size,
           mimeType: file.type,
+          mentionToken: `@图片${nextImageMentionNumber++}`,
           previewUrl: URL.createObjectURL(file),
           remote: null,
         });
@@ -2338,9 +2477,12 @@
         feedback.className = "talk-panel__feedback";
       }
       imageInput.value = "";
+      renderMentionMenu();
     };
 
     imageInput.addEventListener("change", () => addImageFiles(imageInput.files));
+    textarea.addEventListener("input", renderMentionMenu);
+    textarea.addEventListener("click", renderMentionMenu);
     textarea.addEventListener("paste", (event) => {
       const files = Array.from(event.clipboardData?.items || [])
         .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
@@ -2399,7 +2541,14 @@
       const res = await api(`/api/talk/${encodeURIComponent(worker)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: msg, mode, attachmentIds }),
+        body: JSON.stringify({
+          message: msg,
+          mode,
+          attachmentIds,
+          attachmentMentions: pendingImages
+            .filter((item) => talkMessageHasMention(msg, item.mentionToken))
+            .map((item) => ({ attachmentId: item.remote.id, token: item.mentionToken })),
+        }),
       });
       sendBtn.disabled = false;
       attachBtn.disabled = !supportsImages;
@@ -2419,6 +2568,8 @@
         if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
       }
       pendingImages.length = 0;
+      nextImageMentionNumber = 1;
+      hideMentionMenu();
       renderPendingImages();
       void refreshWorkerUnreadBadges();
       if (requestId) await waitTalkRequest(worker, requestId, feedback);
@@ -2426,6 +2577,25 @@
     };
     sendBtn.addEventListener("click", send);
     textarea.addEventListener("keydown", (e) => {
+      if (!mentionMenu.hidden && mentionMenuOptions.length && !e.ctrlKey && !e.metaKey) {
+        if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+          e.preventDefault();
+          const delta = e.key === "ArrowDown" ? 1 : -1;
+          mentionMenuActiveIndex = (mentionMenuActiveIndex + delta + mentionMenuOptions.length) % mentionMenuOptions.length;
+          renderMentionMenu();
+          return;
+        }
+        if (e.key === "Enter") {
+          e.preventDefault();
+          insertImageMention(mentionMenuOptions[mentionMenuActiveIndex]);
+          return;
+        }
+        if (e.key === "Escape") {
+          e.preventDefault();
+          hideMentionMenu();
+          return;
+        }
+      }
       if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); send(); }
     });
 
@@ -2529,7 +2699,7 @@
         ]),
       ]),
       (j.assignedBy || j.source) ? el("div", { class: "talk-list__meta", text: [j.assignedBy ? `指派: ${j.assignedBy}` : "", j.source ? `来源: ${j.source}` : ""].filter(Boolean).join(" · ") }) : null,
-      j.task ? el("div", { class: "talk-list__task", text: j.task }) : null,
+      j.task ? talkMessageNode(j.task, j.attachmentMentions, j.attachments) : null,
       talkAttachmentNodes(j.attachments || []),
     ]);
   }
@@ -2577,7 +2747,7 @@
           request.error ? `错误: ${request.error}` : "",
         ].filter(Boolean).join(" · "),
       }),
-      request.message ? el("div", { class: "talk-list__task", text: request.message }) : null,
+      request.message ? talkMessageNode(request.message, request.attachmentMentions, request.attachments) : null,
       talkAttachmentNodes(request.attachments || []),
     ]);
   }
@@ -3011,7 +3181,9 @@
     }
     body.appendChild(el("div", { class: "drawer__section" }, [
       el("h4", { text: "任务" }),
-      d.task ? mdNode(d.task) : el("p", { class: "prose", text: "—" }),
+      d.task
+        ? (d.attachmentMentions?.length ? talkMessageNode(d.task, d.attachmentMentions, d.attachments, { compact: false }) : mdNode(d.task))
+        : el("p", { class: "prose", text: "—" }),
       talkAttachmentNodes(d.attachments || []),
     ]));
     const replyText = d.fullReply || d.latestReply || d.summary || "";

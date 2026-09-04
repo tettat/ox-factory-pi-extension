@@ -207,12 +207,118 @@ export function buildPiAttachmentArgs(attachments = []) {
   return attachments.map((attachment) => `@${attachment.path}`);
 }
 
-export function buildCodexTurnInput(text, attachments = []) {
+function escapeRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function mentionTokenRegex(tokens, flags = "g") {
+  const alternatives = [...tokens]
+    .sort((a, b) => b.length - a.length)
+    .map(escapeRegex);
+  if (!alternatives.length) return null;
+  return new RegExp(`(${alternatives.join("|")})(?!\\d)`, flags);
+}
+
+function textHasMentionToken(text, token) {
+  return mentionTokenRegex([token], "u")?.test(String(text || "")) || false;
+}
+
+export function filterTalkAttachmentMentionsInText(text, mentions = []) {
+  if (!Array.isArray(mentions)) return [];
+  return mentions.filter((mention) => mention?.token && textHasMentionToken(text, mention.token));
+}
+
+export function normalizeTalkAttachmentMentions(text, attachments = [], value = []) {
+  if (value == null) return [];
+  if (!Array.isArray(value)) throw new Error("attachmentMentions 必须是数组");
+  const attachmentIds = new Set(attachments.map((attachment) => String(attachment?.id || "")).filter(Boolean));
+  const seenIds = new Set();
+  const seenTokens = new Set();
+  return value.map((mention) => {
+    const attachmentId = String(mention?.attachmentId || "").trim();
+    const token = String(mention?.token || "").trim();
+    if (!attachmentIds.has(attachmentId)) {
+      throw new Error(`attachment mention 不属于本条消息: ${attachmentId}`);
+    }
+    if (!/^@图片[1-9]\d{0,2}$/.test(token)) {
+      throw new Error(`attachment mention token 非法: ${token}`);
+    }
+    if (seenIds.has(attachmentId) || seenTokens.has(token)) {
+      throw new Error(`attachment mention 重复: ${attachmentId} ${token}`);
+    }
+    if (!textHasMentionToken(text, token)) {
+      throw new Error(`attachment mention 在正文中不存在: ${token}`);
+    }
+    seenIds.add(attachmentId);
+    seenTokens.add(token);
+    return { attachmentId, token };
+  });
+}
+
+export function orderTalkAttachmentsForMentions(text, attachments = [], mentions = []) {
+  const firstPositionById = new Map();
+  for (const mention of mentions) {
+    const matcher = mentionTokenRegex([mention.token], "u");
+    const position = matcher ? String(text || "").search(matcher) : -1;
+    if (position >= 0) firstPositionById.set(mention.attachmentId, position);
+  }
+  return attachments
+    .map((attachment, index) => ({ attachment, index }))
+    .sort((a, b) => {
+      const aPosition = firstPositionById.get(a.attachment.id) ?? Number.POSITIVE_INFINITY;
+      const bPosition = firstPositionById.get(b.attachment.id) ?? Number.POSITIVE_INFINITY;
+      return aPosition - bPosition || a.index - b.index;
+    })
+    .map(({ attachment }) => attachment);
+}
+
+export function buildPiAttachmentReferenceContext(text, attachments = [], mentions = []) {
+  if (!mentions.length) return "";
+  const mentionById = new Map(mentions.map((mention) => [mention.attachmentId, mention]));
+  const ordered = orderTalkAttachmentsForMentions(text, attachments, mentions);
+  return [
+    "图片引用映射（图片附件按下列顺序随本轮消息提供）：",
+    ...ordered.map((attachment, index) => {
+      const mention = mentionById.get(attachment.id);
+      const reference = mention?.token || "未在正文中 @";
+      return `- ${reference} = 第 ${index + 1} 张随附图片（${attachment.name || "图片"}）`;
+    }),
+    "正文中的 @图片N 只表示引用位置，不是文件路径。",
+  ].join("\n");
+}
+
+export function buildCodexTurnInput(text, attachments = [], mentions = []) {
   const input = [];
-  if (String(text || "").trim()) {
-    input.push({ type: "text", text: String(text), text_elements: [] });
+  const sourceText = String(text || "");
+  const attachmentById = new Map(attachments.map((attachment) => [attachment.id, attachment]));
+  const mentionByToken = new Map(mentions.map((mention) => [mention.token, mention]));
+  const matcher = mentionTokenRegex(mentionByToken.keys());
+  const emittedAttachmentIds = new Set();
+  let cursor = 0;
+  const pushText = (value) => {
+    if (!value) return;
+    const previous = input[input.length - 1];
+    if (previous?.type === "text") previous.text += value;
+    else input.push({ type: "text", text: value, text_elements: [] });
+  };
+  if (matcher) {
+    for (const match of sourceText.matchAll(matcher)) {
+      const end = match.index + match[0].length;
+      pushText(sourceText.slice(cursor, end));
+      const mention = mentionByToken.get(match[0]);
+      const attachment = attachmentById.get(mention?.attachmentId);
+      if (attachment && !emittedAttachmentIds.has(attachment.id)) {
+        input.push({ type: "localImage", path: attachment.path });
+        emittedAttachmentIds.add(attachment.id);
+      }
+      cursor = end;
+    }
+    pushText(sourceText.slice(cursor));
+  } else if (sourceText.trim()) {
+    pushText(sourceText);
   }
   for (const attachment of attachments) {
+    if (emittedAttachmentIds.has(attachment.id)) continue;
     input.push({ type: "localImage", path: attachment.path });
   }
   return input;

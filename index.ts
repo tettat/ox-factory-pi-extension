@@ -142,6 +142,7 @@ import {
 } from "./web-talk.mjs";
 import {
   assertTalkImageBackendSupported,
+  filterTalkAttachmentMentionsInText,
   materializeTalkAttachments,
 } from "./talk-attachments.mjs";
 import {
@@ -796,8 +797,10 @@ function editQueuedWorkerJob(input: { jobId?: string; worker?: string; task?: st
     const item = queue.find((candidate) => !jobId || jobIdMatches(candidate.job, jobId));
     if (!item) continue;
     item.options.task = task;
+    item.options.attachmentMentions = filterTalkAttachmentMentionsInText(task, item.options.attachmentMentions);
     const updated = updateJob(item.job, {
       task,
+      attachmentMentions: item.options.attachmentMentions,
       editedAt: new Date().toISOString(),
       editedBy: actor,
     });
@@ -987,6 +990,7 @@ export default function (pi: ExtensionAPI) {
           const attachments = materializeTalkAttachments(getWorkersDir(), request.attachments || [], {
             requestId: request.id,
           });
+          const attachmentMentions = request.attachmentMentions || [];
           assertTalkImageBackendSupported(w?.backend ?? "pi", attachments);
           if (!message && attachments.length === 0) {
             failWebTalkRequest(getWorkersDir(), {
@@ -1001,6 +1005,7 @@ export default function (pi: ExtensionAPI) {
             attach: false,
             notify: false,
             attachments,
+            attachmentMentions,
           });
           if (!job) {
             failWebTalkRequest(getWorkersDir(), {
@@ -2747,7 +2752,12 @@ export default function (pi: ExtensionAPI) {
     msg: string,
     ctx?: any,
     requestedMode?: TalkDeliveryMode,
-    options: { attach?: boolean; notify?: boolean; attachments?: SpawnOptions["attachments"] } = {},
+    options: {
+      attach?: boolean;
+      notify?: boolean;
+      attachments?: SpawnOptions["attachments"];
+      attachmentMentions?: SpawnOptions["attachmentMentions"];
+    } = {},
   ) {
     w = recoverWorkerFromRegistrySnapshot(w.id) || w;
     const availability = workerCanAcceptWork(w, w.id);
@@ -2761,6 +2771,7 @@ export default function (pi: ExtensionAPI) {
     const runningJob = openBefore.find((candidate: any) => candidate.status === "running") ?? openBefore[0];
     const steerInline = deliveryMode === "steer" && canSteerActiveCodexTurn(w);
     const attachments = options.attachments || [];
+    const attachmentMentions = options.attachmentMentions || [];
     assertTalkImageBackendSupported(w.backend ?? "pi", attachments);
 
     const job = createJob(getWorkersDir(), {
@@ -2769,6 +2780,7 @@ export default function (pi: ExtensionAPI) {
       project: "talk",
       task: msg,
       attachments: attachments.map(({ path: _path, ...attachment }) => attachment),
+      attachmentMentions,
       cwd: process.cwd(),
       sessionFile: w.sessionFile,
     });
@@ -2787,6 +2799,7 @@ export default function (pi: ExtensionAPI) {
         text: msg,
         queuedJobId: job.id,
         attachmentIds: attachments.map((attachment) => attachment.id),
+        attachmentMentions,
       });
     }
 
@@ -2821,7 +2834,7 @@ export default function (pi: ExtensionAPI) {
 
     try {
       const handle = startWorkerJobQueued(
-        { worker: w, task: msg, project: "talk", attachments, signal: undefined as any, deliveryMode },
+        { worker: w, task: msg, project: "talk", attachments, attachmentMentions, signal: undefined as any, deliveryMode },
         job,
         (ev) => {
           queueTalkLive(w.id, job, ev);

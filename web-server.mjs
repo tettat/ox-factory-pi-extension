@@ -49,6 +49,7 @@ import {
   assertTalkImageBackendSupported,
   bindTalkAttachments,
   createTalkAttachment,
+  normalizeTalkAttachmentMentions,
   resolveTalkAttachmentIds,
   talkAttachmentContentPath,
 } from "./talk-attachments.mjs";
@@ -309,6 +310,7 @@ function summarizeJobForOverview(job) {
     model: job.model || null,
     task: compactText(job.task || "", 80),
     attachments: summarizeTalkAttachments(job.attachments),
+    attachmentMentions: summarizeTalkAttachmentMentions(job.attachmentMentions),
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
     finishedAt: job.finishedAt,
@@ -328,6 +330,13 @@ function summarizeTalkAttachments(attachments) {
       size: Number(attachment.size) || 0,
       contentUrl: `/api/talk-attachments/${encodeURIComponent(attachment.id)}/content`,
     }));
+}
+
+function summarizeTalkAttachmentMentions(mentions) {
+  if (!Array.isArray(mentions)) return [];
+  return mentions
+    .filter((mention) => mention?.attachmentId && mention?.token)
+    .map((mention) => ({ attachmentId: mention.attachmentId, token: mention.token }));
 }
 
 function compactText(value, max = 160) {
@@ -1208,6 +1217,7 @@ async function handleWorkerDetail(workersDir, res, name, url = null) {
       source: request.source || null,
       message: request.message || "",
       attachments: summarizeTalkAttachments(request.attachments),
+      attachmentMentions: summarizeTalkAttachmentMentions(request.attachmentMentions),
       mode: request.mode || "auto",
       deliveryMode: request.deliveryMode || request.resolvedMode || null,
       placement: request.placement || null,
@@ -1313,6 +1323,7 @@ async function handleJobDetail(workersDir, res, id, url = null) {
     returnTo: job.returnTo || "",
     task: job.task,
     attachments: summarizeTalkAttachments(job.attachments),
+    attachmentMentions: summarizeTalkAttachmentMentions(job.attachmentMentions),
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
     startedAt: job.startedAt,
@@ -1674,10 +1685,12 @@ async function handleTalkMessage(workersDir, res, pathname, body) {
   }
   const message = String(body?.message ?? "").trim();
   let attachments;
+  let attachmentMentions;
   try {
     attachments = resolveTalkAttachmentIds(workersDir, body?.attachmentIds || []);
     assertTalkImageBackendSupported(regInfo?.backend || "pi", attachments);
     assertTalkAttachmentsUnbound(workersDir, attachments);
+    attachmentMentions = normalizeTalkAttachmentMentions(message, attachments, body?.attachmentMentions);
   } catch (err) {
     return badRequest(res, err?.message || String(err));
   }
@@ -1697,6 +1710,7 @@ async function handleTalkMessage(workersDir, res, pathname, body) {
       from: String(body?.from || "web").trim() || "web",
       mode,
       attachments,
+      attachmentMentions,
     });
     let boundAttachments;
     try {
@@ -1719,6 +1733,7 @@ async function handleTalkMessage(workersDir, res, pathname, body) {
           size: attachment.size,
           contentUrl: `/api/talk-attachments/${encodeURIComponent(attachment.id)}/content`,
         })),
+        attachmentMentions,
         mode: request.mode,
         createdAt: request.createdAt,
       },

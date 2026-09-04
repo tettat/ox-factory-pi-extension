@@ -16,10 +16,10 @@
 - Modify: `talk-attachments.mjs`
 - Modify: `test/ox-factory.test.mjs`
 
-- [ ] Write failing tests for `{ attachmentId, token }` validation, repeated textual references, Codex interleaving, Pi first-reference ordering, and unreferenced-image fallback.
-- [ ] Run the targeted Node tests and confirm failures are caused by missing mention helpers.
-- [ ] Implement `normalizeTalkAttachmentMentions`, mention-aware Codex input construction, Pi attachment ordering, and Pi reference mapping.
-- [ ] Run targeted tests and confirm they pass.
+- [x] Write failing tests for `{ attachmentId, token }` validation, repeated textual references, Codex interleaving, Pi first-reference ordering, and unreferenced-image fallback.
+- [x] Run the targeted Node tests and confirm failures are caused by missing mention helpers.
+- [x] Implement `normalizeTalkAttachmentMentions`, mention-aware Codex input construction, Pi attachment ordering, and Pi reference mapping.
+- [x] Run targeted tests and confirm they pass.
 
 ### Task 2: Persist mentions through request, job, queue, and backend dispatch
 
@@ -32,10 +32,10 @@
 - Modify: `codex-backend.mjs`
 - Modify: `test/ox-factory.test.mjs`
 
-- [ ] Write failing tests showing the HTTP request, event-sourced talk request, job serializers, Pi dispatch, Codex start, and Codex steer retain mention metadata.
-- [ ] Run the targeted tests and confirm the metadata is currently absent.
-- [ ] Add `attachmentMentions` to request/job/spawn options and validate all referenced IDs belong to the submitted attachments.
-- [ ] Run targeted tests and confirm they pass.
+- [x] Write failing tests showing the HTTP request, event-sourced talk request, job serializers, Pi dispatch, Codex start, and Codex steer retain mention metadata.
+- [x] Run the targeted tests and confirm the metadata is currently absent.
+- [x] Add `attachmentMentions` to request/job/spawn options and validate all referenced IDs belong to the submitted attachments.
+- [x] Run targeted tests and confirm they pass.
 
 ### Task 3: Add Web `@` selection and positional rendering
 
@@ -44,18 +44,18 @@
 - Modify: `web/styles.css`
 - Modify: `test/ox-factory.test.mjs`
 
-- [ ] Write failing source-contract tests for stable `@图片N` labels, an uploaded-image completion menu, cursor insertion, submission payload, and inline history rendering.
-- [ ] Run the targeted test and confirm it fails before UI code exists.
-- [ ] Add the completion menu and clickable preview mention tokens without turning `@` into an upload action.
-- [ ] Submit mention mappings only for tokens present in the message and render stored tokens as links at their exact text positions.
-- [ ] Run targeted tests and confirm they pass.
+- [x] Write failing source-contract tests for stable `@图片N` labels, an uploaded-image completion menu, cursor insertion, submission payload, and inline history rendering.
+- [x] Run the targeted test and confirm it fails before UI code exists.
+- [x] Add the completion menu and clickable preview mention tokens without turning `@` into an upload action.
+- [x] Submit mention mappings only for tokens present in the message and render stored tokens as links at their exact text positions.
+- [x] Run targeted tests and confirm they pass.
 
 ### Task 4: Verify and commit
 
 **Files:**
 - Modify: `docs/plans/2026-09-04-web-talk-image-input.md`
 
-- [ ] Document upload-versus-mention semantics and the Pi compatibility mapping.
-- [ ] Run `git diff --check` and `pnpm run verify`; require all tests to pass.
-- [ ] Review the final diff for accidental main-worktree changes or persisted absolute paths.
-- [ ] Commit the isolated branch without merging or reloading the active factory.
+- [x] Document upload-versus-mention semantics and the Pi compatibility mapping.
+- [x] Run `git diff --check` and `pnpm run verify`; require all tests to pass.
+- [x] Review the final diff for accidental main-worktree changes or persisted absolute paths.
+- [x] Commit the isolated branch without merging or reloading the active factory.

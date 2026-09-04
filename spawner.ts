@@ -26,7 +26,9 @@ import { buildWorkerSystemPrompt, buildWorkerTaskPrompt } from "./worker-prompts
 import { scoreUserEmotion } from "./quality-metrics.mjs";
 import {
   assertTalkImageBackendSupported,
+  buildPiAttachmentReferenceContext,
   buildPiAttachmentArgs,
+  orderTalkAttachmentsForMentions,
 } from "./talk-attachments.mjs";
 
 const OWNER_INSTANCE_ID = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -141,6 +143,10 @@ export interface SpawnOptions {
     size: number;
     path: string;
   }>;
+  attachmentMentions?: Array<{
+    attachmentId: string;
+    token: string;
+  }>;
   signal?: AbortSignal;
   onProgress?: (text: string) => void;
   deliveryMode?: "message" | "queue" | "steer";
@@ -191,7 +197,7 @@ function shouldSkipUserEmotionScore(job: any): boolean {
 }
 
 export async function spawnWorker(options: SpawnOptions): Promise<SpawnResult> {
-  const { worker, task, project, cwd, additionalContext, attachments = [], signal, onProgress } = options;
+  const { worker, task, project, cwd, additionalContext, attachments = [], attachmentMentions = [], signal, onProgress } = options;
 
   assertTalkImageBackendSupported(worker.backend ?? "pi", attachments);
 
@@ -223,8 +229,14 @@ export async function spawnWorker(options: SpawnOptions): Promise<SpawnResult> {
   }
 
   // 任务内容
-  const taskContent = buildWorkerTaskPrompt({ project, task, additionalContext });
-  args.push(...buildPiAttachmentArgs(attachments));
+  const orderedAttachments = orderTalkAttachmentsForMentions(task, attachments, attachmentMentions);
+  const attachmentContext = buildPiAttachmentReferenceContext(task, attachments, attachmentMentions);
+  const taskContent = buildWorkerTaskPrompt({
+    project,
+    task,
+    additionalContext: [additionalContext, attachmentContext].filter(Boolean).join("\n\n"),
+  });
+  args.push(...buildPiAttachmentArgs(orderedAttachments));
   args.push(taskContent);
 
   const workCwd = cwd ?? process.cwd();
@@ -343,7 +355,7 @@ export async function spawnWorkerStreaming(
   options: SpawnOptions,
   onEvent: (event: StreamEvent) => void,
 ): Promise<SpawnResult> {
-  const { worker, task, project, cwd, additionalContext, attachments = [], signal } = options;
+  const { worker, task, project, cwd, additionalContext, attachments = [], attachmentMentions = [], signal } = options;
 
   assertTalkImageBackendSupported(worker.backend ?? "pi", attachments);
 
@@ -356,6 +368,7 @@ export async function spawnWorkerStreaming(
         cwd,
         additionalContext,
         attachments,
+        attachmentMentions,
         signal,
         agentDef: getAgentDef(worker.role),
         workersDir: getWorkersDir(),
@@ -415,8 +428,14 @@ export async function spawnWorkerStreaming(
     args.push("--append-system-prompt", tmpFilePath);
   }
 
-  const taskContent = buildWorkerTaskPrompt({ project, task, additionalContext });
-  args.push(...buildPiAttachmentArgs(attachments));
+  const orderedAttachments = orderTalkAttachmentsForMentions(task, attachments, attachmentMentions);
+  const attachmentContext = buildPiAttachmentReferenceContext(task, attachments, attachmentMentions);
+  const taskContent = buildWorkerTaskPrompt({
+    project,
+    task,
+    additionalContext: [additionalContext, attachmentContext].filter(Boolean).join("\n\n"),
+  });
+  args.push(...buildPiAttachmentArgs(orderedAttachments));
   args.push(taskContent);
 
   const workCwd = cwd ?? process.cwd();

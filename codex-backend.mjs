@@ -589,7 +589,7 @@ async function ensureThread(client, { worker, cwd, agentDef, workersDir, onWorke
 }
 
 export async function runCodexWorkerStreaming(options, onEvent) {
-  const { worker, task, project, cwd, additionalContext, attachments = [], signal, agentDef, workersDir, onWorkerPatch } = options;
+  const { worker, task, project, cwd, additionalContext, attachments = [], attachmentMentions = [], signal, agentDef, workersDir, onWorkerPatch } = options;
   const url = getCodexServerUrl(worker);
   const model = normalizeCodexModel(worker.model);
   if (model && model !== worker.model) {
@@ -667,6 +667,7 @@ export async function runCodexWorkerStreaming(options, onEvent) {
       input: buildCodexTurnInput(
         buildCodexTaskContent({ worker, task, project, additionalContext, workersDir }),
         attachments,
+        attachmentMentions,
       ),
       cwd: cwd || process.cwd(),
       model: model || null,
@@ -734,7 +735,7 @@ export async function runCodexWorkerStreaming(options, onEvent) {
 }
 
 export async function steerCodexWorker(options, onEvent) {
-  const { worker, task, attachments = [], workersDir } = options;
+  const { worker, task, attachments = [], attachmentMentions = [], workersDir } = options;
   if (!worker.codexThreadId || !worker.codexActiveTurnId) {
     throw new Error(`Codex worker ${worker.id} has no active turn to steer`);
   }
@@ -749,7 +750,7 @@ export async function steerCodexWorker(options, onEvent) {
     await client.request("turn/steer", {
       threadId: worker.codexThreadId,
       expectedTurnId: worker.codexActiveTurnId,
-      input: buildCodexTurnInput(task, attachments),
+      input: buildCodexTurnInput(task, attachments, attachmentMentions),
     });
     const text = `Steer accepted for active turn ${worker.codexActiveTurnId}`;
     onEvent?.({ type: "text", text });
