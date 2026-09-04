@@ -51,6 +51,10 @@ function jobListShallowSignal(jobsDir) {
   }
 }
 
+function jobListSignalIsAuthoritative(signal) {
+  return String(signal || "").startsWith("marker:");
+}
+
 function jobListFingerprint(jobsDir) {
   if (!existsSync(jobsDir)) return "missing";
   const parts = [];
@@ -78,7 +82,11 @@ function listCachedJobs(workersDir) {
   if (cached && now < cached.trustUntil) return cached.jobs;
 
   const shallowSignal = jobListShallowSignal(jobsDir);
-  if (cached && cached.shallowSignal === shallowSignal && now < cached.deepCheckAfter) {
+  if (
+    cached
+    && cached.shallowSignal === shallowSignal
+    && (jobListSignalIsAuthoritative(shallowSignal) || now < cached.deepCheckAfter)
+  ) {
     cached.trustUntil = now + JOB_LIST_CACHE_TRUST_MS;
     return cached.jobs;
   }
