@@ -126,7 +126,7 @@ export function createWebTalkRequest(workersDir, input) {
   if (!worker) throw new Error("worker 不能为空");
   if (!message && attachments.length === 0) throw new Error("message 或 attachments 至少需要一个");
   const request = {
-    type: "request_v2",
+    type: "request",
     protocolVersion: 2,
     id: randomId(),
     source: "web",

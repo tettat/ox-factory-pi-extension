@@ -2458,7 +2458,8 @@ test("web talk requests are event-sourced and do not create jobs in web-server",
     assert.equal(request.status, "pending");
     assert.equal(listPendingWebTalkRequests(workersDir).length, 1);
     const rawRequestEvent = JSON.parse(readFileSync(webTalkRequestsFile(workersDir), "utf8").trim().split("\n")[0]);
-    assert.equal(rawRequestEvent.type, "request_v2");
+    assert.equal(rawRequestEvent.type, "request");
+    assert.equal(rawRequestEvent.protocolVersion, 2);
 
     const claimed = claimWebTalkRequest(workersDir, {
       requestId: request.id,
