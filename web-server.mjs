@@ -828,7 +828,7 @@ export function buildRouter({ workersDir }) {
       if (pathname === "/api/workers") return await handleWorkers(workersDir, res);
       if (pathname.startsWith("/api/workers/")) {
         const name = decodeURIComponent(pathname.slice("/api/workers/".length));
-        return await handleWorkerDetail(workersDir, res, name);
+        return await handleWorkerDetail(workersDir, res, name, url);
       }
       if (pathname === "/api/jobs") return await handleJobs(workersDir, res, url);
       if (pathname.startsWith("/api/jobs/")) {
@@ -1083,7 +1083,7 @@ async function handleWorkers(workersDir, res) {
   });
 }
 
-async function handleWorkerDetail(workersDir, res, name) {
+async function handleWorkerDetail(workersDir, res, name, url = null) {
   if (!name) return badRequest(res, "worker name required");
   const registry = getWorkerRegistry(workersDir);
   const regInfo = registry.get(name) || {};
@@ -1094,9 +1094,12 @@ async function handleWorkerDetail(workersDir, res, name) {
   const inbox = listMessages(workersDir, { worker: name, limit: 50, includeSent: true });
   const unreadIncomingMessages = listMessages(workersDir, { worker: name, unreadOnly: true, limit: 100000 })
     .filter((m) => m.from !== name && (m.to === name || m.to === "*"));
-  const tokenReport = buildFactoryTokenReport({ workersDir, date: localDateString(new Date()), worker: name });
+  const includeToken = url?.searchParams?.get("includeToken") === "1";
+  const tokenReport = includeToken ? buildFactoryTokenReport({ workersDir, date: localDateString(new Date()), worker: name }) : null;
   const responsibilities = listWorkerResponsibilities(workersDir, { worker: name });
-  const unreadJobState = buildWorkerJobUnreadSummary(workersDir, jobs).byWorker.get(name) || {};
+  const unreadJobSummary = buildWorkerJobUnreadSummary(workersDir, jobs);
+  const unreadJobState = unreadJobSummary.byWorker.get(name) || {};
+  const unreadMessageIdsBeforeOpen = new Set(unreadIncomingMessages.map((m) => m.id).filter(Boolean));
   const unreadMessages = unreadIncomingMessages.length;
   const unreadJobUpdates = unreadJobState.unreadJobs || 0;
   const unreadJobEvents = unreadJobState.unreadEvents || 0;
@@ -1112,7 +1115,17 @@ async function handleWorkerDetail(workersDir, res, name) {
     responsibility: summarizeResponsibilities(responsibilities, { max: 5 }),
     responsibilities,
     jobCount: jobs.length,
-    jobs: jobs.map(summarizeJobForOverview),
+    jobs: jobs.map((job) => {
+      const unreadJob = unreadJobSummary.byJob.get(job.id);
+      return {
+        ...summarizeJobForOverview(job),
+        unreadBeforeOpen: Boolean(unreadJob?.unread),
+        unreadEventsBeforeOpen: Number(unreadJob?.unreadEvents || 0),
+        lastUnreadAt: unreadJob?.lastUnreadAt || null,
+      };
+    }),
+    unreadJobIds: (unreadJobState.jobs || []).map((item) => item.jobId).filter(Boolean),
+    unreadMessageIds: unreadIncomingMessages.map((m) => m.id).filter(Boolean),
     talkRequests: talkRequests.map((request) => ({
       id: request.id,
       status: request.status,
@@ -1145,9 +1158,10 @@ async function handleWorkerDetail(workersDir, res, name) {
       direction: m.to === name ? "in" : "out",
       createdAt: m.createdAt,
       read: m.read,
+      unreadBeforeOpen: unreadMessageIdsBeforeOpen.has(m.id),
       content: m.content,
     })),
-    tokenToday: tokenReport.workers[0]?.reported || null,
+    tokenToday: tokenReport?.workers[0]?.reported || null,
   });
 }
 

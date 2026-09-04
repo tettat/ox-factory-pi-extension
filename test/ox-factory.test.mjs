@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -172,6 +173,7 @@ import {
   isOutsourceJob,
   isOutsourceWorkerName,
   uniqueWorkers,
+  buildRouter,
   buildWorkersView,
   buildProjectStrips,
   computeReliableFinishedAt,
@@ -2640,6 +2642,108 @@ test("worker jobs can be bulk-marked read when opening worker detail", () => {
   }
 });
 
+test("worker detail snapshots unread talk items before auto-marking read", () => {
+  const webServerSource = readFileSync(join(testDir, "../web-server.mjs"), "utf8");
+  const webAppSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
+  const webStyleSource = readFileSync(join(testDir, "../web/styles.css"), "utf8");
+
+  assert.match(webServerSource, /unreadBeforeOpen:\s*Boolean\(unreadJob\?\.unread\)/);
+  assert.match(webServerSource, /unreadEventsBeforeOpen:\s*Number\(unreadJob\?\.unreadEvents/);
+  assert.match(webServerSource, /unreadMessageIds:\s*unreadIncomingMessages\.map/);
+  assert.match(webServerSource, /unreadBeforeOpen:\s*unreadMessageIdsBeforeOpen\.has\(m\.id\)/);
+
+  assert.match(webAppSource, /function talkUnreadBadge/);
+  assert.match(webAppSource, /talk-list__item--unread-before-open/);
+  assert.match(webAppSource, /talk-list__unread-badge/);
+  assert.match(webAppSource, /本次打开前/);
+  assert.match(webStyleSource, /\.talk-list__item--unread-before-open/);
+  assert.match(webStyleSource, /\.talk-list__unread-badge/);
+});
+
+test("web job drawer clears talk unread marker locally after view", () => {
+  const webAppSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
+
+  assert.match(webAppSource, /function markTalkJobReadLocally/);
+  assert.match(webAppSource, /data:\s*\{\s*jobId:\s*j\.id/);
+  assert.match(webAppSource, /talk-list__item--unread-before-open/);
+  assert.match(webAppSource, /talk-list__unread-badge/);
+  assert.match(webAppSource, /if \(d\.read\?\.marked\) \{/);
+  assert.match(webAppSource, /markTalkJobReadLocally\(d\.id \|\| id\)/);
+});
+
+test("worker detail API exposes unread snapshots before UI auto-mark-read", async () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-web-worker-detail-unread-api-test-"));
+  const handler = buildRouter({ workersDir });
+  const server = createServer((req, res) => handler(req, res));
+  try {
+    const job = createJob(workersDir, {
+      kind: "talk",
+      worker: "DesignerA",
+      project: "talk",
+      task: "做页面",
+    });
+    appendJobEvent(job, { type: "text", text: "第一段进度" });
+    updateJob(job, { status: "running" });
+    const message = sendAuthorizedMessage(workersDir, {
+      from: "秘书",
+      to: "DesignerA",
+      content: "请看一下最新需求",
+    });
+
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    const res = await fetch(`http://127.0.0.1:${address.port}/api/workers/${encodeURIComponent("DesignerA")}`);
+    assert.equal(res.ok, true);
+    const data = await res.json();
+
+    assert.equal(data.unreadMessages, 1);
+    assert.equal(data.unreadJobUpdates, 1);
+    assert.deepEqual(data.unreadJobIds, [job.id]);
+    assert.deepEqual(data.unreadMessageIds, [message.id]);
+    const apiJob = data.jobs.find((item) => item.id === job.id);
+    assert.equal(apiJob.unreadBeforeOpen, true);
+    assert.equal(apiJob.unreadEventsBeforeOpen, 1);
+    const apiMessage = data.inbox.find((item) => item.id === message.id);
+    assert.equal(apiMessage.read, false);
+    assert.equal(apiMessage.unreadBeforeOpen, true);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("worker detail API skips token aggregation by default and supports opt-in token payload", async () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-web-worker-detail-token-opt-in-test-"));
+  const handler = buildRouter({ workersDir });
+  const server = createServer((req, res) => handler(req, res));
+  try {
+    const job = createJob(workersDir, {
+      kind: "talk",
+      worker: "DesignerA",
+      project: "talk",
+      task: "做页面",
+    });
+    updateJob(job, { status: "done", inputTokens: 12, outputTokens: 3, totalTokens: 15 });
+
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    const base = `http://127.0.0.1:${address.port}/api/workers/${encodeURIComponent("DesignerA")}`;
+
+    const defaultRes = await fetch(base);
+    assert.equal(defaultRes.ok, true);
+    const defaultData = await defaultRes.json();
+    assert.equal(defaultData.tokenToday, null);
+
+    const tokenRes = await fetch(`${base}?includeToken=1`);
+    assert.equal(tokenRes.ok, true);
+    const tokenData = await tokenRes.json();
+    assert.equal(tokenData.tokenToday.totalTokens, 15);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
 test("web inbox messages can be marked read from the UI", () => {
   const webServerSource = readFileSync(join(testDir, "../web-server.mjs"), "utf8");
   const appSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
@@ -2668,6 +2772,16 @@ test("web inbox messages can be marked read from the UI", () => {
   assert.doesNotMatch(appSource, /cssEscape/);
   assert.match(appSource, /lastInteractionAt/);
   assert.match(appSource, /最近交互靠前/);
+});
+
+test("web worker detail uses lightweight default payloads for fast switching", () => {
+  const webServerSource = readFileSync(join(testDir, "../web-server.mjs"), "utf8");
+  const jobsSource = readFileSync(join(testDir, "../jobs.mjs"), "utf8");
+
+  assert.match(webServerSource, /includeToken\s*=\s*url\?\.searchParams\?\.get\("includeToken"\) === "1"/);
+  assert.match(webServerSource, /tokenToday:\s*tokenReport\?\.workers\[0\]\?\.reported \|\| null/);
+  assert.match(jobsSource, /const jobListCache = new Map\(\)/);
+  assert.match(jobsSource, /function listCachedJobs/);
 });
 
 test("worker list search is debounced name-only filtering without empty-state block", () => {

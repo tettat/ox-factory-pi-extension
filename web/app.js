@@ -991,6 +991,21 @@
     card.querySelector(".worker-card__badge--unread")?.remove();
   }
 
+  function decrementWorkerCardUnreadLocally(worker, amount = 1) {
+    const card = $$(".worker-card").find((item) => item.dataset.name === worker);
+    if (!card) return;
+    const nextUnread = Math.max(0, Number(card.dataset.unread || 0) - Math.max(1, Number(amount) || 1));
+    card.dataset.unread = String(nextUnread);
+    const badge = card.querySelector(".worker-card__badge--unread");
+    if (nextUnread > 0) {
+      card.classList.add("worker-card--unread");
+      if (badge) badge.textContent = nextUnread > 99 ? "99+" : String(nextUnread);
+    } else {
+      card.classList.remove("worker-card--unread");
+      badge?.remove();
+    }
+  }
+
   function unreadBadgeTitle(worker) {
     return `未读 job 更新 ${worker.unreadJobUpdates || 0} · 未读 event ${worker.unreadJobEvents || 0} · 最后未读 ${worker.lastUnreadAt ? fmtRelative(worker.lastUnreadAt) : "-"}`;
   }
@@ -1034,7 +1049,8 @@
     const defaultOpen = Boolean(opts.defaultOpen);
     const direction = m.direction || (m.to === (opts.worker || "") ? "in" : "out");
     const worker = opts.worker || "";
-    const unreadIncoming = showRead && m.read === false && worker && m.from !== worker && (m.to === worker || m.to === "*");
+    const unreadBeforeOpen = Boolean(m.unreadBeforeOpen);
+    const unreadIncoming = showRead && (m.read === false || unreadBeforeOpen) && worker && m.from !== worker && (m.to === worker || m.to === "*");
 
     // 预览（第一行 plain text，折叠时可见）
     const preview = String(m.content || "").replace(/\s+/g, " ").trim().slice(0, 120);
@@ -1046,14 +1062,18 @@
     headChildren.push(el("span", { class: "msg-list__peer", text: `${m.from} → ${m.to}` }));
     headChildren.push(el("span", { class: "msg-list__time", text: fmtRelative(m.createdAt) }));
     if (unreadIncoming) {
-      headChildren.push(el("span", { class: "msg-preview__unread", text: "未读" }));
+      headChildren.push(el("span", {
+        class: "msg-preview__unread",
+        text: unreadBeforeOpen && m.read !== false ? "打开前未读" : "未读",
+        title: "本次打开员工详情前尚未读过",
+      }));
     }
 
     // 详情项（原生 <details>，可折叠）
     const details = el("details", {
-      class: `msg-list__item msg-list__item--${direction}${unreadIncoming ? " msg-list__item--unread" : ""} ${defaultOpen ? "msg-list__item--open" : ""}`,
+      class: `msg-list__item msg-list__item--${direction}${unreadIncoming ? " msg-list__item--unread" : ""}${unreadBeforeOpen ? " msg-list__item--unread-before-open" : ""} ${defaultOpen ? "msg-list__item--open" : ""}`,
     });
-    if (unreadIncoming) {
+    if (unreadIncoming && m.read === false) {
       details.addEventListener("toggle", () => {
         if (!details.open || m.read || details.dataset.readPending === "1") return;
         void markMessageReadFromUi(m, details, worker);
@@ -2131,6 +2151,15 @@
     if (d.unreadCount && d.unreadCount > 0) {
       metaChildren.push(el("span", { class: "talk-panel__badge", text: `${d.unreadCount} 条未读` }));
     }
+    const unreadSnapshot = d.unreadBeforeOpen || {};
+    const unreadSnapshotTotal = Number(unreadSnapshot.total || 0);
+    if (unreadSnapshotTotal > 0) {
+      metaChildren.push(el("span", {
+        class: "talk-panel__badge talk-panel__badge--snapshot",
+        text: `本次打开前 ${unreadSnapshotTotal} 项未读`,
+        title: `消息 ${Number(unreadSnapshot.messages || 0)} · job ${Number(unreadSnapshot.jobUpdates || 0)} · event ${Number(unreadSnapshot.jobEvents || 0)}`,
+      }));
+    }
     card.appendChild(el("div", { class: "talk-panel__meta" }, metaChildren));
 
     // 输入区
@@ -2255,13 +2284,42 @@
     return Boolean(job?.id) && String(job.status || "") === "queued";
   }
 
+  function markTalkJobReadLocally(jobId) {
+    const id = String(jobId || "").trim();
+    if (!id) return 0;
+    let cleared = 0;
+    for (const item of $$(".talk-list__item[data-job-id]")) {
+      if (item.dataset.jobId !== id) continue;
+      if (item.classList.contains("talk-list__item--unread-before-open")) cleared += 1;
+      item.classList.remove("talk-list__item--unread-before-open");
+      item.dataset.unreadBeforeOpen = "0";
+      item.querySelector(".talk-list__unread-badge")?.remove();
+    }
+    return cleared;
+  }
+
+  function talkUnreadBadge(count, title = "本次打开员工详情前尚未看过的更新") {
+    const n = Number(count || 0);
+    return el("span", {
+      class: "talk-list__unread-badge",
+      text: n > 1 ? `未读×${n}` : "未读",
+      title,
+    });
+  }
+
   function renderTalkJobItem(worker, j) {
     const queued = isEditableQueuedJob(j);
-    return el("li", { class: "talk-list__item talk-list__item--job" }, [
+    const unreadBeforeOpen = Boolean(j.unreadBeforeOpen);
+    const unreadEventsBeforeOpen = Number(j.unreadEventsBeforeOpen || 0);
+    return el("li", {
+      class: `talk-list__item talk-list__item--job${unreadBeforeOpen ? " talk-list__item--unread-before-open" : ""}`,
+      data: { jobId: j.id || "", unreadBeforeOpen: unreadBeforeOpen ? "1" : "0" },
+    }, [
       el("div", { class: "talk-list__head" }, [
         statusPill(j.status),
         el("span", { class: "talk-list__id", text: (j.id || "").slice(-6) }),
         el("span", { class: "talk-list__time", text: fmtRelative(talkJobSortTime(j)) }),
+        unreadBeforeOpen ? talkUnreadBadge(unreadEventsBeforeOpen) : null,
         el("div", { class: "talk-list__actions" }, [
           el("button", { class: "btn btn--ghost talk-list__btn", type: "button", text: "查看", onclick: () => openJobDrawer(j.id) }),
           queued ? el("button", {
@@ -2470,6 +2528,12 @@
     const previousUnreadMessages = Number(d.unreadMessages || 0);
     const previousUnreadJobUpdates = Number(d.unreadJobUpdates || 0);
     const previousUnreadJobEvents = Number(d.unreadJobEvents || 0);
+    d.unreadBeforeOpen = {
+      messages: previousUnreadMessages,
+      jobUpdates: previousUnreadJobUpdates,
+      jobEvents: previousUnreadJobEvents,
+      total: previousUnreadMessages + previousUnreadJobUpdates,
+    };
     const hasUnreadForWorker = previousUnreadMessages > 0 || previousUnreadJobUpdates > 0 || previousUnreadJobEvents > 0;
     if (hasUnreadForWorker) {
       const marked = await markWorkerReadFromUi(name);
@@ -2724,6 +2788,10 @@
       return;
     }
     const d = res.data;
+    if (d.read?.marked) {
+      const cleared = markTalkJobReadLocally(d.id || id);
+      if (cleared > 0) decrementWorkerCardUnreadLocally(d.worker, cleared);
+    }
     body.innerHTML = "";
     body.appendChild(el("div", { class: "drawer__meta" }, [
 	      el("div", {}, [el("span", { class: "muted", text: "状态" }), statusPill(d.status)]),

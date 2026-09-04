@@ -4,6 +4,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -14,6 +15,94 @@ const MAX_LATEST_REPLY_CHARS = 8000;
 const MAX_EVENT_TEXT_CHARS = 1200;
 export const DEFAULT_JOB_HEARTBEAT_INTERVAL_MS = 5000;
 export const DEFAULT_JOB_HEARTBEAT_TIMEOUT_MS = 30000;
+const JOB_LIST_CACHE_TRUST_MS = 5000;
+const JOB_LIST_CACHE_DEEP_CHECK_MS = 30000;
+const JOB_LIST_VERSION_FILE = ".job-list-version";
+
+const jobListCache = new Map();
+
+function jobListVersionFile(jobsDir) {
+  return join(jobsDir, JOB_LIST_VERSION_FILE);
+}
+
+function touchJobListVersion(jobsDir) {
+  try {
+    writeFileSync(jobListVersionFile(jobsDir), `${Date.now()}\n`, "utf8");
+  } catch {
+    // Best-effort cache invalidation only. The next deep check still repairs.
+  }
+}
+
+function jobListShallowSignal(jobsDir) {
+  if (!existsSync(jobsDir)) return "missing";
+  try {
+    const stat = statSync(jobListVersionFile(jobsDir));
+    return `marker:${stat.size}:${Math.trunc(stat.mtimeMs)}`;
+  } catch {
+    // Older running processes may not write the marker yet. Directory stats are
+    // cheap and catch create/delete; existing-file updates are covered by the
+    // periodic deep check below.
+  }
+  try {
+    const stat = statSync(jobsDir);
+    return `dir:${stat.size}:${Math.trunc(stat.mtimeMs)}`;
+  } catch {
+    return "missing";
+  }
+}
+
+function jobListFingerprint(jobsDir) {
+  if (!existsSync(jobsDir)) return "missing";
+  const parts = [];
+  for (const name of readdirSync(jobsDir)) {
+    if (!name.endsWith(".json")) continue;
+    try {
+      const stat = statSync(join(jobsDir, name));
+      if (!stat.isFile()) continue;
+      parts.push(`${name}:${stat.size}:${Math.trunc(stat.mtimeMs)}`);
+    } catch {
+      parts.push(`${name}:missing`);
+    }
+  }
+  return parts.sort().join("|");
+}
+
+function cloneJob(job) {
+  return { ...job };
+}
+
+function listCachedJobs(workersDir) {
+  const { jobsDir } = ensureJobDirs(workersDir);
+  const now = Date.now();
+  const cached = jobListCache.get(jobsDir);
+  if (cached && now < cached.trustUntil) return cached.jobs;
+
+  const shallowSignal = jobListShallowSignal(jobsDir);
+  if (cached && cached.shallowSignal === shallowSignal && now < cached.deepCheckAfter) {
+    cached.trustUntil = now + JOB_LIST_CACHE_TRUST_MS;
+    return cached.jobs;
+  }
+
+  const fingerprint = jobListFingerprint(jobsDir);
+  if (cached?.fingerprint === fingerprint) {
+    cached.shallowSignal = shallowSignal;
+    cached.trustUntil = now + JOB_LIST_CACHE_TRUST_MS;
+    cached.deepCheckAfter = now + JOB_LIST_CACHE_DEEP_CHECK_MS;
+    return cached.jobs;
+  }
+  const jobs = readdirSync(jobsDir)
+    .filter((name) => name.endsWith(".json"))
+    .map((name) => readJob(join(jobsDir, name)))
+    .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+  jobListCache.set(jobsDir, {
+    fingerprint,
+    shallowSignal,
+    jobs,
+    trustUntil: now + JOB_LIST_CACHE_TRUST_MS,
+    deepCheckAfter: now + JOB_LIST_CACHE_DEEP_CHECK_MS,
+  });
+  return jobs;
+}
 
 export function nowIso() {
   return new Date().toISOString();
@@ -61,6 +150,9 @@ export function readJob(jobOrPath) {
 export function writeJob(job) {
   mkdirSync(join(job.jobFile, ".."), { recursive: true });
   writeFileSync(job.jobFile, `${JSON.stringify(job, null, 2)}\n`, "utf8");
+  const jobsDir = join(job.jobFile, "..");
+  jobListCache.delete(jobsDir);
+  touchJobListVersion(jobsDir);
 }
 
 export function updateJob(jobOrPath, patch) {
@@ -119,14 +211,11 @@ export function readJobEventsSince(jobOrPath, offset = 0, limit = 200) {
 }
 
 export function listJobs(workersDir, { worker, status, limit = 20 } = {}) {
-  const { jobsDir } = ensureJobDirs(workersDir);
-  const jobs = readdirSync(jobsDir)
-    .filter((name) => name.endsWith(".json"))
-    .map((name) => readJob(join(jobsDir, name)))
+  const jobs = listCachedJobs(workersDir)
     .filter((job) => !worker || job.worker === worker)
     .filter((job) => !status || job.status === status)
     .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
-  return jobs.slice(-limit);
+  return jobs.slice(-limit).map(cloneJob);
 }
 
 export function isTerminalJob(job) {
