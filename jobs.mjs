@@ -137,6 +137,7 @@ export function createJob(workersDir, input) {
     worker: input.worker,
     project: input.project || "",
     task: input.task || "",
+    attachments: Array.isArray(input.attachments) ? input.attachments.map((attachment) => ({ ...attachment })) : [],
     cwd: input.cwd || "",
     sessionFile: input.sessionFile || "",
     status: "queued",

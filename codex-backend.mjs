@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { buildWorkerSystemPrompt, buildWorkerTaskPrompt } from "./worker-prompts.mjs";
+import { buildCodexTurnInput } from "./talk-attachments.mjs";
 
 export const DEFAULT_CODEX_SERVER_URL = "ws://127.0.0.1:48177";
 
@@ -588,7 +589,7 @@ async function ensureThread(client, { worker, cwd, agentDef, workersDir, onWorke
 }
 
 export async function runCodexWorkerStreaming(options, onEvent) {
-  const { worker, task, project, cwd, additionalContext, signal, agentDef, workersDir, onWorkerPatch } = options;
+  const { worker, task, project, cwd, additionalContext, attachments = [], signal, agentDef, workersDir, onWorkerPatch } = options;
   const url = getCodexServerUrl(worker);
   const model = normalizeCodexModel(worker.model);
   if (model && model !== worker.model) {
@@ -663,7 +664,10 @@ export async function runCodexWorkerStreaming(options, onEvent) {
 
     const start = await client.request("turn/start", {
       threadId,
-      input: [{ type: "text", text: buildCodexTaskContent({ worker, task, project, additionalContext, workersDir }), text_elements: [] }],
+      input: buildCodexTurnInput(
+        buildCodexTaskContent({ worker, task, project, additionalContext, workersDir }),
+        attachments,
+      ),
       cwd: cwd || process.cwd(),
       model: model || null,
       effort: normalizeCodexEffort(worker.thinking),
@@ -730,7 +734,7 @@ export async function runCodexWorkerStreaming(options, onEvent) {
 }
 
 export async function steerCodexWorker(options, onEvent) {
-  const { worker, task, workersDir } = options;
+  const { worker, task, attachments = [], workersDir } = options;
   if (!worker.codexThreadId || !worker.codexActiveTurnId) {
     throw new Error(`Codex worker ${worker.id} has no active turn to steer`);
   }
@@ -745,7 +749,7 @@ export async function steerCodexWorker(options, onEvent) {
     await client.request("turn/steer", {
       threadId: worker.codexThreadId,
       expectedTurnId: worker.codexActiveTurnId,
-      input: [{ type: "text", text: task, text_elements: [] }],
+      input: buildCodexTurnInput(task, attachments),
     });
     const text = `Steer accepted for active turn ${worker.codexActiveTurnId}`;
     onEvent?.({ type: "text", text });

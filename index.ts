@@ -141,6 +141,10 @@ import {
   listPendingWebTalkJobControlRequests,
 } from "./web-talk.mjs";
 import {
+  assertTalkImageBackendSupported,
+  materializeTalkAttachments,
+} from "./talk-attachments.mjs";
+import {
   acceptMainAgentTalkRequest,
   claimMainAgentTalkRequest,
   failMainAgentTalkRequest,
@@ -980,16 +984,24 @@ export default function (pi: ExtensionAPI) {
             });
             continue;
           }
-          if (!message) {
+          const attachments = materializeTalkAttachments(getWorkersDir(), request.attachments || [], {
+            requestId: request.id,
+          });
+          assertTalkImageBackendSupported(w?.backend ?? "pi", attachments);
+          if (!message && attachments.length === 0) {
             failWebTalkRequest(getWorkersDir(), {
               requestId: request.id,
-              error: "web talk 消息为空",
+              error: "web talk 消息和图片都为空",
             });
             continue;
           }
 
           const requestedMode = request.mode === "queue" || request.mode === "steer" ? request.mode : undefined;
-          const job = startTalkMessage(w!, message, ctx, requestedMode, { attach: false, notify: false });
+          const job = startTalkMessage(w!, message, ctx, requestedMode, {
+            attach: false,
+            notify: false,
+            attachments,
+          });
           if (!job) {
             failWebTalkRequest(getWorkersDir(), {
               requestId: request.id,
@@ -2735,7 +2747,7 @@ export default function (pi: ExtensionAPI) {
     msg: string,
     ctx?: any,
     requestedMode?: TalkDeliveryMode,
-    options: { attach?: boolean; notify?: boolean } = {},
+    options: { attach?: boolean; notify?: boolean; attachments?: SpawnOptions["attachments"] } = {},
   ) {
     w = recoverWorkerFromRegistrySnapshot(w.id) || w;
     const availability = workerCanAcceptWork(w, w.id);
@@ -2748,12 +2760,15 @@ export default function (pi: ExtensionAPI) {
     const deliveryMode: TalkDeliveryMode = requestedMode ?? (busy ? "queue" : "message");
     const runningJob = openBefore.find((candidate: any) => candidate.status === "running") ?? openBefore[0];
     const steerInline = deliveryMode === "steer" && canSteerActiveCodexTurn(w);
+    const attachments = options.attachments || [];
+    assertTalkImageBackendSupported(w.backend ?? "pi", attachments);
 
     const job = createJob(getWorkersDir(), {
       kind: "talk",
       worker: w.id,
       project: "talk",
       task: msg,
+      attachments: attachments.map(({ path: _path, ...attachment }) => attachment),
       cwd: process.cwd(),
       sessionFile: w.sessionFile,
     });
@@ -2767,7 +2782,12 @@ export default function (pi: ExtensionAPI) {
       text: steerInline ? `codex steer injected into active turn ${w.codexActiveTurnId}` : busy ? `${deliveryMode} queued behind ${job.queuedBehind || "current job"}` : `${deliveryMode} starts immediately`,
     });
     if (deliveryMode === "steer" && runningJob) {
-      appendJobEvent(runningJob, { type: "steer", text: msg, queuedJobId: job.id });
+      appendJobEvent(runningJob, {
+        type: "steer",
+        text: msg,
+        queuedJobId: job.id,
+        attachmentIds: attachments.map((attachment) => attachment.id),
+      });
     }
 
     const attachToCurrentTalk = options.attach !== false;
@@ -2801,7 +2821,7 @@ export default function (pi: ExtensionAPI) {
 
     try {
       const handle = startWorkerJobQueued(
-        { worker: w, task: msg, project: "talk", signal: undefined as any, deliveryMode },
+        { worker: w, task: msg, project: "talk", attachments, signal: undefined as any, deliveryMode },
         job,
         (ev) => {
           queueTalkLive(w.id, job, ev);

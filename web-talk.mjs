@@ -1,5 +1,6 @@
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { TALK_IMAGE_MAX_COUNT } from "./talk-attachments.mjs";
 
 function nowIso() {
   return new Date().toISOString();
@@ -10,6 +11,22 @@ function randomId(prefix = "wtalk") {
 }
 
 const REQUEST_EVENT_TYPES = new Set(["request", "request_v2"]);
+
+function normalizeAttachments(value) {
+  if (value == null) return [];
+  if (!Array.isArray(value)) throw new Error("attachments 必须是数组");
+  const byId = new Map();
+  for (const attachment of value) {
+    const id = String(attachment?.id || "").trim();
+    if (!id) throw new Error("attachment id 不能为空");
+    byId.set(id, { ...attachment, id });
+  }
+  const attachments = [...byId.values()];
+  if (attachments.length > TALK_IMAGE_MAX_COUNT) {
+    throw new Error(`每条消息最多 ${TALK_IMAGE_MAX_COUNT} 张图片`);
+  }
+  return attachments;
+}
 
 export function webTalkRequestsFile(workersDir) {
   return join(workersDir, "web-talk-requests.jsonl");
@@ -98,10 +115,11 @@ function releaseRequestLock(workersDir, requestId, fd) {
 export function createWebTalkRequest(workersDir, input) {
   const worker = String(input?.worker || "").trim();
   const message = String(input?.message || "").trim();
+  const attachments = normalizeAttachments(input?.attachments);
   const from = String(input?.from || "web").trim() || "web";
   const mode = normalizeWebTalkMode(input?.mode || input?.deliveryMode || "auto");
   if (!worker) throw new Error("worker 不能为空");
-  if (!message) throw new Error("message 不能为空");
+  if (!message && attachments.length === 0) throw new Error("message 或 attachments 至少需要一个");
   const request = {
     type: "request_v2",
     protocolVersion: 2,
@@ -110,6 +128,7 @@ export function createWebTalkRequest(workersDir, input) {
     from,
     worker,
     message,
+    attachments,
     mode,
     createdAt: nowIso(),
   };
@@ -160,7 +179,7 @@ export function listWebTalkRequests(workersDir, { worker, limit = 200 } = {}) {
       });
     } else if (event.type === "edited") {
       Object.assign(state, {
-        message: event.message || state.message,
+        message: Object.prototype.hasOwnProperty.call(event, "message") ? event.message : state.message,
         mode: event.mode || state.mode || "auto",
         editedAt: event.editedAt,
         editedBy: event.from || null,
@@ -257,7 +276,9 @@ export function editWebTalkRequest(workersDir, { requestId, message, mode, from 
   const request = requirePendingWebTalkRequest(workersDir, requestId);
   const nextMessage = message == null ? request.message : String(message || "").trim();
   const nextMode = mode == null ? request.mode || "auto" : normalizeWebTalkMode(mode);
-  if (!nextMessage) throw new Error("message 不能为空");
+  if (!nextMessage && (!request.attachments || request.attachments.length === 0)) {
+    throw new Error("message 或 attachments 至少需要一个");
+  }
   const event = {
     type: "edited",
     requestId: request.id,

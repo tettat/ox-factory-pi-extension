@@ -36,12 +36,22 @@ import {
   createWebTalkRequest,
   createWebTalkJobControlRequest,
   editWebTalkRequest,
+  failWebTalkRequest,
   getWebTalkJobControlRequest,
   getWebTalkRequest,
   listWebTalkJobControlRequests,
   listWebTalkRequests,
   normalizeWebTalkMode,
 } from "./web-talk.mjs";
+import {
+  TALK_IMAGE_MAX_BYTES,
+  assertTalkAttachmentsUnbound,
+  assertTalkImageBackendSupported,
+  bindTalkAttachments,
+  createTalkAttachment,
+  resolveTalkAttachmentIds,
+  talkAttachmentContentPath,
+} from "./talk-attachments.mjs";
 import {
   buildWorkerJobUnreadSummary,
   markWebJobRead,
@@ -298,12 +308,26 @@ function summarizeJobForOverview(job) {
     returnTo: job.returnTo || "",
     model: job.model || null,
     task: compactText(job.task || "", 80),
+    attachments: summarizeTalkAttachments(job.attachments),
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
     finishedAt: job.finishedAt,
     summary: compactText(job.summary || "", 200),
     error: compactText(job.error || "", 200),
   };
+}
+
+function summarizeTalkAttachments(attachments) {
+  if (!Array.isArray(attachments)) return [];
+  return attachments
+    .filter((attachment) => attachment?.id)
+    .map((attachment) => ({
+      id: attachment.id,
+      name: attachment.name || "图片",
+      mimeType: attachment.mimeType || "application/octet-stream",
+      size: Number(attachment.size) || 0,
+      contentUrl: `/api/talk-attachments/${encodeURIComponent(attachment.id)}/content`,
+    }));
 }
 
 function compactText(value, max = 160) {
@@ -698,6 +722,16 @@ export function buildRouter({ workersDir }) {
       res.end();
       return;
     }
+    // POST /api/talk-attachments 接受单张图片原始二进制。
+    if (method === "POST" && pathname === "/api/talk-attachments") {
+      try {
+        return await handleTalkAttachmentUpload(workersDir, req, res, url);
+      } catch (err) {
+        const message = err?.message || String(err);
+        const status = /过大|too large/i.test(message) ? 413 : 400;
+        return errorResponse(res, status, "上传图片失败", message);
+      }
+    }
     // /api/talk/:worker 与 /api/main-agent/talk 接受 POST；其余仍只 GET
     if (method === "POST" && pathname.startsWith("/api/talk/")) {
       try {
@@ -823,6 +857,9 @@ export function buildRouter({ workersDir }) {
 
     try {
       if (pathname === "/api/health") return handleHealth(res);
+      if (pathname.startsWith("/api/talk-attachments/")) {
+        return await handleTalkAttachmentContent(workersDir, res, pathname);
+      }
       if (pathname.startsWith("/api/avatars/")) return await handleAvatarAsset(workersDir, res, pathname);
       if (pathname === "/api/overview") return await handleOverview(workersDir, res);
       if (pathname === "/api/workers") return await handleWorkers(workersDir, res);
@@ -921,6 +958,42 @@ async function readJsonBody(req, maxBytes = 64 * 1024) {
   });
 }
 
+async function readBinaryBody(req, maxBytes = TALK_IMAGE_MAX_BYTES) {
+  return new Promise((resolve, reject) => {
+    const contentLength = Number(req.headers["content-length"] || 0);
+    if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+      req.resume();
+      reject(new Error(`图片过大，单张不能超过 ${maxBytes / 1024 / 1024} MiB`));
+      return;
+    }
+    let len = 0;
+    const chunks = [];
+    let settled = false;
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      chunks.length = 0;
+      reject(error);
+    };
+    req.on("data", (chunk) => {
+      if (settled) return;
+      len += chunk.length;
+      if (len > maxBytes) {
+        fail(new Error(`图片过大，单张不能超过 ${maxBytes / 1024 / 1024} MiB`));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      if (settled) return;
+      settled = true;
+      resolve(Buffer.concat(chunks));
+    });
+    req.on("aborted", () => fail(new Error("图片上传已中断")));
+    req.on("error", fail);
+  });
+}
+
 function handleHealth(res) {
   return jsonResponse(res, 200, {
     ok: true,
@@ -933,6 +1006,7 @@ function handleHealth(res) {
       compactJobTimeline: true,
       mainAgentTalk: true,
       workerTalkRequests: true,
+      workerTalkImages: true,
     },
     timestamp: new Date().toISOString(),
   });
@@ -1133,6 +1207,7 @@ async function handleWorkerDetail(workersDir, res, name, url = null) {
       from: request.from || null,
       source: request.source || null,
       message: request.message || "",
+      attachments: summarizeTalkAttachments(request.attachments),
       mode: request.mode || "auto",
       deliveryMode: request.deliveryMode || request.resolvedMode || null,
       placement: request.placement || null,
@@ -1237,6 +1312,7 @@ async function handleJobDetail(workersDir, res, id, url = null) {
     assignedBy: job.assignedBy || "",
     returnTo: job.returnTo || "",
     task: job.task,
+    attachments: summarizeTalkAttachments(job.attachments),
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
     startedAt: job.startedAt,
@@ -1530,6 +1606,54 @@ async function handleProjects(workersDir, res) {
 // - 因此这里不再直接 createJob，避免制造永远没人执行的 queued 悬空 job。
 // - 这里只写 web-talk intent；Pi 主进程 reload 后会轮询并调用正常 /talk 背后的
 //   startTalkMessage(worker, message)，从而复用同一套空闲/忙碌排队/事件/记忆机制。
+async function handleTalkAttachmentUpload(workersDir, req, res, url) {
+  const declaredMimeType = String(req.headers["content-type"] || "").trim();
+  const originalName = String(url.searchParams.get("name") || "image").trim();
+  const data = await readBinaryBody(req);
+  const attachment = createTalkAttachment(workersDir, {
+    data,
+    declaredMimeType,
+    originalName,
+  });
+  return jsonResponse(res, 201, {
+    ok: true,
+    attachment: {
+      id: attachment.id,
+      name: attachment.name,
+      mimeType: attachment.mimeType,
+      size: attachment.size,
+      createdAt: attachment.createdAt,
+      contentUrl: `/api/talk-attachments/${encodeURIComponent(attachment.id)}/content`,
+    },
+  });
+}
+
+async function handleTalkAttachmentContent(workersDir, res, pathname) {
+  const match = pathname.match(/^\/api\/talk-attachments\/([^/]+)\/content$/);
+  if (!match) return notFound(res, "图片附件路径格式错误");
+  let attachment;
+  let filePath;
+  try {
+    attachment = resolveTalkAttachmentIds(workersDir, [decodeURIComponent(match[1])])[0];
+    filePath = talkAttachmentContentPath(workersDir, attachment.id);
+  } catch (err) {
+    return notFound(res, err?.message || "图片附件不存在");
+  }
+  try {
+    const data = readFileSync(filePath);
+    res.writeHead(200, {
+      "content-type": attachment.mimeType,
+      "content-length": String(data.length),
+      "cache-control": "private, no-store",
+      "x-content-type-options": "nosniff",
+      "content-disposition": `inline; filename*=UTF-8''${encodeURIComponent(attachment.name)}`,
+    });
+    res.end(data);
+  } catch (err) {
+    return errorResponse(res, 500, "读取图片附件失败", err?.message || String(err));
+  }
+}
+
 async function handleTalkMessage(workersDir, res, pathname, body) {
   const m = pathname.match(/^\/api\/talk\/(.+)$/);
   if (!m) return notFound(res, "路径格式错误");
@@ -1549,7 +1673,15 @@ async function handleTalkMessage(workersDir, res, pathname, body) {
     return badRequest(res, `员工 ${worker} 已离职，不能对话。`);
   }
   const message = String(body?.message ?? "").trim();
-  if (!message) return badRequest(res, "message 不能为空");
+  let attachments;
+  try {
+    attachments = resolveTalkAttachmentIds(workersDir, body?.attachmentIds || []);
+    assertTalkImageBackendSupported(regInfo?.backend || "pi", attachments);
+    assertTalkAttachmentsUnbound(workersDir, attachments);
+  } catch (err) {
+    return badRequest(res, err?.message || String(err));
+  }
+  if (!message && attachments.length === 0) return badRequest(res, "message 或图片至少需要一个");
   if (message.length > 16000) return badRequest(res, "message 过长 (>16000)");
   let mode = "auto";
   try {
@@ -1564,7 +1696,15 @@ async function handleTalkMessage(workersDir, res, pathname, body) {
       message,
       from: String(body?.from || "web").trim() || "web",
       mode,
+      attachments,
     });
+    let boundAttachments;
+    try {
+      boundAttachments = bindTalkAttachments(workersDir, attachments, { requestId: request.id });
+    } catch (error) {
+      failWebTalkRequest(workersDir, { requestId: request.id, error: error?.message || String(error) });
+      throw error;
+    }
     return jsonResponse(res, 202, {
       ok: true,
       request: {
@@ -1572,6 +1712,13 @@ async function handleTalkMessage(workersDir, res, pathname, body) {
         status: request.status,
         worker: request.worker,
         message: request.message,
+        attachments: boundAttachments.map((attachment) => ({
+          id: attachment.id,
+          name: attachment.name,
+          mimeType: attachment.mimeType,
+          size: attachment.size,
+          contentUrl: `/api/talk-attachments/${encodeURIComponent(attachment.id)}/content`,
+        })),
         mode: request.mode,
         createdAt: request.createdAt,
       },

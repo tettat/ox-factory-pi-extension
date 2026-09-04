@@ -11,6 +11,9 @@
   const LANG_STORAGE_KEY = "oxFactoryLang";
   const NOTIFICATION_LAST_SEEN_KEY = "oxFactoryNotificationsLastSeen";
   const NOTIFICATION_SPOKEN_IDS_KEY = "oxFactoryNotificationsSpokenIds";
+  const TALK_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"]);
+  const TALK_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
+  const TALK_IMAGE_MAX_COUNT = 6;
   const I18N = {
     zh: {
       "app.title": "牛马工厂 · 驾驶舱",
@@ -2128,6 +2131,56 @@
     queueMicrotask(() => filterWorkerCards(""));
   }
 
+  function talkAttachmentUrl(attachment) {
+    if (attachment?.contentUrl) return attachment.contentUrl;
+    if (!attachment?.id) return "";
+    return `/api/talk-attachments/${encodeURIComponent(attachment.id)}/content`;
+  }
+
+  function formatTalkAttachmentSize(value) {
+    const bytes = Number(value) || 0;
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KiB`;
+    return `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
+  }
+
+  function talkAttachmentNodes(attachments = [], { preview = false, onRemove } = {}) {
+    if (!Array.isArray(attachments) || attachments.length === 0) return null;
+    return el("div", {
+      class: `talk-attachments${preview ? " talk-panel__attachment-preview" : ""}`,
+    }, attachments.map((attachment, index) => {
+      const src = preview ? attachment.previewUrl : talkAttachmentUrl(attachment);
+      return el("figure", { class: "talk-attachment" }, [
+        src ? el("a", {
+          class: "talk-attachment__link",
+          href: src,
+          target: "_blank",
+          rel: "noreferrer",
+          title: attachment.name || "查看图片",
+        }, [
+          el("img", {
+            class: "talk-attachment__image",
+            src,
+            alt: attachment.name || "对话图片",
+            loading: preview ? "eager" : "lazy",
+          }),
+        ]) : null,
+        el("figcaption", { class: "talk-attachment__caption" }, [
+          el("span", { class: "talk-attachment__name", text: attachment.name || `图片 ${index + 1}` }),
+          attachment.size != null ? el("span", { class: "talk-attachment__size", text: formatTalkAttachmentSize(attachment.size) }) : null,
+        ]),
+        preview && onRemove ? el("button", {
+          class: "talk-attachment__remove",
+          type: "button",
+          text: "×",
+          title: "移除图片",
+          "aria-label": `移除 ${attachment.name || `图片 ${index + 1}`}`,
+          onclick: () => onRemove(index),
+        }) : null,
+      ]);
+    }));
+  }
+
 // 和 TA 对话 · Web 版 /talk 员工名
   // 后端走 web-talk 流程：POST /api/talk → createWebTalkRequest (pending)，
   // Pi 主进程接管后转为 accepted (创建 talk job)、done / failed / cancelled。
@@ -2163,11 +2216,34 @@
     card.appendChild(el("div", { class: "talk-panel__meta" }, metaChildren));
 
     // 输入区
+    const pendingImages = [];
+    const backend = String(d.backend || "pi").toLowerCase();
+    const supportsImages = backend === "pi" || backend === "codex";
     const textarea = el("textarea", {
       class: "input talk-panel__input",
       id: `talkInput-${worker}`,
       placeholder: `输入要发送给 ${worker} 的消息…（Ctrl+Enter 发送）`,
       rows: 4,
+    });
+    const imageInput = el("input", {
+      class: "talk-panel__file-input",
+      type: "file",
+      accept: "image/png,image/jpeg,image/webp,image/gif",
+      multiple: "multiple",
+      tabindex: "-1",
+      "aria-hidden": "true",
+    });
+    const attachBtn = el("button", {
+      class: "btn btn--ghost talk-panel__attach",
+      type: "button",
+      text: "＋ 图片",
+      disabled: !supportsImages,
+      title: supportsImages ? "选择图片，也可以直接粘贴到输入框" : `${backend} 后端暂不支持图片输入`,
+      onclick: () => imageInput.click(),
+    });
+    const attachmentPreview = el("div", {
+      class: "talk-panel__attachment-preview-wrap",
+      hidden: "hidden",
     });
     const sendBtn = el("button", {
       class: "btn btn--primary",
@@ -2185,13 +2261,16 @@
       el("option", { value: "queue", text: "排队 (queue)", ...(STATE.talkMode === "queue" ? { selected: "selected" } : {}) }),
       el("option", { value: "steer", text: "插队 (steer)", ...(STATE.talkMode === "steer" ? { selected: "selected" } : {}) }),
     ]);
-    const hint = el("p", { class: "muted talk-panel__hint", html: md("**auto** 空闲马上起、忙碌排队 · **queue** 强制排队 · **steer** 优先插入 Codex active turn。", { compact: true, max: 240 }) });
+    const hintText = supportsImages
+      ? "**图片** 支持选择或粘贴（最多 6 张、每张 10 MiB） · **auto** 空闲马上起、忙碌排队 · **queue** 强制排队 · **steer** 优先插入 Codex active turn。"
+      : `当前 **${backend}** 后端暂不支持图片 · **auto** 空闲马上起、忙碌排队 · **queue** 强制排队。`;
+    const hint = el("p", { class: "muted talk-panel__hint", html: md(hintText, { compact: true, max: 320 }) });
 
     // 提示：API 调用状态
     const feedback = el("div", { class: "talk-panel__feedback", id: `talkFeedback-${worker}` });
     const sendRow = el("div", { class: "talk-panel__row" }, [
-      textarea,
-      el("div", { class: "talk-panel__actions" }, [modeSel, sendBtn, feedback]),
+      el("div", { class: "talk-panel__compose" }, [textarea, imageInput, attachmentPreview]),
+      el("div", { class: "talk-panel__actions" }, [modeSel, attachBtn, sendBtn, feedback]),
     ]);
     card.appendChild(sendRow);
     card.appendChild(hint);
@@ -2200,25 +2279,133 @@
     const historyBox = el("div", { class: "talk-panel__history", id: `talkHistory-${worker}` }, [el("p", { class: "muted", text: "加载中…" })]);
     card.appendChild(historyBox);
 
+    const showFeedbackError = (message) => {
+      feedback.textContent = `❌ ${message}`;
+      feedback.className = "talk-panel__feedback talk-panel__feedback--error";
+    };
+
+    const apiDetailMessage = (detail, fallback) => {
+      if (typeof detail === "string") return detail;
+      return detail?.error?.message || detail?.detail || fallback;
+    };
+
+    const renderPendingImages = () => {
+      attachmentPreview.innerHTML = "";
+      attachmentPreview.hidden = pendingImages.length === 0;
+      if (!pendingImages.length) return;
+      attachmentPreview.appendChild(talkAttachmentNodes(pendingImages, {
+        preview: true,
+        onRemove: (index) => {
+          const [removed] = pendingImages.splice(index, 1);
+          if (removed?.previewUrl) URL.revokeObjectURL(removed.previewUrl);
+          renderPendingImages();
+        },
+      }));
+    };
+
+    const addImageFiles = (files) => {
+      if (!supportsImages) {
+        showFeedbackError(`${backend} 后端暂不支持图片输入，请改用 Pi 或 Codex 员工`);
+        return;
+      }
+      let error = "";
+      for (const file of Array.from(files || [])) {
+        if (!TALK_IMAGE_TYPES.has(file.type)) {
+          error = "仅支持 PNG、JPEG、WebP、GIF 图片";
+          continue;
+        }
+        if (file.size > TALK_IMAGE_MAX_BYTES) {
+          error = `${file.name || "图片"} 超过 10 MiB`;
+          continue;
+        }
+        if (pendingImages.length >= TALK_IMAGE_MAX_COUNT) {
+          error = `每条消息最多 ${TALK_IMAGE_MAX_COUNT} 张图片`;
+          break;
+        }
+        pendingImages.push({
+          file,
+          name: file.name || `粘贴图片-${pendingImages.length + 1}.png`,
+          size: file.size,
+          mimeType: file.type,
+          previewUrl: URL.createObjectURL(file),
+          remote: null,
+        });
+      }
+      renderPendingImages();
+      if (error) showFeedbackError(error);
+      else if (pendingImages.length) {
+        feedback.textContent = `已添加 ${pendingImages.length} 张图片`;
+        feedback.className = "talk-panel__feedback";
+      }
+      imageInput.value = "";
+    };
+
+    imageInput.addEventListener("change", () => addImageFiles(imageInput.files));
+    textarea.addEventListener("paste", (event) => {
+      const files = Array.from(event.clipboardData?.items || [])
+        .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+        .map((item) => item.getAsFile())
+        .filter(Boolean);
+      if (!files.length) return;
+      if (!supportsImages) {
+        addImageFiles(files);
+        return;
+      }
+      event.preventDefault();
+      addImageFiles(files);
+    });
+
+    const uploadPendingImages = async () => {
+      for (let index = 0; index < pendingImages.length; index++) {
+        const item = pendingImages[index];
+        if (item.remote?.id) continue;
+        feedback.textContent = `上传图片 ${index + 1}/${pendingImages.length}…`;
+        const upload = await api(`/api/talk-attachments?name=${encodeURIComponent(item.name)}`, {
+          method: "POST",
+          headers: { "Content-Type": item.mimeType },
+          body: item.file,
+        });
+        if (!upload.ok || !upload.data?.attachment?.id) {
+          throw new Error(apiDetailMessage(upload.detail, `${item.name} 上传失败`));
+        }
+        item.remote = upload.data.attachment;
+      }
+      return pendingImages.map((item) => item.remote.id);
+    };
+
     // 点击发送
     const send = async () => {
       const msg = (textarea.value || "").trim();
-      if (!msg) { feedback.textContent = "消息不能为空"; feedback.className = "talk-panel__feedback talk-panel__feedback--error"; return; }
+      if (!msg && pendingImages.length === 0) {
+        showFeedbackError("消息或图片至少需要一个");
+        return;
+      }
       sendBtn.disabled = true;
+      attachBtn.disabled = true;
       sendBtn.textContent = "发送中…";
       feedback.textContent = "";
       feedback.className = "talk-panel__feedback";
       const mode = document.getElementById(`talkMode-${worker}`)?.value || "auto";
+      let attachmentIds;
+      try {
+        attachmentIds = await uploadPendingImages();
+      } catch (error) {
+        sendBtn.disabled = false;
+        attachBtn.disabled = !supportsImages;
+        sendBtn.textContent = "发送";
+        showFeedbackError(error?.message || "图片上传失败");
+        return;
+      }
       const res = await api(`/api/talk/${encodeURIComponent(worker)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: msg, mode }),
+        body: JSON.stringify({ message: msg, mode, attachmentIds }),
       });
       sendBtn.disabled = false;
+      attachBtn.disabled = !supportsImages;
       sendBtn.textContent = "发送";
       if (!res.ok) {
-        feedback.textContent = `❌ ${(res.detail && (res.detail.error?.message || res.detail)) || "发送失败"}`;
-        feedback.className = "talk-panel__feedback talk-panel__feedback--error";
+        showFeedbackError(apiDetailMessage(res.detail, "发送失败"));
         return;
       }
       const requestId = res.data?.request?.id;
@@ -2228,6 +2415,11 @@
         : "✓ 已提交，等待 Pi 主进程接管…";
       feedback.className = "talk-panel__feedback talk-panel__feedback--ok";
       textarea.value = "";
+      for (const item of pendingImages) {
+        if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+      }
+      pendingImages.length = 0;
+      renderPendingImages();
       void refreshWorkerUnreadBadges();
       if (requestId) await waitTalkRequest(worker, requestId, feedback);
       await reloadTalkHistory(worker);
@@ -2337,7 +2529,8 @@
         ]),
       ]),
       (j.assignedBy || j.source) ? el("div", { class: "talk-list__meta", text: [j.assignedBy ? `指派: ${j.assignedBy}` : "", j.source ? `来源: ${j.source}` : ""].filter(Boolean).join(" · ") }) : null,
-      el("div", { class: "talk-list__task", text: j.task || "" }),
+      j.task ? el("div", { class: "talk-list__task", text: j.task }) : null,
+      talkAttachmentNodes(j.attachments || []),
     ]);
   }
 
@@ -2384,7 +2577,8 @@
           request.error ? `错误: ${request.error}` : "",
         ].filter(Boolean).join(" · "),
       }),
-      el("div", { class: "talk-list__task", text: request.message || "" }),
+      request.message ? el("div", { class: "talk-list__task", text: request.message }) : null,
+      talkAttachmentNodes(request.attachments || []),
     ]);
   }
 
@@ -2818,6 +3012,7 @@
     body.appendChild(el("div", { class: "drawer__section" }, [
       el("h4", { text: "任务" }),
       d.task ? mdNode(d.task) : el("p", { class: "prose", text: "—" }),
+      talkAttachmentNodes(d.attachments || []),
     ]));
     const replyText = d.fullReply || d.latestReply || d.summary || "";
     if (replyText) {

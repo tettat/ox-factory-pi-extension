@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -176,6 +176,7 @@ import {
   buildRouter,
   buildWorkersView,
   buildProjectStrips,
+  buildRouter,
   computeReliableFinishedAt,
   computeReliableElapsedMs,
   serializeOutsourceRun,
@@ -198,6 +199,16 @@ import {
   listWebTalkRequests,
   webTalkRequestsFile,
 } from "../web-talk.mjs";
+import {
+  TALK_IMAGE_MAX_BYTES,
+  bindTalkAttachments,
+  buildPiAttachmentArgs,
+  cleanupUnboundTalkAttachments,
+  createTalkAttachment,
+  materializeTalkAttachments,
+  resolveTalkAttachmentIds,
+  talkAttachmentContentPath,
+} from "../talk-attachments.mjs";
 import {
   buildWorkerJobUnreadSummary,
   markWorkerJobsRead,
@@ -2497,13 +2508,259 @@ test("web talk requests are event-sourced and do not create jobs in web-server",
     assert.match(indexSource, /listPendingWebTalkRequests/);
     assert.match(indexSource, /claimWebTalkRequest/);
     assert.match(indexSource, /const requestedMode = request\.mode === "queue" \|\| request\.mode === "steer" \? request\.mode : undefined/);
-    assert.match(indexSource, /startTalkMessage\(w!, message, ctx, requestedMode, \{ attach: false, notify: false \}\)/);
-    assert.match(indexSource, /options:\s*\{ attach\?: boolean; notify\?: boolean \}/);
+    assert.match(indexSource, /startTalkMessage\(w!, message, ctx, requestedMode, \{[\s\S]{0,160}attach: false,[\s\S]{0,160}notify: false,[\s\S]{0,160}attachments/);
+    assert.match(indexSource, /options:\s*\{ attach\?: boolean; notify\?: boolean; attachments\?: SpawnOptions\["attachments"\] \}/);
     assert.match(indexSource, /const notifyConsole = options\.notify !== false/);
     assert.match(indexSource, /if \(notifyConsole\) ctx\?\.ui\?\.notify/);
   } finally {
     rmSync(workersDir, { recursive: true, force: true });
   }
+});
+
+test("talk image attachments are validated, persisted, resolved, and bound", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-talk-image-test-"));
+  try {
+    const png = Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      Buffer.from("image payload"),
+    ]);
+    const attachment = createTalkAttachment(workersDir, {
+      data: png,
+      declaredMimeType: "image/png",
+      originalName: "页面截图.png",
+    });
+
+    assert.match(attachment.id, /^timg_/);
+    assert.equal(attachment.name, "页面截图.png");
+    assert.equal(attachment.mimeType, "image/png");
+    assert.equal(attachment.size, png.length);
+    assert.deepEqual(readFileSync(talkAttachmentContentPath(workersDir, attachment.id)), png);
+
+    const resolved = resolveTalkAttachmentIds(workersDir, [attachment.id]);
+    assert.equal(resolved.length, 1);
+    assert.equal(resolved[0].id, attachment.id);
+    assert.equal(resolved[0].boundAt, undefined);
+
+    const bound = bindTalkAttachments(workersDir, resolved, { requestId: "request-1" });
+    assert.equal(bound[0].requestId, "request-1");
+    assert.ok(bound[0].boundAt);
+
+    const materialized = materializeTalkAttachments(workersDir, bound, { requestId: "request-1" });
+    assert.equal(materialized[0].path, talkAttachmentContentPath(workersDir, attachment.id));
+    assert.throws(() => materializeTalkAttachments(workersDir, bound, { requestId: "request-2" }), /绑定请求不一致/);
+
+    assert.deepEqual(buildPiAttachmentArgs(materialized), [`@${materialized[0].path}`]);
+
+    assert.throws(() => createTalkAttachment(workersDir, {
+      data: png,
+      declaredMimeType: "image/jpeg",
+      originalName: "伪装.jpg",
+    }), /MIME.*不一致/);
+    assert.throws(() => createTalkAttachment(workersDir, {
+      data: Buffer.alloc(TALK_IMAGE_MAX_BYTES + 1),
+      declaredMimeType: "image/png",
+      originalName: "too-large.png",
+    }), /过大/);
+    assert.throws(() => resolveTalkAttachmentIds(workersDir, ["../../etc/passwd"]), /attachment id/);
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("talk image cleanup removes expired unbound metadata and orphan content only", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-talk-image-cleanup-test-"));
+  try {
+    const oldNow = new Date("2026-09-01T00:00:00.000Z");
+    const png = Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      Buffer.from("cleanup payload"),
+    ]);
+    const expired = createTalkAttachment(workersDir, {
+      data: png,
+      declaredMimeType: "image/png",
+      originalName: "expired.png",
+      now: oldNow,
+    });
+    const bound = createTalkAttachment(workersDir, {
+      data: png,
+      declaredMimeType: "image/png",
+      originalName: "bound.png",
+      now: oldNow,
+    });
+    bindTalkAttachments(workersDir, [bound], { requestId: "request-keep", now: oldNow });
+
+    const orphanId = "timg_cleanup_aabbccddeeff0011";
+    const orphanPath = join(workersDir, "attachments", "web-talk", `${orphanId}.png`);
+    writeFileSync(orphanPath, png);
+    utimesSync(orphanPath, oldNow, oldNow);
+
+    const removed = cleanupUnboundTalkAttachments(workersDir, {
+      now: new Date("2026-09-04T00:00:00.000Z"),
+      maxAgeMs: 24 * 60 * 60 * 1000,
+    });
+    assert.equal(removed, 2);
+    assert.equal(existsSync(talkAttachmentContentPath(workersDir, bound.id)), true);
+    assert.equal(existsSync(orphanPath), false);
+    assert.throws(() => resolveTalkAttachmentIds(workersDir, [expired.id]), /不存在/);
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("web talk supports image-only requests and preserves attachment metadata", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-web-talk-image-only-test-"));
+  try {
+    const attachment = createTalkAttachment(workersDir, {
+      data: Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.from("jpeg payload")]),
+      declaredMimeType: "image/jpeg",
+      originalName: "screen.jpg",
+    });
+    const request = createWebTalkRequest(workersDir, {
+      worker: "DesignerA",
+      message: "",
+      attachments: [attachment],
+    });
+    assert.equal(request.message, "");
+    assert.deepEqual(request.attachments, [attachment]);
+
+    const edited = editWebTalkRequest(workersDir, {
+      requestId: request.id,
+      message: "补充说明",
+    });
+    assert.equal(edited.message, "补充说明");
+    assert.deepEqual(edited.attachments, [attachment]);
+
+    assert.throws(() => createWebTalkRequest(workersDir, {
+      worker: "DesignerA",
+      message: "",
+      attachments: [],
+    }), /message 或 attachments/);
+  } finally {
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("web talk attachment API uploads, previews, and submits an image-only request", async () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-web-talk-image-api-test-"));
+  mkdirSync(join(workersDir, "sessions"), { recursive: true });
+  writeFileSync(join(workersDir, "sessions", "DesignerA.jsonl"), "", "utf8");
+  const server = createServer(buildRouter({ workersDir }));
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  try {
+    const png = Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      Buffer.from("browser screenshot"),
+    ]);
+    const uploadResponse = await fetch(`${baseUrl}/api/talk-attachments?name=${encodeURIComponent("截图.png")}`, {
+      method: "POST",
+      headers: { "content-type": "image/png" },
+      body: png,
+    });
+    assert.equal(uploadResponse.status, 201);
+    const upload = await uploadResponse.json();
+    assert.equal(upload.ok, true);
+    assert.equal(upload.attachment.name, "截图.png");
+
+    const previewResponse = await fetch(`${baseUrl}${upload.attachment.contentUrl}`);
+    assert.equal(previewResponse.status, 200);
+    assert.equal(previewResponse.headers.get("content-type"), "image/png");
+    assert.deepEqual(Buffer.from(await previewResponse.arrayBuffer()), png);
+
+    const talkResponse = await fetch(`${baseUrl}/api/talk/${encodeURIComponent("DesignerA")}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message: "", attachmentIds: [upload.attachment.id], mode: "auto" }),
+    });
+    assert.equal(talkResponse.status, 202);
+    const talk = await talkResponse.json();
+    assert.equal(talk.request.message, "");
+    assert.equal(talk.request.attachments[0].id, upload.attachment.id);
+    const persisted = getWebTalkRequest(workersDir, talk.request.id);
+    assert.equal(persisted.attachments[0].id, upload.attachment.id);
+
+    const duplicateResponse = await fetch(`${baseUrl}/api/talk/${encodeURIComponent("DesignerA")}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message: "重复", attachmentIds: [upload.attachment.id], mode: "auto" }),
+    });
+    assert.equal(duplicateResponse.status, 400);
+    assert.match(JSON.stringify(await duplicateResponse.json()), /已绑定/);
+    assert.equal(listWebTalkRequests(workersDir).length, 1);
+
+    const workerDetailResponse = await fetch(`${baseUrl}/api/workers/${encodeURIComponent("DesignerA")}`);
+    assert.equal(workerDetailResponse.status, 200);
+    const workerDetail = await workerDetailResponse.json();
+    assert.equal(workerDetail.talkRequests[0].attachments[0].contentUrl, upload.attachment.contentUrl);
+
+    const job = createJob(workersDir, {
+      worker: "DesignerA",
+      kind: "talk",
+      project: "talk",
+      task: "看图",
+      attachments: persisted.attachments,
+    });
+    const jobsResponse = await fetch(`${baseUrl}/api/jobs?worker=${encodeURIComponent("DesignerA")}`);
+    const jobs = await jobsResponse.json();
+    assert.equal(jobs.jobs[0].attachments[0].id, upload.attachment.id);
+    const jobDetailResponse = await fetch(`${baseUrl}/api/jobs/${encodeURIComponent(job.id)}?markRead=0`);
+    const jobDetail = await jobDetailResponse.json();
+    assert.equal(jobDetail.attachments[0].contentUrl, upload.attachment.contentUrl);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
+test("Codex talk input carries local images while unsupported backends are rejected", async () => {
+  const { assertTalkImageBackendSupported, buildCodexTurnInput } = await import("../talk-attachments.mjs");
+  const attachments = [{
+    id: "timg_1234567890abcdef",
+    path: "/tmp/screen.png",
+    mimeType: "image/png",
+    name: "screen.png",
+    size: 10,
+  }];
+
+  assert.deepEqual(buildCodexTurnInput("看一下按钮", attachments), [
+    { type: "text", text: "看一下按钮", text_elements: [] },
+    { type: "localImage", path: "/tmp/screen.png" },
+  ]);
+  assert.deepEqual(buildCodexTurnInput("", attachments), [
+    { type: "localImage", path: "/tmp/screen.png" },
+  ]);
+  assert.doesNotThrow(() => assertTalkImageBackendSupported("pi", attachments));
+  assert.doesNotThrow(() => assertTalkImageBackendSupported("codex", attachments));
+  assert.throws(() => assertTalkImageBackendSupported("claude", attachments), /Claude.*暂不支持图片/);
+  assert.throws(() => assertTalkImageBackendSupported("kimi", attachments), /Kimi.*暂不支持图片/);
+
+  const spawnerSource = readFileSync(join(testDir, "../spawner.ts"), "utf8");
+  const codexSource = readFileSync(join(testDir, "../codex-backend.mjs"), "utf8");
+  assert.match(spawnerSource, /args\.push\(\.\.\.buildPiAttachmentArgs\(attachments\)\)/);
+  assert.match(spawnerSource, /runCodexWorkerStreaming\([\s\S]{0,240}attachments,/);
+  assert.match(codexSource, /input:\s*buildCodexTurnInput\(/);
+  assert.match(codexSource, /export async function steerCodexWorker[\s\S]+input:\s*buildCodexTurnInput\(task, attachments\)/);
+});
+
+test("web talk composer exposes paste, picker, preview, and image history affordances", () => {
+  const appSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
+  const styleSource = readFileSync(join(testDir, "../web/styles.css"), "utf8");
+  const serverSource = readFileSync(join(testDir, "../web-server.mjs"), "utf8");
+
+  assert.match(appSource, /accept:\s*"image\/png,image\/jpeg,image\/webp,image\/gif"/);
+  assert.match(appSource, /addEventListener\("paste"/);
+  assert.match(appSource, /\/api\/talk-attachments/);
+  assert.match(appSource, /talk-panel__attachment-preview/);
+  assert.match(appSource, /talkAttachmentNodes/);
+  assert.match(styleSource, /\.talk-panel__attachment-preview/);
+  assert.match(styleSource, /\.talk-attachment__image/);
+  assert.match(serverSource, /POST.*\/api\/talk-attachments/);
+  assert.match(serverSource, /handleTalkAttachmentUpload/);
+  assert.match(serverSource, /handleTalkAttachmentContent/);
 });
 
 test("web talk requests preserve delivery mode and support pending edit/cancel", () => {

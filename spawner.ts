@@ -24,6 +24,10 @@ import { runClaudeWorkerStreaming } from "./claude-backend.mjs";
 import { runKimiWorkerStreaming } from "./kimi-backend.mjs";
 import { buildWorkerSystemPrompt, buildWorkerTaskPrompt } from "./worker-prompts.mjs";
 import { scoreUserEmotion } from "./quality-metrics.mjs";
+import {
+  assertTalkImageBackendSupported,
+  buildPiAttachmentArgs,
+} from "./talk-attachments.mjs";
 
 const OWNER_INSTANCE_ID = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
@@ -130,6 +134,13 @@ export interface SpawnOptions {
   project: string;
   cwd?: string;
   additionalContext?: string;
+  attachments?: Array<{
+    id: string;
+    name: string;
+    mimeType: string;
+    size: number;
+    path: string;
+  }>;
   signal?: AbortSignal;
   onProgress?: (text: string) => void;
   deliveryMode?: "message" | "queue" | "steer";
@@ -180,7 +191,9 @@ function shouldSkipUserEmotionScore(job: any): boolean {
 }
 
 export async function spawnWorker(options: SpawnOptions): Promise<SpawnResult> {
-  const { worker, task, project, cwd, additionalContext, signal, onProgress } = options;
+  const { worker, task, project, cwd, additionalContext, attachments = [], signal, onProgress } = options;
+
+  assertTalkImageBackendSupported(worker.backend ?? "pi", attachments);
 
   if ((worker.backend ?? "pi") === "codex" || (worker.backend ?? "pi") === "claude" || (worker.backend ?? "pi") === "kimi") {
     return spawnWorkerStreaming(options, (event) => {
@@ -211,6 +224,7 @@ export async function spawnWorker(options: SpawnOptions): Promise<SpawnResult> {
 
   // 任务内容
   const taskContent = buildWorkerTaskPrompt({ project, task, additionalContext });
+  args.push(...buildPiAttachmentArgs(attachments));
   args.push(taskContent);
 
   const workCwd = cwd ?? process.cwd();
@@ -329,7 +343,9 @@ export async function spawnWorkerStreaming(
   options: SpawnOptions,
   onEvent: (event: StreamEvent) => void,
 ): Promise<SpawnResult> {
-  const { worker, task, project, cwd, additionalContext, signal } = options;
+  const { worker, task, project, cwd, additionalContext, attachments = [], signal } = options;
+
+  assertTalkImageBackendSupported(worker.backend ?? "pi", attachments);
 
   if ((worker.backend ?? "pi") === "codex") {
     return runCodexWorkerStreaming(
@@ -339,6 +355,7 @@ export async function spawnWorkerStreaming(
         project,
         cwd,
         additionalContext,
+        attachments,
         signal,
         agentDef: getAgentDef(worker.role),
         workersDir: getWorkersDir(),
@@ -399,6 +416,7 @@ export async function spawnWorkerStreaming(
   }
 
   const taskContent = buildWorkerTaskPrompt({ project, task, additionalContext });
+  args.push(...buildPiAttachmentArgs(attachments));
   args.push(taskContent);
 
   const workCwd = cwd ?? process.cwd();
