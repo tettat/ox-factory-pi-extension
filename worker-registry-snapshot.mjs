@@ -5,6 +5,8 @@ import { homedir } from "node:os";
 const registryCache = { map: null, file: null, mtime: 0 };
 
 export function findMainSessionFile(workersDir) {
+  const configured = process.env.OX_FACTORY_MAIN_SESSION_FILE;
+  if (configured) return existsSync(resolve(configured)) ? resolve(configured) : null;
   const projectRoot = resolve(workersDir, "..", "..");
   const sanitized = projectRoot.replace(/^\//, "").replace(/\//g, "-");
   const sessionDirName = "--" + sanitized + "--";
@@ -23,6 +25,7 @@ export function findMainSessionFile(workersDir) {
 function applyWorkerPatch(worker, data) {
   const fields = [
     "backend",
+    "displayName",
     "avatar",
     "model",
     "thinking",
@@ -67,6 +70,7 @@ export function scanWorkerEntries(entries) {
         id: workerId,
         role: data.role || null,
         backend: data.backend || "pi",
+        displayName: data.displayName || null,
         avatar: data.avatar || null,
         model: data.model || null,
         thinking: data.thinking || null,

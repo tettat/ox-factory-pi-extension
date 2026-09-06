@@ -1,0 +1,1 @@
+$t=(Get-Content (Join-Path $PSScriptRoot '.pi\hub\token') -Raw).Trim();Invoke-RestMethod http://127.0.0.1:8790/api/health|ConvertTo-Json;Invoke-RestMethod http://127.0.0.1:8790/api/state -Headers @{Authorization="Bearer $t"}|ConvertTo-Json -Depth 8

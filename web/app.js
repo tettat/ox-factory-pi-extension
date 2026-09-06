@@ -731,8 +731,15 @@
     return value === "working" ? "busy" : value;
   }
 
+  function workerDisplayName(worker) {
+    const defaults = { Pi: "派派", Kimi: "柯南", Codex: "牛来" };
+    if (typeof worker === "object" && worker) return worker.displayName || defaults[worker.name] || worker.name || "";
+    const name = String(worker || "");
+    return STATE.workers.find((item) => item.name === name)?.displayName || defaults[name] || name;
+  }
+
   function workerAvatarNode(worker, opts = {}) {
-    const name = typeof worker === "string" ? worker : (worker?.name || "");
+    const name = workerDisplayName(worker);
     const avatar = typeof worker === "object" ? String(worker?.avatar || "").trim() : "";
     const status = normalizedAvatarStatus(typeof worker === "object" ? worker?.status : opts.status);
     const className = `avatar${opts.large ? " avatar--lg" : ""} avatar--${status}`;
@@ -1287,7 +1294,7 @@
           el("div", { class: "worker-preview__body" }, [
             el("div", { class: "worker-preview__name" }, [
               workerStatusDot(w.status),
-              el("span", { text: w.name }),
+              el("span", { text: workerDisplayName(w) }),
               w.status === "vacation" ? el("span", { class: "worker-card__vacation-badge", text: "🏖 休假" }) : null,
             ]),
             el("div", { class: "worker-preview__meta" }, [
@@ -1351,7 +1358,7 @@
     const cards = $$(".worker-card", list);
     let visible = 0;
     for (const card of cards) {
-      const name = String(card.dataset.name || "").toLowerCase();
+      const name = String(card.dataset.searchName || card.dataset.name || "").toLowerCase();
       const match = !q || name.includes(q);
       card.hidden = !match;
       if (match) visible += 1;
@@ -2096,7 +2103,7 @@
           return el("a", {
             class: `worker-card${status === "vacation" ? " worker-card--vacation" : ""}${w.name === initialWorker ? " worker-card--active" : ""}${hasUnread ? " worker-card--unread" : ""}`,
             href: `#/workers/${encodeURIComponent(w.name)}`,
-            data: { name: w.name, role: w.role || "", model: w.model || "", unread, lastInteractionAt: w.lastInteractionAt || "" },
+            data: { name: w.name, searchName: `${workerDisplayName(w)} ${w.name} ${w.deviceName || ""}`, role: w.role || "", model: w.model || "", unread, lastInteractionAt: w.lastInteractionAt || "" },
             onclick: (e) => {
               e.preventDefault();
               navigateToWorker(w.name);
@@ -2105,13 +2112,14 @@
             workerAvatarNode(w),
             el("div", { class: "worker-card__body" }, [
               el("div", { class: "worker-card__headline" }, [
-                el("span", { class: "worker-card__name", text: w.name }),
+                el("span", { class: "worker-card__name", text: workerDisplayName(w) }),
                 el("span", { class: `worker-card__status-dot dot dot--${status || "idle"}`, title: status || "idle" }),
                 status === "vacation" ? el("span", { class: "worker-card__vacation-badge", text: "休假" }) : null,
               ]),
               workerCardTalkPreviewNode(w),
             ]),
             el("div", { class: "worker-card__aside" }, [
+              w.remote ? el("span", { class: "tag tag--soft", text: w.deviceName || "远端设备" }) : null,
               hasUnread ? el("span", {
                 class: "worker-card__badge worker-card__badge--unread",
                 text: unread > 99 ? "99+" : String(unread),
@@ -2921,7 +2929,7 @@
       el("div", { class: "worker-detail__title" }, [
         el("h2", {}, [
           d.status === "vacation" ? el("span", { class: "worker-card__vacation-badge", text: "🏖 休假" }) : null,
-          el("span", { text: ` ${d.name}` }),
+          el("span", { text: ` ${workerDisplayName(d)}` }),
           d.unreadCount > 0 ? el("span", { class: "worker-detail__unread-badge", text: `${d.unreadCount} 条未读` }) : null,
         ]),
         el("div", { class: "worker-detail__sub" }, [
@@ -2936,7 +2944,14 @@
     target.appendChild(head);
 
     // 和 TA 对话 · Web 版 /talk 员工名
-    target.appendChild(buildTalkPanel(name, d, d.jobs || []));
+    if (d.remote) {
+      target.appendChild(el("section", { class: "panel" }, [
+        sectionHead("远端员工", `所在设备：${d.deviceName || d.deviceId || "未知设备"}`),
+        el("p", { class: "muted", text: d.deviceOnline ? "设备在线。跨设备对话/派活路由将在下一步接入。" : "设备当前离线。" }),
+      ]));
+    } else {
+      target.appendChild(buildTalkPanel(name, d, d.jobs || []));
+    }
 
     // 职责
     const responsibilities = d.responsibilities || [];
@@ -3073,7 +3088,7 @@
     if (res.ok) {
       STATE.workers = res.data.workers || [];
       sel.innerHTML = `<option value="">全部 (${STATE.workers.length})</option>` +
-        STATE.workers.map((w) => `<option value="${esc(w.name)}">${esc(w.name)}</option>`).join("");
+        STATE.workers.map((w) => `<option value="${esc(w.name)}">${esc(workerDisplayName(w))}</option>`).join("");
     }
   }
 
@@ -4852,7 +4867,7 @@
     const record = task || { priority: "normal", status: "TODO", mode: "auto", labels: [] };
     const assigneeSelect = el("select", { class: "input", name: "assignee" }, [
       el("option", { value: "", text: "未指派" }),
-      ...STATE.workers.map((worker) => el("option", { value: worker.name, text: worker.name, selected: worker.name === record.assignee })),
+      ...STATE.workers.filter((worker) => !worker.remote).map((worker) => el("option", { value: worker.name, text: workerDisplayName(worker), selected: worker.name === record.assignee })),
     ]);
     const triggerInput = el("input", { class: "input", name: "triggerAt", type: "datetime-local", value: toDatetimeLocal(record.triggerAt) });
     const runAfterSaveInput = el("input", {
@@ -5433,13 +5448,15 @@
       if (r.ok) {
         STATE.workers = r.data.workers || [];
         const sel = $("#msgWorker");
-        sel.innerHTML = STATE.workers.map((w) => `<option value="${esc(w.name)}">${esc(w.name)}</option>`).join("");
-        sel.value = STATE.workers[0]?.name || "主agent";
+        const localWorkers = STATE.workers.filter((worker) => !worker.remote);
+        sel.innerHTML = localWorkers.map((w) => `<option value="${esc(w.name)}">${esc(workerDisplayName(w))}</option>`).join("");
+        sel.value = localWorkers[0]?.name || "主agent";
       }
     } else {
       const sel = $("#msgWorker");
-      sel.innerHTML = STATE.workers.map((w) => `<option value="${esc(w.name)}">${esc(w.name)}</option>`).join("");
-      sel.value = STATE.workers[0]?.name || "主agent";
+      const localWorkers = STATE.workers.filter((worker) => !worker.remote);
+      sel.innerHTML = localWorkers.map((w) => `<option value="${esc(w.name)}">${esc(workerDisplayName(w))}</option>`).join("");
+      sel.value = localWorkers[0]?.name || "主agent";
     }
     loadMessages();
     return wrap;
@@ -5870,10 +5887,29 @@ async function route() {
     window.addEventListener("popstate", route);
   }
 
-  document.addEventListener("DOMContentLoaded", () => {
+  async function acceptHubJoinLink() {
+    const encoded = new URLSearchParams(location.search).get("hubJoin");
+    if (!encoded) return;
+    try {
+      const base64 = encoded.replace(/-/g, "+").replace(/_/g, "/");
+      const padded = base64 + "=".repeat((4 - base64.length % 4) % 4);
+      const bytes = Uint8Array.from(atob(padded), (char) => char.charCodeAt(0));
+      const config = JSON.parse(new TextDecoder().decode(bytes));
+      if (!confirm(`是否把这台牛马工厂接入 Hub？\n${config.url}`)) return;
+      const result = await api("/api/device-hub/join", { method: "POST", body: JSON.stringify(config) });
+      if (!result.ok) throw new Error(apiDetailMessage(result.detail, "接入失败"));
+      history.replaceState({}, "", location.pathname + location.hash);
+      toast("已接入 Device Hub", "success");
+    } catch (error) {
+      toast(`接入 Hub 失败：${error.message}`, "error");
+    }
+  }
+
+  document.addEventListener("DOMContentLoaded", async () => {
     bind();
     applyStaticI18n();
     void loadNotificationSettings();
+    await acceptHubJoinLink();
     route();
   });
 })();

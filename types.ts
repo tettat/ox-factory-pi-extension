@@ -47,6 +47,7 @@ export interface Worker {
   sessionFile: string;
   role: WorkerRole;
   backend?: WorkerBackend;
+  displayName?: string | null;
   avatar?: string | null;
   model?: string;
   thinking?: ThinkingLevel;

@@ -57,6 +57,7 @@ export function init(cwd: string) {
 // ─── 入职 ─────────────────────────────────────────────
 
 export interface HireOptions {
+  displayName?: string;
   backend?: WorkerBackend;
   codexThreadId?: string;
   codexThreadInitialized?: boolean;
@@ -87,6 +88,7 @@ export function hire(name: string, role: WorkerRole, model?: string, thinking?: 
     sessionFile: workerSessionFile(name),
     role,
     backend: options.backend ?? "pi",
+    displayName: options.displayName,
     avatar: undefined,
     model,
     thinking: thinking as Worker["thinking"],
@@ -125,6 +127,7 @@ export function hire(name: string, role: WorkerRole, model?: string, thinking?: 
   _pi?.appendEntry(EntryTypes.HIRE, {
     workerId: name,
     role,
+    displayName: w.displayName,
     backend: w.backend,
     model,
     thinking: w.thinking,
@@ -160,6 +163,7 @@ export function updateWorkerConfig(workerId: string, patch: Partial<Worker>) {
 
   const allowedKeys = [
     "backend",
+    "displayName",
     "avatar",
     "model",
     "thinking",
@@ -599,6 +603,7 @@ export function restoreFromEntries(entries: any[]) {
         const w = workers.get(entry.data.workerId);
         if (w) {
           if (entry.data.backend) w.backend = entry.data.backend;
+          if ("displayName" in entry.data) w.displayName = entry.data.displayName;
           if (entry.data.model) w.model = (w.backend ?? "pi") === "codex" ? normalizeCodexModel(entry.data.model) : entry.data.model;
           if (entry.data.thinking) w.thinking = entry.data.thinking;
           if ("codexThreadId" in entry.data) w.codexThreadId = entry.data.codexThreadId;
