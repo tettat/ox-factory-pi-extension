@@ -9,7 +9,8 @@
 import { createServer } from "node:http";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { extname, isAbsolute, join, resolve, dirname, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { fetchHubState, findRemoteWorker, mergeHubWorkers, saveHubConnection, syncLocalFactory } from "./device-hub-client.mjs";
 
 import {
   listJobs,
@@ -120,6 +121,10 @@ import { markdownPreviewText } from "./markdown-preview.mjs";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const WEB_DIR = join(__dirname, "web");
+const DEFAULT_WORKER_DISPLAY_NAMES = { Pi: "派派", Kimi: "柯南", Codex: "牛来" };
+function workerDisplayName(name, registryInfo = {}) {
+  return registryInfo.displayName || DEFAULT_WORKER_DISPLAY_NAMES[name] || name;
+}
 const VERSION = "phase-1-0.1.0";
 const REPO_ROOT = resolve(__dirname, "..", "..", "..");
 const QUALITY_CACHE_TTL_MS = 30_000;
@@ -653,6 +658,7 @@ export function buildWorkersView(workersDir, jobs, tokenReport, messages, regist
     ].filter(Boolean).sort().at(-1) || null;
     return {
       name,
+      displayName: workerDisplayName(name, regInfo),
       status,
       role: regInfo.role || null,
       avatar: regInfo.avatar || null,
@@ -756,6 +762,15 @@ export function buildRouter({ workersDir }) {
         return await handleMainAgentTalkMessage(workersDir, res, body);
       } catch (err) {
         return errorResponse(res, 400, `读取请求体失败: ${err.message}`);
+      }
+    }
+    if (method === "POST" && pathname === "/api/device-hub/join") {
+      try {
+        const body = await readJsonBody(req);
+        const connection = saveHubConnection(workersDir, body);
+        return jsonResponse(res, 200, { ok: true, connection });
+      } catch (err) {
+        return errorResponse(res, 400, `接入 Hub 失败: ${err.message}`);
       }
     }
     if (method === "POST" && pathname === "/api/task-requests") {
@@ -1036,7 +1051,9 @@ async function handleOverview(workersDir, res) {
   const jobsToday = jobsAll.filter((j) => localDateString(j.createdAt) === today);
   const projectStrips = buildProjectStrips(workersDir);
   const projectCatalog = listStoredProjects(workersDir, { includeArchived: false });
-  const workers = buildWorkersView(workersDir, jobsAll, tokenReport, messages);
+  const localWorkers = buildWorkersView(workersDir, jobsAll, tokenReport, messages);
+  await syncLocalFactory(workersDir, localWorkers);
+  const workers = mergeHubWorkers(localWorkers, await fetchHubState(workersDir));
 
   // Job 状态统计
   const jobStats = {
@@ -1159,7 +1176,9 @@ async function handleWorkers(workersDir, res) {
     Promise.resolve(buildFactoryTokenReport({ workersDir, date: localDateString(new Date()) })),
     Promise.resolve(listMessages(workersDir, { worker: "主agent", limit: 200 })),
   ]);
-  const workers = buildWorkersView(workersDir, jobsAll, tokenReport, messages);
+  const localWorkers = buildWorkersView(workersDir, jobsAll, tokenReport, messages);
+  await syncLocalFactory(workersDir, localWorkers);
+  const workers = mergeHubWorkers(localWorkers, await fetchHubState(workersDir));
   return jsonResponse(res, 200, {
     generatedAt: new Date().toISOString(),
     workers,
@@ -1168,6 +1187,21 @@ async function handleWorkers(workersDir, res) {
 
 async function handleWorkerDetail(workersDir, res, name, url = null) {
   if (!name) return badRequest(res, "worker name required");
+  if (name.startsWith("remote:")) {
+    const remote = await findRemoteWorker(workersDir, name);
+    if (!remote) return notFound(res, `远端员工不存在或设备已从 Hub 移除: ${name}`);
+    const { device, worker } = remote;
+    return jsonResponse(res, 200, {
+      name, workerId: worker.id || worker.name,
+      displayName: worker.displayName || worker.id || worker.name,
+      status: device.online ? (worker.status || "idle") : "offline",
+      role: worker.role || null, backend: worker.backend || null,
+      avatar: /^(data:image\/|https?:\/\/)/i.test(worker.avatar || "") ? worker.avatar : null,
+      remote: true, deviceId: device.id, deviceName: device.name || device.id,
+      deviceOnline: Boolean(device.online), responsibilities: [], jobs: [], inbox: [],
+      talkRequests: [], pendingTalkRequests: [], jobCount: 0, unreadCount: 0,
+    });
+  }
   const registry = getWorkerRegistry(workersDir);
   const regInfo = registry.get(name) || {};
   const jobs = listJobs(workersDir, { worker: name, limit: 200 }).sort((a, b) =>
@@ -1188,6 +1222,7 @@ async function handleWorkerDetail(workersDir, res, name, url = null) {
   const unreadJobEvents = unreadJobState.unreadEvents || 0;
   return jsonResponse(res, 200, {
     name,
+    displayName: workerDisplayName(name, regInfo),
     status: regInfo.status === "vacation" ? "vacation" : pickStatus(jobs),
     role: regInfo.role || null,
     avatar: regInfo.avatar || null,
@@ -2957,6 +2992,19 @@ function main() {
     },
     onError: (error) => process.stderr.write(`[task-scheduler] ${error?.message || String(error)}\n`),
   });
+  const syncHub = () => {
+    const registry = getWorkerRegistry(args.workersDir);
+    const workers = [...registry.entries()].map(([name, worker]) => ({
+      name,
+      displayName: workerDisplayName(name, worker),
+      backend: worker.backend || null,
+      role: worker.role || null,
+      status: worker.status || "idle",
+      avatar: worker.avatar || null,
+    }));
+    return syncLocalFactory(args.workersDir, workers);
+  };
+  let hubHeartbeat = null;
   const server = createServer((req, res) => {
     handler(req, res).catch((err) => {
       // eslint-disable-next-line no-console
@@ -2970,6 +3018,9 @@ function main() {
   });
   server.listen(args.port, args.host, () => {
     taskScheduler.start();
+    void syncHub();
+    hubHeartbeat = setInterval(() => void syncHub(), 10_000);
+    hubHeartbeat.unref?.();
     process.stdout.write(
       [
         "🐂🐴 牛马工厂本地 Web 协作驾驶舱",
@@ -2986,6 +3037,7 @@ function main() {
   const shutdown = () => {
     process.stdout.write("\n[web-server] shutting down…\n");
     taskScheduler.stop();
+    if (hubHeartbeat) clearInterval(hubHeartbeat);
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 1500).unref();
   };
@@ -2993,6 +3045,6 @@ function main() {
   process.on("SIGTERM", shutdown);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   main();
 }

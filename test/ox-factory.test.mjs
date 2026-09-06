@@ -3603,7 +3603,7 @@ test("kimi backend builds resume prompt args without unsupported auto flags", ()
     taskContent: "完成一个页面",
   });
 
-  assert.deepEqual(args, ["-r", "session_demo", "--output-format", "stream-json", "--model", "moonshot-v1", "-p", "完成一个页面"]);
+  assert.deepEqual(args, ["--session", "session_demo", "--output-format", "stream-json", "--model", "moonshot-v1", "-p", "完成一个页面"]);
   assert.equal(args.includes("--auto"), false);
   assert.equal(args.includes("--yolo"), false);
 });

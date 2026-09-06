@@ -1,0 +1,1 @@
+$f=Join-Path $PSScriptRoot '.pi\service\hub-processes.json';if(!(Test-Path $f)){'Hub is not running';exit};$s=Get-Content $f -Raw|ConvertFrom-Json;foreach($n in 'device-agent','hub'){$e=$s.$n;if($e){$p=Get-Process -Id $e.pid -ErrorAction SilentlyContinue;if($p){Stop-Process $p -Force;"Stopped $n"}}};Remove-Item $f -Force
