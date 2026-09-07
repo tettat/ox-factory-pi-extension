@@ -233,6 +233,14 @@
       s = esc(s);
       // 代码块 `code`
       s = s.replace(/`([^`\n]+)`/g, (_, c) => stashIt(`<code>${c}</code>`));
+      // 图片先于链接处理，避免 ![alt](url) 被当成普通链接。
+      s = s.replace(/!\[([^\]\n]*)\]\(([^)\s]+)\)/g, (_, alt, url) => {
+        const label = alt || "图片";
+        if (compact) return stashIt(`[图片：${label}]`);
+        const safe = /^https?:\/\//i.test(url) || /^\/api\/talk-attachments\/[^/]+\/content$/.test(url);
+        if (!safe) return stashIt(`[图片无法预览：${label}]`);
+        return stashIt(`<a class="md__image-link" href="${url}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer"><img class="md__image" src="${url}" alt="${label}" loading="lazy" decoding="async" referrerpolicy="no-referrer"><span class="md__image-caption">${label} · 查看原图</span></a>`);
+      });
       // 粗体 **text** / __text__
       s = s.replace(/\*\*([^*\n]+)\*\*/g, (_, c) => stashIt(`<strong>${c}</strong>`));
       s = s.replace(/__([^_\n]+)__/g, (_, c) => stashIt(`<strong>${c}</strong>`));
@@ -377,6 +385,13 @@
   function mdNode(text, options = {}) {
     const wrap = el("div", { class: "md" });
     wrap.innerHTML = md(text, options);
+    wrap.querySelectorAll("img.md__image").forEach((img) => {
+      img.addEventListener("error", () => {
+        img.hidden = true;
+        const caption = img.parentElement?.querySelector(".md__image-caption");
+        if (caption) caption.textContent = `${img.alt || "图片"} · 加载失败，点击查看原图`;
+      }, { once: true });
+    });
     return wrap;
   }
 
