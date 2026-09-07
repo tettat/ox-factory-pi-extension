@@ -3128,6 +3128,35 @@ test("web worker detail uses lightweight default payloads for fast switching", (
   assert.match(jobsSource, /function listCachedJobs/);
 });
 
+test("job list cache refreshes active jobs even when external writers miss the marker", () => {
+  const workersDir = mkdtempSync(join(tmpdir(), "ox-job-cache-active-refresh-"));
+  const realNow = Date.now;
+  let fakeNow = realNow();
+  Date.now = () => fakeNow;
+  try {
+    const job = createJob(workersDir, { worker: "派派", project: "talk", task: "缓存状态测试", cwd: "/repo" });
+    updateJob(job, { status: "running", startedAt: "2026-09-07T09:00:00.000Z" });
+
+    assert.equal(listJobs(workersDir, { worker: "派派", limit: 10 })[0].status, "running");
+
+    const externallyFinished = {
+      ...readJob(job),
+      status: "done",
+      finishedAt: "2026-09-07T09:01:00.000Z",
+      updatedAt: "2026-09-07T09:01:00.000Z",
+      summary: "外部进程写入完成，但没有 touch .job-list-version",
+    };
+    writeFileSync(job.jobFile, `${JSON.stringify(externallyFinished, null, 2)}\n`, "utf8");
+
+    assert.equal(listJobs(workersDir, { worker: "派派", limit: 10 })[0].status, "running");
+    fakeNow += 5001;
+    assert.equal(listJobs(workersDir, { worker: "派派", limit: 10 })[0].status, "done");
+  } finally {
+    Date.now = realNow;
+    rmSync(workersDir, { recursive: true, force: true });
+  }
+});
+
 test("worker list search is debounced name-only filtering without empty-state block", () => {
   const appSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
   const styleSource = readFileSync(join(testDir, "../web/styles.css"), "utf8");

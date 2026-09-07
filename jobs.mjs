@@ -51,8 +51,8 @@ function jobListShallowSignal(jobsDir) {
   }
 }
 
-function jobListSignalIsAuthoritative(signal) {
-  return String(signal || "").startsWith("marker:");
+function cachedListHasOpenJobs(cached) {
+  return (cached?.jobs || []).some((job) => !TERMINAL_STATUSES.has(job.status));
 }
 
 function jobListFingerprint(jobsDir) {
@@ -85,7 +85,8 @@ function listCachedJobs(workersDir) {
   if (
     cached
     && cached.shallowSignal === shallowSignal
-    && (jobListSignalIsAuthoritative(shallowSignal) || now < cached.deepCheckAfter)
+    && now < cached.deepCheckAfter
+    && !cachedListHasOpenJobs(cached)
   ) {
     cached.trustUntil = now + JOB_LIST_CACHE_TRUST_MS;
     return cached.jobs;
