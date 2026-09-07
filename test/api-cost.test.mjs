@@ -13,6 +13,14 @@ test('unknown price, unknown semantics, invalid usage are never free',()=>{
  for(const patch of [{cachedInputTokens:1001},{inputTokens:null},{outputTokens:NaN},{outputTokens:-1}])
   assert.equal(estimateApiCost({...job,apiPrice:price,...patch}).usd,null);
 });
+
+test('legacy Codex jobs with persisted thread ids can be conservatively estimated',()=>{
+ const legacy={...job,apiPrice:price,tokenUsageSchema:undefined,codexThreadId:'thread-1',codexTurnId:'turn-1'};
+ const cost=estimateApiCost(legacy,{});
+ assert.equal(cost.status,'estimated');
+ assert.equal(cost.usd,0.0078);
+ assert.equal(cost.legacyInferred,true);
+});
 test('snapshots override changed prices and running usage is provisional',()=>{
  const cost=estimateApiCost({...job,status:'running',apiPrice:price},{test:{...price,input:100}});
  assert.equal(cost.usd,0.0078); assert.equal(cost.provisional,true);
@@ -52,6 +60,28 @@ test('job detail and model reports expose identical estimates without touching l
   const report=buildFactoryQualityReport({workersDir:dir,date:'all'});
   assert.equal(report.apiCost.usd,0.0078);
   assert.equal(report.models[0].apiCost.usd,0.0078);
+  assert.equal(report.costByWorker[0].usd,0.0078);
+ }finally{await new Promise(resolve=>server.close(resolve));rmSync(dir,{recursive:true,force:true});}
+});
+
+test('token report endpoint exposes same-day API cost estimates', async()=>{
+ const {mkdtempSync,rmSync}=await import('node:fs');
+ const {tmpdir}=await import('node:os'); const {join}=await import('node:path');
+ const {createServer}=await import('node:http');
+ const {createJob,updateJob}=await import('../jobs.mjs');
+ const {buildRouter}=await import('../web-server.mjs');
+ const dir=mkdtempSync(join(tmpdir(),'ox-token-cost-api-'));
+ const server=createServer(buildRouter({workersDir:dir}));
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+ try{
+  const included=createJob(dir,{worker:'test',task:'cost fixture'});
+  updateJob(included,{...job,apiPrice:price,createdAt:'2026-09-07T02:00:00.000Z'});
+  const excluded=createJob(dir,{worker:'test',task:'old cost fixture'});
+  updateJob(excluded,{...job,apiPrice:price,createdAt:'2026-09-06T02:00:00.000Z'});
+  const report=await (await fetch(`http://127.0.0.1:${server.address().port}/api/tokens?date=2026-09-07`)).json();
+  assert.equal(report.apiCost.usd,0.0078);
+  assert.equal(report.apiCost.pricedJobs,1);
+  assert.equal(report.costByWorker[0].worker,'test');
   assert.equal(report.costByWorker[0].usd,0.0078);
  }finally{await new Promise(resolve=>server.close(resolve));rmSync(dir,{recursive:true,force:true});}
 });

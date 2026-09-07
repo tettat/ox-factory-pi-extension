@@ -3428,6 +3428,7 @@
         kpiCard("推理输出", fmtNumber(totals.reasoningOutputTokens), ""),
         kpiCard("总 Token", fmtNumber(totals.totalTokens), "input + output"),
         kpiCard("含缓存合计", fmtNumber(totals.totalWithCachedTokens), "input + cache + output"),
+        kpiCard("参考费用", apiCostText(d.apiCost), `${d.apiCost?.pricedJobs || 0} 项可估 · ${d.apiCost?.unpricedJobs || 0} 项未知`),
       ]);
       wrap.appendChild(kpi);
       const max = Math.max(1, ...(d.workers || []).map((w) => w.reported?.totalWithCachedTokens || 0));
@@ -3437,6 +3438,31 @@
           (d.workers && d.workers.length)
             ? el("div", { class: "bar-list" }, d.workers.map((row) => barRow(row, max)))
             : emptyState(`${STATE.tokensDate} 暂无 token 记录`),
+        ]),
+      ]));
+      wrap.appendChild(el("section", { class: "section" }, [
+        el("div", { class: "card" }, [
+          cardHead("API 参考费用", `按 ${STATE.tokensDate} 的 job usage 估算；非实际账单`),
+          el("p", { text: `${apiCostText(d.apiCost)} · 已估算 ${d.apiCost?.pricedJobs || 0} 项 · 未能估算 ${d.apiCost?.unpricedJobs || 0} 项` }),
+          el("p", { class: "muted", text: "仅对有可确认 token 口径和价格表的 job 计价；运行中 job 会按已收到用量累计估算。" }),
+          (d.costByWorker || []).length
+            ? el("div", { class: "table-wrap" }, [el("table", { class: "table quality-table" }, [
+              el("thead", {}, [el("tr", {}, [
+                el("th", { text: "员工" }),
+                sortableNumericTh("参考费用 $"),
+                sortableNumericTh("计价样本"),
+                sortableNumericTh("未计价"),
+                sortableNumericTh("平均每计价任务 $"),
+              ])]),
+              el("tbody", {}, d.costByWorker.map((row) => el("tr", {}, [
+                el("td", { text: row.worker || "—" }),
+                numericTd(row.usd ?? -1, apiCostText(row)),
+                numericTd(row.pricedJobs || 0, String(row.pricedJobs || 0)),
+                numericTd(row.unpricedJobs || 0, String(row.unpricedJobs || 0)),
+                numericTd(row.avgUsd ?? -1, row.avgUsd == null ? "—" : `≈ $${row.avgUsd.toFixed(4)}`),
+              ]))),
+            ])])
+            : emptyState("当前日期暂无可估算费用", "等待新的 Codex inclusive usage 或补充模型价格表"),
         ]),
       ]));
       if (d.warnings && d.warnings.length) {

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { estimateApiCost, readApiPrices } from "./api-cost.mjs";
+import { estimateApiCost, readApiPrices, summarizeApiCosts } from "./api-cost.mjs";
 // 牛马工厂本地 Web 协作驾驶舱
 // ---------------------------------------------------------------------------
 // 目标：把 .pi/workers/ 下的工厂运行数据聚合成一个本地仪表盘。
@@ -1376,6 +1376,26 @@ async function handleTokens(workersDir, res, url) {
   const worker = url.searchParams.get("worker") || null;
   const format = (url.searchParams.get("format") || "json").toLowerCase();
   const report = buildFactoryTokenReport({ workersDir, date, worker });
+  const apiPrices = readApiPrices(workersDir);
+  const costJobs = listJobs(workersDir, { worker: worker || undefined, limit: 100000 })
+    .filter((job) => localDateString(job.createdAt) === date);
+  const costByWorkerMap = new Map();
+  for (const job of costJobs) {
+    const name = job.worker || "未记录员工";
+    const list = costByWorkerMap.get(name) || [];
+    list.push(job);
+    costByWorkerMap.set(name, list);
+  }
+  const costByWorker = [...costByWorkerMap.entries()]
+    .map(([name, jobs]) => ({ worker: name, ...summarizeApiCosts(jobs, apiPrices) }))
+    .sort((a, b) => (b.usd ?? -1) - (a.usd ?? -1) || String(a.worker).localeCompare(String(b.worker)));
+  const costByWorkerLookup = new Map(costByWorker.map((row) => [row.worker, row]));
+  report.apiCost = summarizeApiCosts(costJobs, apiPrices);
+  report.costByWorker = costByWorker;
+  report.workers = report.workers.map((row) => ({
+    ...row,
+    apiCost: costByWorkerLookup.get(row.worker) || { status: "usage_unknown", usd: null, currency: "USD", pricedJobs: 0, unpricedJobs: 0, avgUsd: null },
+  }));
   if (format === "markdown" || format === "md") {
     const md = formatFactoryTokenReport(report);
     res.writeHead(200, { "content-type": "text/markdown; charset=utf-8", "cache-control": "no-store" });

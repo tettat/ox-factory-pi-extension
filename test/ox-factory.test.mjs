@@ -3548,6 +3548,9 @@ test("tokens page route-refreshes when date or trend filters change", () => {
   const webAppSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
 
   assert.match(webAppSource, /function applyTokenFilters/);
+  assert.match(webAppSource, /cardHead\("API 参考费用"/);
+  assert.match(webAppSource, /apiCostText\(d\.apiCost\)/);
+  assert.match(webAppSource, /d\.costByWorker/);
   assert.match(webAppSource, /oninput:\s*\(e\)\s*=>\s*applyTokenFilters\(\{\s*date:/);
   assert.match(webAppSource, /onchange:\s*\(e\)\s*=>\s*applyTokenFilters\(\{\s*date:/);
   assert.match(webAppSource, /onchange:\s*\(e\)\s*=>\s*applyTokenFilters\(\{\s*trend:/);
