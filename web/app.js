@@ -4098,6 +4098,33 @@
         ]))),
       ]) : null,
       el("div", { class: "card" }, [
+        cardHead("模型执行对比", "按本页日期和样本范围聚合；仅完成任务，排除 steer。耗时 = finishedAt − startedAt，不含排队，包含工具执行与等待；缺失值不算作 0。"),
+        el("p", { class: "muted", text: "Token 各列按实际有记录的样本独立求均值（悬停查看样本数）；任务难度不同，不代表模型能力排名。旧版 API 暂不提供此表。" }),
+        (d.models || []).length ? el("div", { class: "table-wrap" }, [
+          el("table", { class: "table quality-table" }, [
+            el("thead", {}, [el("tr", {}, [
+              el("th", { text: "模型" }),
+              ...["完成数", "耗时样本", "缺失耗时", "排除 steer", "平均耗时", "耗时中位数", "平均输入 Token", "平均输出 Token", "平均缓存 Token", "平均含缓存总 Token"].map(label => sortableNumericTh(label)),
+            ])]),
+            el("tbody", {}, d.models.map(row => el("tr", {}, [
+              el("td", { class: "td--mono", text: row.model }),
+              numericTd(row.completed, String(row.completed)),
+              numericTd(row.durationSamples, String(row.durationSamples)),
+              numericTd(row.missingDuration, String(row.missingDuration)),
+              numericTd(row.excludedSteer, String(row.excludedSteer)),
+              numericTd(row.avgDurationMs ?? -1, row.avgDurationMs == null ? "—" : fmtDurationMs(row.avgDurationMs)),
+              numericTd(row.medianDurationMs ?? -1, row.medianDurationMs == null ? "—" : fmtDurationMs(row.medianDurationMs)),
+              ...["inputTokens", "outputTokens", "cachedInputTokens", "totalWithCachedTokens"].map(field => {
+                const metric = row.tokens[field];
+                const cell = numericTd(metric.average ?? -1, metric.average == null ? "—" : fmtNumber(metric.average));
+                cell.title = `有效样本 ${metric.samples} · 缺失 ${metric.missing}`;
+                return cell;
+              }),
+            ]))),
+          ]),
+        ]) : emptyState("当前范围暂无模型统计"),
+      ]),
+      el("div", { class: "card" }, [
         cardHead(`员工质量指标 (${workers.length})`, `评分: ${config.enabled ? "开启" : "关闭"} · ${config.provider || "—"}/${config.model || "—"} · ${history.exactContextPerTurn ? "精确上下文" : "历史回放估算"} · usable ${history.usableJobs ?? totals.turns ?? 0}/${history.candidateJobs ?? "—"}`),
         workers.length
           ? el("div", { class: "table-wrap" }, [

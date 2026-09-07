@@ -1,3 +1,4 @@
+import { summarizeModelExecution } from "./model-execution-stats.mjs";
 import {
   appendFileSync,
   existsSync,
@@ -619,6 +620,7 @@ export function buildFactoryQualityReport({ workersDir, date, limit = DEFAULT_LI
     workers,
     turns,
     dates: summarizeTurnsByDate(turns),
+    models: summarizeModelExecution(jobs),
     history: {
       backfilled: true,
       exactContextPerTurn: false,
