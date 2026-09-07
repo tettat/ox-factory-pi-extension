@@ -1,3 +1,4 @@
+import { readApiPrices } from "./api-cost.mjs";
 /**
  * 牛马工厂 — Worker 进程管理
  *
@@ -340,6 +341,7 @@ export async function spawnWorker(options: SpawnOptions): Promise<SpawnResult> {
 // ─── 流式 Spawn（factory_talk 用）──────────────────────
 
 export type StreamEvent =
+  | { type: "usage"; inputTokens: number; cachedInputTokens: number; outputTokens: number; reasoningOutputTokens?: number; model?: string; tokenUsageSchema: string }
   | { type: "thinking"; text: string }
   | { type: "text"; text: string }
   | { type: "tool_start"; name: string; args: unknown }
@@ -603,6 +605,17 @@ export function startWorkerJob(
 
   const appendLiveEvent = (event: StreamEvent) => {
     heartbeat();
+    if (event.type === "usage") {
+      const usage = event;
+      const current = readJob(job);
+      if (!isTerminalJob(current)) updateJob(current, {
+        inputTokens: usage.inputTokens, cachedInputTokens: usage.cachedInputTokens,
+        outputTokens: usage.outputTokens, reasoningOutputTokens: usage.reasoningOutputTokens,
+        model: usage.model, tokenUsageSchema: usage.tokenUsageSchema,
+        usageUpdatedAt: new Date().toISOString(),
+        apiPrice: current.apiPrice || readApiPrices(getWorkersDir())[usage.model] || null,
+      });
+    }
     appendJobEventIfOpen(job, event);
     onEvent?.(event);
   };

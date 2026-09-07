@@ -647,7 +647,11 @@ export async function runCodexWorkerStreaming(options, onEvent) {
       }
 
       if (message.method === "thread/tokenUsage/updated") {
-        tokenUsageTracker.remember(params, turnId);
+        if (turnId && params.turnId && params.turnId !== turnId) return;
+        const liveUsage = tokenUsageTracker.remember(params, turnId);
+        if (turnId && hasNonZeroTokenUsage(liveUsage)) {
+          onEvent({ type: "usage", ...liveUsage, model: result.model, tokenUsageSchema: "codex-inclusive-v1" });
+        }
       }
 
       for (const event of codexNotificationToStreamEvents(message)) {
@@ -692,6 +696,7 @@ export async function runCodexWorkerStreaming(options, onEvent) {
     const turnUsage = extractCodexTokenUsage(turn);
     const capturedUsage = await waitForCapturedTokenUsage(turn.id);
     const usage = hasNonZeroTokenUsage(capturedUsage) ? capturedUsage : turnUsage;
+    if (hasNonZeroTokenUsage(usage)) onEvent({ type: "usage", ...usage, model: result.model, tokenUsageSchema: "codex-inclusive-v1" });
     result.inputTokens += usage.inputTokens;
     result.cachedInputTokens += usage.cachedInputTokens;
     result.outputTokens += usage.outputTokens;
@@ -724,6 +729,9 @@ export async function runCodexWorkerStreaming(options, onEvent) {
     result.stopReason = "error";
     result.errorMessage = error?.message || String(error);
     result.stderr = result.errorMessage;
+    // Preserve observed spend when a transport error interrupts completion.
+    const observedUsage = tokenUsageTracker.get(turnId);
+    if (hasNonZeroTokenUsage(observedUsage)) Object.assign(result, observedUsage);
     onEvent({ type: "error", message: result.errorMessage });
     onEvent({ type: "done", turns: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0, model: result.model, exitCode: 1, stopReason: "error", text: result.output, codexThreadId: result.codexThreadId, codexTurnId: result.codexTurnId });
     return result;

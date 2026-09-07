@@ -1,3 +1,4 @@
+import { summarizeApiCosts, readApiPrices } from "./api-cost.mjs";
 import { summarizeModelExecution } from "./model-execution-stats.mjs";
 import {
   appendFileSync,
@@ -504,6 +505,7 @@ export function buildFactoryQualityReport({ workersDir, date, limit = DEFAULT_LI
   const config = readQualityMonitorConfig(workersDir);
   const dateFilter = normalizeDateFilter(date);
   const maxTurns = normalizeLimit(limit);
+  const apiPrices = readApiPrices(workersDir);
   // 回溯历史时不能先按 limit 截最近 N 条，否则看前几天会被当天新 job 挤掉。
   // jobs 只存轻量 metadata，因此这里扫描足够多历史记录，再做日期过滤和展示截断。
   const scannedJobs = listJobs(workersDir, { worker, limit: 100000 });
@@ -620,7 +622,11 @@ export function buildFactoryQualityReport({ workersDir, date, limit = DEFAULT_LI
     workers,
     turns,
     dates: summarizeTurnsByDate(turns),
-    models: summarizeModelExecution(jobs),
+    apiCost: summarizeApiCosts(jobs, apiPrices),
+    costByWorker: workers.map(item => ({worker:item.worker, ...summarizeApiCosts(jobs.filter(job=>job.worker===item.worker), apiPrices)})),
+    models: summarizeModelExecution(jobs).map(item => ({...item,
+      apiCost: summarizeApiCosts(jobs.filter(job=>(String(job.model || '').trim() || '未记录模型')===item.model), apiPrices),
+    })),
     history: {
       backfilled: true,
       exactContextPerTurn: false,

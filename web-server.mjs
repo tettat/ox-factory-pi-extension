@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { estimateApiCost, readApiPrices } from "./api-cost.mjs";
 // 牛马工厂本地 Web 协作驾驶舱
 // ---------------------------------------------------------------------------
 // 目标：把 .pi/workers/ 下的工厂运行数据聚合成一个本地仪表盘。
@@ -1331,6 +1332,8 @@ async function handleJobDetail(workersDir, res, id, url = null) {
     elapsedSeconds: job.elapsedSeconds,
     model: job.model,
     summary: job.summary || null,
+    apiCost: estimateApiCost(job, readApiPrices(workersDir)),
+    usageUpdatedAt: job.usageUpdatedAt || null,
     fullReply: fullReply.text || null,
     fullReplyChars: fullReply.chars,
     fullReplyTruncated: fullReply.truncated,

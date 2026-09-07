@@ -395,6 +395,25 @@
     return wrap;
   }
 
+  function apiCostText(cost) {
+    if (cost?.usd != null) return `≈ $${cost.usd.toFixed(4)}${cost.provisional ? "（累计估算）" : ""}`;
+    return ({price_missing:"价格未配置", usage_unknown:"用量口径未确认", usage_incomplete:"用量不完整"})[cost?.status] || "暂无费用数据";
+  }
+
+  async function pollDrawerCost(id, target) {
+    while (target.isConnected && STATE.drawerJob === id) {
+      await sleep(3000);
+      if (!target.isConnected || STATE.drawerJob !== id) return;
+      const response = await api(`/api/jobs/${encodeURIComponent(id)}?markRead=0`);
+      if (!target.isConnected || STATE.drawerJob !== id) return;
+      if (response.ok) {
+        target.textContent = apiCostText(response.data.apiCost);
+        target.title = response.data.apiCost?.note || "";
+        if (["done", "failed", "aborted", "stale"].includes(response.data.status)) return;
+      }
+    }
+  }
+
   function fmtTime(iso, opts = {}) {
     if (!iso) return "—";
     const d = new Date(iso);
@@ -3201,6 +3220,12 @@
         : el("p", { class: "prose", text: "—" }),
       talkAttachmentNodes(d.attachments || []),
     ]));
+    const costValue = el("strong", {text: apiCostText(d.apiCost), title:d.apiCost?.note || ""});
+    body.appendChild(el("div", {class:"drawer__section"}, [
+      el("h4", {text:"API 参考费用（非实际扣费）"}), costValue,
+      el("p", {class:"muted", text:d.apiCost?.note || "等待可识别的模型价格与用量；历史数据不会按零费用处理。"}),
+    ]));
+    if (!["done", "failed", "aborted", "stale"].includes(d.status)) void pollDrawerCost(d.id || id, costValue);
     const replyText = d.fullReply || d.latestReply || d.summary || "";
     if (replyText) {
       body.appendChild(el("div", { class: "drawer__section" }, [
@@ -4085,6 +4110,18 @@
         trendKpi("已评分", String(totals.scoredTurns || 0), config.enabled ? "情绪旁路已开启" : "情绪旁路关闭"),
         trendKpi("丢弃", String(history.droppedJobs || 0), Object.entries(history.dropReasons || {}).map(([k, v]) => `${k}:${v}`).join(" · ") || "无明显坏数据"),
       ]),
+      el("div", {class:"card"}, [
+        cardHead("API 参考费用", "按本页日期与样本范围折算；含运行中及失败任务已记录的消耗，非账单。"),
+        el("p", {text: `${apiCostText(d.apiCost)} · 已估算 ${d.apiCost?.pricedJobs || 0} 项 · 未能估算 ${d.apiCost?.unpricedJobs || 0} 项`}),
+        el("p", {class:"muted",text:"默认 Standard 短上下文参考价；不含缓存写入、图片生成、搜索等额外费用，不自动识别 Fast / 长上下文 / 区域加价。"}),
+        el("div", {class:"table-wrap"}, [el("table", {class:"table quality-table"}, [
+          el("thead", {}, [el("tr", {}, [el("th", {text:"员工"}), sortableNumericTh("参考费用 $"), sortableNumericTh("计价样本"), sortableNumericTh("未计价")])]),
+          el("tbody", {}, (d.costByWorker || []).map(row=>el("tr", {}, [
+            el("td", {text:row.worker}), numericTd(row.usd ?? -1, apiCostText(row)),
+            numericTd(row.pricedJobs, String(row.pricedJobs)), numericTd(row.unpricedJobs, String(row.unpricedJobs)),
+          ]))),
+        ])]),
+      ]),
       dates.length > 1 ? el("div", { class: "card" }, [
         cardHead(`历史分布 (${dates.length} 天)`, "按天回溯可用 turn；点击日期切换到当天"),
         el("div", { class: "quality-date-strip" }, dates.map((day) => el("button", {
@@ -4099,12 +4136,12 @@
       ]) : null,
       el("div", { class: "card" }, [
         cardHead("模型执行对比", "按本页日期和样本范围聚合；仅完成任务，排除 steer。耗时 = finishedAt − startedAt，不含排队，包含工具执行与等待；缺失值不算作 0。"),
-        el("p", { class: "muted", text: "Token 各列按实际有记录的样本独立求均值（悬停查看样本数）；任务难度不同，不代表模型能力排名。旧版 API 暂不提供此表。" }),
+        el("p", { class: "muted", text: "Token 各列按实际有记录的样本独立求均值（悬停查看样本数）。费用列包含运行中/失败任务的已记录消耗，均价分母为计价样本；任务难度不同，不代表模型能力排名。" }),
         (d.models || []).length ? el("div", { class: "table-wrap" }, [
           el("table", { class: "table quality-table" }, [
             el("thead", {}, [el("tr", {}, [
               el("th", { text: "模型" }),
-              ...["完成数", "耗时样本", "缺失耗时", "排除 steer", "平均耗时", "耗时中位数", "平均输入 Token", "平均输出 Token", "平均缓存 Token", "平均含缓存总 Token"].map(label => sortableNumericTh(label)),
+              ...["完成数", "耗时样本", "缺失耗时", "排除 steer", "平均耗时", "耗时中位数", "平均输入 Token", "平均输出 Token", "平均缓存 Token", "平均含缓存总 Token", "参考费用 $", "平均每计价任务 $", "计价样本", "未计价"].map(label => sortableNumericTh(label)),
             ])]),
             el("tbody", {}, d.models.map(row => el("tr", {}, [
               el("td", { class: "td--mono", text: row.model }),
@@ -4120,6 +4157,10 @@
                 cell.title = `有效样本 ${metric.samples} · 缺失 ${metric.missing}`;
                 return cell;
               }),
+              numericTd(row.apiCost?.usd ?? -1, apiCostText(row.apiCost)),
+              numericTd(row.apiCost?.avgUsd ?? -1, row.apiCost?.avgUsd == null ? "—" : `≈ $${row.apiCost.avgUsd.toFixed(4)}`),
+              numericTd(row.apiCost?.pricedJobs || 0, String(row.apiCost?.pricedJobs || 0)),
+              numericTd(row.apiCost?.unpricedJobs || 0, String(row.apiCost?.unpricedJobs || 0)),
             ]))),
           ]),
         ]) : emptyState("当前范围暂无模型统计"),
