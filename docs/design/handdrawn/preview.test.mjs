@@ -11,7 +11,7 @@ function setup(reduce = false) {
 }
 test('all actions have animated and matching static assets',()=>{
  const {elements:e}=setup();
- for(const action of ['running','sprinting','grazing']) {
+ for(const action of ['running','sprinting','grazing','leopard','leopard-run','leopard-jump','cow-truck']) {
   e.action.value=action;e.action.handlers.change();
   assert.equal(e.mascots.src,`${action}-mascots.svg`);
   assert.ok(existsSync(new URL(e.mascots.src,import.meta.url)));
