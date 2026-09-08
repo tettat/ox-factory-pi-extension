@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 230" role="img" aria-labelledby="title desc">
+<title id="title">牛马一起轻快跑步</title><desc id="desc">戴眼镜的小牛与小马原地跑步；减少动态效果设置下静止。</desc>
+<style>
+.line{stroke:#454338;stroke-width:3;stroke-linecap:round;stroke-linejoin:round}
+.runner{animation:bob .52s ease-in-out infinite alternate;transform-box:fill-box;transform-origin:center}
+.horse{animation-delay:-.26s}.leg{transform-box:fill-box;transform-origin:50% 0%;animation:stride .52s ease-in-out infinite alternate}.back{animation-delay:-.52s}.tail{transform-box:fill-box;transform-origin:0% 0%;animation:swish .52s ease-in-out infinite alternate}
+.dash{animation:ground .75s linear infinite}.second{animation-delay:-.35s}
+@keyframes bob{from{transform:translateY(0) rotate(-2deg)}to{transform:translateY(-7px) rotate(1deg)}}
+@keyframes stride{from{transform:rotate(-29deg)}to{transform:rotate(29deg)}}
+@keyframes swish{to{transform:rotate(-17deg)}}
+@keyframes ground{from{transform:translateX(20px);opacity:0}40%{opacity:.55}to{transform:translateX(-30px);opacity:0}}
+@media(prefers-reduced-motion:reduce){.runner,.leg,.tail,.dash{animation:none}.dash{opacity:.35}}
+</style>
+<g fill="none" stroke="#a8a48d" stroke-width="2" stroke-linecap="round"><path d="M90 204h195m50 0h220"/><path class="dash" d="M90 211h35m120 4h22m100-4h32"/><path class="dash second" d="M158 218h25m310-2h30"/></g>
+<g transform="translate(104 15)"><g class="runner line">
+<path class="tail" d="M55 113Q12 96 20 135l-10 5" fill="none"/>
+<g class="leg back"><path d="M76 142l-8 36 13 4" fill="none"/><path d="M67 177l-6 8 23 0-3-8" fill="#454338"/></g>
+<g class="leg"><path d="M128 142l9 34 14 4" fill="none"/><path d="M136 176l-2 10 24 0-7-8" fill="#454338"/></g>
+<path d="M57 101q-17 25 1 46 27 18 79-2l6-46z" fill="#b6c7cb"/>
+<path d="M73 104l18 18 15-15 13 14 13-22" fill="none"/>
+<path d="M88 140q25 14 43-7" fill="none"/>
+<path d="M70 62Q40 56 47 44l27 6M129 57q32-17 31 0l-27 15" fill="#e8d9aa"/>
+<path d="M78 41Q62 28 69 16q5 19 17 17m32 4q18-10 17-24 12 21-7 31" fill="#e7d2a0"/>
+<path d="M68 55q0-27 36-24 37 0 38 35l-1 26q-8 21-38 20Q64 112 65 87z" fill="#faf5e4"/>
+<path d="M71 49q-8 15 4 28 14-7 11-24z" fill="#82765d" stroke="none"/>
+<ellipse cx="104" cy="91" rx="33" ry="18" fill="#e7caba"/>
+<path d="M89 90v4m27-4v4m-20 9q9 5 16-1" fill="none"/>
+<g fill="none"><rect x="74" y="58" width="25" height="19" rx="6"/><rect x="108" y="57" width="25" height="19" rx="6"/><path d="M99 64h9"/></g>
+<circle cx="87" cy="65" r="2" fill="#454338"/><circle cx="120" cy="64" r="2" fill="#454338"/>
+<path d="M76 120q-17 15-30 5" fill="none"/>
+</g></g>
+<g transform="translate(351 12)"><g class="runner horse line">
+<path class="tail" d="M52 118Q6 110 15 145q14-10 28-6" fill="#8d7057"/>
+<g class="leg"><path d="M72 148l-8 32 13 4" fill="none"/><path d="M63 178l-5 9h24l-5-7" fill="#454338"/></g>
+<g class="leg back"><path d="M128 146l10 33 12 3" fill="none"/><path d="M137 178l-2 9h24l-9-7" fill="#454338"/></g>
+<path d="M61 104q-20 28-5 44 40 19 85-5l-5-45z" fill="#e7c887"/>
+<path d="M77 106l16 18 18-16 13 15 8-20M91 140q22 12 40-6" fill="none"/>
+<path d="M82 45Q54 32 53 61L42 89l24 29 18-22" fill="#8d7057"/>
+<path d="M84 45L74 12q-14 8-5 35m41-2 11-31q14 9 5 33" fill="#dabb87"/>
+<path d="M75 49q19-24 46-5 17 12 11 34l20 20q8 17-9 24-30 12-50-14L73 82z" fill="#e4c493"/>
+<path d="M77 47l10-14 8 13 10-10 9 13" fill="#8d7057"/>
+<path d="M120 94q27-6 33 12-2 17-23 14l-16-11" fill="#efdbc0"/>
+<path d="M139 102l1 3m-11 8q7 3 11-1" fill="none"/>
+<g fill="none"><rect x="83" y="59" width="23" height="18" rx="5"/><rect x="113" y="62" width="23" height="18" rx="5"/><path d="M106 65h7"/></g>
+<circle cx="96" cy="66" r="2" fill="#454338"/><circle cx="124" cy="69" r="2" fill="#454338"/>
+<path d="M80 123q-15 13-28 5" fill="none"/>
+</g></g>
+</svg>
