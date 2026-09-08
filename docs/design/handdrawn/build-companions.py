@@ -49,7 +49,6 @@ def leopard():
 def scene(name):
     if name=='cow-truck':
         cow=base['animal']()
-        passengers=''.join(f'<g class="passenger" transform="translate({x} 18) scale(.28)">{cow}</g>' for x in [118,161,204])
         calves=''.join(f'<g transform="translate(225 100) scale(.42)"><g class="convoy" style="--arrival:-{i*1.5}s;--parking:{i*70}px">{cow}</g></g>' for i in range(4))
         # The translated parent is outside the animated element: positions do not get overwritten.
         # Convoy displacements are in scaled units, keeping the scene within the viewBox.
@@ -60,10 +59,9 @@ def scene(name):
 <path d="M131 180h190m-4-11 84 44h-30l-63-34" fill="#c7ad80"/>
 <circle cx="87" cy="183" r="23" fill="#655d50"/><circle cx="87" cy="183" r="11" fill="#d5c6a8"/>
 <circle cx="280" cy="183" r="23" fill="#655d50"/><circle cx="280" cy="183" r="11" fill="#d5c6a8"/>
-</g>{passengers}<rect x="125" y="83" width="197" height="16" fill="#91a38a" stroke="#514737" stroke-width="2"/>
-<text x="158" y="140" font-family="system-ui,sans-serif" font-size="25" fill="#3d5647">牛马工厂</text>{calves}
-<text x="355" y="67" font-family="system-ui,sans-serif" font-size="18" fill="#725039">来啦！一车牛。</text>
-<text x="375" y="93" font-family="system-ui,sans-serif" font-size="12" fill="#938169">下车动作循环小样</text>'''
+</g><rect x="125" y="83" width="197" height="16" fill="#91a38a" stroke="#514737" stroke-width="2"/>
+{calves}
+'''
     if name=='leopard-jump':
         return f'''<path d="M312 166q-25 40-18 115h84q-12-55 18-115" fill="#d5e8e7"/>
 <path d="M45 226q137-24 250 0m88 0q115-18 222 0" stroke="#a5b98c" stroke-width="3" fill="none"/>

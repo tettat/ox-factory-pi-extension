@@ -32,3 +32,13 @@ test('pause survives skin and action changes without losing selected pose',()=>{
 test('unknown action cannot be used as an asset path',()=>{
  const {elements:e}=setup();e.action.value='../../anything';e.action.handlers.change();assert.equal(e.mascots.src,'running-mascots.svg');
 });
+
+test('truck scene has no visible text or rooftop cows; keeps four unloading cows',()=>{
+ for(const suffix of ['', '-still']) {
+  const svg=readFileSync(new URL(`cow-truck-mascots${suffix}.svg`,import.meta.url),'utf8');
+  assert.doesNotMatch(svg,/<text\b/);
+  assert.doesNotMatch(svg,/class="passenger"/);
+  assert.equal((svg.match(/class="convoy"/g)||[]).length,4);
+  assert.match(svg,/<title\b/);
+ }
+});
