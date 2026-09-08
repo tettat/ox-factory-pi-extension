@@ -42,3 +42,11 @@ test('truck scene has no visible text or rooftop cows; keeps four unloading cows
   assert.match(svg,/<title\b/);
  }
 });
+
+test('van uses compact perspective canvas and a central side door',()=>{
+ const svg=readFileSync(new URL('cow-truck-mascots.svg',import.meta.url),'utf8');
+ assert.match(svg,/viewBox="0 0 400 360"/);
+ assert.match(svg,/id="side-door"/);
+ assert.match(svg,/@keyframes van-exit/);
+ assert.match(svg,/class="front-calf/);
+});

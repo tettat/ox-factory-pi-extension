@@ -18,6 +18,14 @@ STYLE = base['STYLE'] + '''
 @media(prefers-reduced-motion:reduce){.jumper,.convoy,.ripple{animation:none!important}.convoy{transform:translate(var(--parking),44px)}}
 .still .jumper,.still .convoy,.still .ripple{animation:none!important}.still .convoy{transform:translate(var(--parking),44px)}
 '''
+VAN_STYLE = '''.convoy{animation:van-exit 6s linear infinite;animation-delay:var(--arrival)}
+.front-calf{animation:calf-step .5s ease-in-out infinite}.front-hoof{animation:hoof-step .5s ease-in-out infinite}.front-hoof.other{animation-delay:-.25s}
+@keyframes calf-step{0%,100%{transform:translateY(0) rotate(-1deg)}50%{transform:translateY(-2px) rotate(1deg)}}
+@keyframes hoof-step{50%{transform:translateY(-4px)}}
+@keyframes van-exit{0%{transform:translate(0,-4px) scale(.43);opacity:0}10%{transform:translate(-2px,7px) scale(.47);opacity:1}35%{transform:translate(-11px,35px) scale(.58);opacity:1}80%{transform:translate(-29px,98px) scale(.85);opacity:1}96%,100%{transform:translate(-36px,116px) scale(.95);opacity:0}}
+@media(prefers-reduced-motion:reduce){.jumper,.convoy,.ripple,.front-calf,.front-hoof{animation:none!important}.convoy{transform:translate(var(--park-x),var(--park-y)) scale(var(--park-scale))}}
+.still .jumper,.still .convoy,.still .ripple{animation:none!important}.still .convoy{transform:translate(var(--park-x),var(--park-y)) scale(var(--park-scale))}
+'''
 
 def rosette(x,y,r=4):
     return f'<g transform="translate({x} {y})"><path d="M-{r} 0q-2-{r} 2-{r+1}m3 0q{r} 1 {r-1} {r}m-1 3q-3 3-5 0" fill="none" stroke="#725039" stroke-width="2.3"/><circle cx="0" cy="0" r="1.5" fill="#b58645" stroke="none"/></g>'
@@ -46,22 +54,57 @@ def leopard():
 <path d="M124 101l-19-3m20 7-17 2m57-6 18-4m-19 8 18 2" fill="none" stroke-width="1"/>
 </g></g></g>'''
 
+def front_calf():
+    # Same blue scarf, cream/brown markings and round glasses, redrawn facing camera.
+    return '''<g class="front-calf ink">
+<ellipse cx="0" cy="2" rx="23" ry="4" fill="#776953" opacity=".17" stroke="none"/>
+<g class="front-hoof"><path d="M-18-19l-1 17q7 6 14 0l-1-19" fill="#fff3d9"/><path d="M-19-5q6 3 14 0v5q-6 5-14 0z" fill="#685646"/></g>
+<g class="front-hoof other"><path d="M6-19 5-2q7 6 14 0l-1-19" fill="#fff3d9"/><path d="M5-5q6 3 14 0v5q-6 5-14 0z" fill="#685646"/></g>
+<path d="M-20-50q-14 12-10 26l10-2m39-24q14 12 11 26l-10-2" fill="#fff3d9"/>
+<path d="M-22-48q-10 27 0 35 22 10 44 0 10-10 0-35z" fill="#fff8e6"/>
+<path d="M-22-35q13-8 15 6-2 12-17 10m28-6q15-4 16 10l-13 2" fill="#99856a" stroke="none"/>
+<path d="M-22-49q20 13 44 0l-2 10q-20 12-40 0zM-1-38l-8 16 16-4-1-13" fill="#82a9b1"/>
+<path d="M-23-73q-25-11-19 3 6 10 19 5m46-8q25-11 19 3-6 10-19 5" fill="#fff0d1"/>
+<path d="M-20-79q-16-4-12-17 4 10 16 9m32 0q13-1 16-11 5 15-12 19" fill="#d8c08c"/>
+<path d="M-26-71q-1-21 26-21 27 0 26 21l2 21q-4 15-28 16-24-1-28-16z" fill="#fff8e6"/>
+<path d="M-25-78q13-11 16 6-4 12-17 9" fill="#99856a" stroke="none"/>
+<ellipse cx="0" cy="-49" rx="22" ry="13" fill="#e7bdaa"/>
+<path d="M-9-51v2m18-2v2m-15 8q6 4 12 0" fill="none" stroke-width="1.8"/>
+<g fill="none" stroke-width="2"><circle cx="-13" cy="-68" r="11"/><circle cx="13" cy="-68" r="11"/><path d="M-2-70h4"/></g>
+<g class="eye" fill="#514737" stroke="none"><ellipse cx="-12" cy="-68" rx="2" ry="3"/><ellipse cx="12" cy="-68" rx="2" ry="3"/></g>
+<path d="M-5-88l4-6 3 7 5-4" fill="#aa9471"/>
+</g>'''
+
 def scene(name):
     if name=='cow-truck':
-        cow=base['animal']()
-        calves=''.join(f'<g transform="translate(225 100) scale(.42)"><g class="convoy" style="--arrival:-{i*1.5}s;--parking:{i*70}px">{cow}</g></g>' for i in range(4))
-        # The translated parent is outside the animated element: positions do not get overwritten.
-        # Convoy displacements are in scaled units, keeping the scene within the viewBox.
-        return f'''<path d="M40 216h545" stroke="#c7baa0" fill="none"/>
-<g class="ink"><rect x="125" y="80" width="199" height="89" rx="6" fill="#91a38a"/>
-<path d="M124 101H68L43 139v44h90" fill="#79927f"/><path d="M77 111h35v33H57z" fill="#d6e7e2"/>
-<rect x="46" y="160" width="15" height="13" rx="3" fill="#f2d997"/>
-<path d="M131 180h190m-4-11 84 44h-30l-63-34" fill="#c7ad80"/>
-<circle cx="87" cy="183" r="23" fill="#655d50"/><circle cx="87" cy="183" r="11" fill="#d5c6a8"/>
-<circle cx="280" cy="183" r="23" fill="#655d50"/><circle cx="280" cy="183" r="11" fill="#d5c6a8"/>
-</g><rect x="125" y="83" width="197" height="16" fill="#91a38a" stroke="#514737" stroke-width="2"/>
-{calves}
-'''
+        calves=''.join(f'<g transform="translate(248 214)"><g class="convoy" style="--arrival:-{i*1.5}s;--park-x:{-i*10}px;--park-y:{i*31}px;--park-scale:{.43+i*.14}">{front_calf()}</g></g>' for i in range(4))
+        return f'''<ellipse cx="200" cy="247" rx="145" ry="29" fill="#d9d1bc" opacity=".4"/>
+<g class="ink">
+<!-- Rear-to-front roof, front face and near side form a compact three-quarter van. -->
+<path d="M72 120 235 59q13-4 23 1l66 36q10 7 10 19v79L165 265 66 220v-77q0-15 6-23" fill="#94a68e"/>
+<path d="M72 120 161 158 334 96 254 59q-8-4-19 0z" fill="#c0cdb4"/>
+<path d="M72 120q-6 14-6 25v75l99 45v-88q0-15-4-19z" fill="#8c9f87"/>
+<path d="M80 133 151 165v46l-78-33z" fill="#d3e4dc"/>
+<path d="M87 140l21 9m-22 1 13 6" stroke="#f8fbef" stroke-width="3"/>
+<path d="M87 174l20 8m20 1 16 7" fill="none" stroke="#6f8173"/>
+<path d="M170 169 202 157v43l-32 13z" fill="#cfdfd5"/>
+<path d="M67 211l98 43v11l-99-43z" fill="#677869"/>
+<path d="M77 195l19 8v12l-19-9zm59 25 18 8v12l-18-8z" fill="#efd79e"/>
+<path d="M103 213l23 10m-23-5 23 10" fill="none" stroke-width="2"/>
+<ellipse cx="184" cy="252" rx="13" ry="20" transform="rotate(19 184 252)" fill="#5b554b"/>
+<ellipse cx="184" cy="252" rx="6" ry="11" transform="rotate(19 184 252)" fill="#bdb79e"/>
+<ellipse cx="313" cy="201" rx="12" ry="18" transform="rotate(19 313 201)" fill="#5b554b"/>
+<ellipse cx="313" cy="201" rx="5" ry="9" transform="rotate(19 313 201)" fill="#bdb79e"/>
+<!-- Open central sliding door, panel parked toward rear rather than a long ramp. -->
+<path id="side-door" d="M211 152 276 127v85l-65 27z" fill="#4b6055"/>
+<path d="M218 158 269 139v64l-51 21z" fill="#64766a" stroke="none"/>
+<path d="M281 127 326 110v81l-45 18z" fill="#a8b99e"/>
+<path d="M287 135 319 124v29l-32 12z" fill="#d6e2d4"/>
+<path d="M286 178l8-3m-85-28 116-43" fill="none"/>
+<path d="M211 230 276 204l10 7-67 29z" fill="#c8bb9b"/>
+<path d="M219 240 286 213v5l-67 29z" fill="#7f8976"/>
+</g>
+{calves}'''
     if name=='leopard-jump':
         return f'''<path d="M312 166q-25 40-18 115h84q-12-55 18-115" fill="#d5e8e7"/>
 <path d="M45 226q137-24 250 0m88 0q115-18 222 0" stroke="#a5b98c" stroke-width="3" fill="none"/>
@@ -72,4 +115,4 @@ def scene(name):
 
 for name,cls,title in [('leopard','idle','豹拉：站立张望'),('leopard-run','fast','豹拉：轻巧快跑'),('leopard-jump','jump','豹拉：跳过小河'),('cow-truck','truck','一车小牛下来帮忙')]:
     for still in [False,True]:
-        (ROOT/f'{name}-mascots{"-still" if still else ""}.svg').write_text(f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 {300 if name=='leopard-jump' else 240}" role="img" aria-labelledby="title desc" class="{cls} {'still' if still else ''}" style="--step:.38s"><title id="title">{title}</title><desc id="desc">与牛马同系列的原创 SVG 小样，支持减少动态效果。</desc><style>{STYLE}</style>{scene(name)}</svg>''')
+        (ROOT/f'{name}-mascots{"-still" if still else ""}.svg').write_text(f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {400 if name=='cow-truck' else 640} {360 if name=='cow-truck' else 300 if name=='leopard-jump' else 240}" role="img" aria-labelledby="title desc" class="{cls} {'still' if still else ''}" style="--step:.38s"><title id="title">{title}</title><desc id="desc">与牛马同系列的原创 SVG 小样，支持减少动态效果。</desc><style>{STYLE}{VAN_STYLE if name=='cow-truck' else ''}</style>{scene(name)}</svg>''')

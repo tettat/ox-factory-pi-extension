@@ -16,6 +16,7 @@ function applyMotion() {
   const selected = Object.hasOwn(descriptions, action.value) ? action.value : 'running';
   mascots.src = `${selected}-mascots${still ? '-still' : ''}.svg`;
   mascots.alt = descriptions[selected];
+  mascots.setAttribute("data-action", selected);
   actionNote.textContent = descriptions[selected];
   motion.textContent = reduced.matches ? '系统已减少动态效果' : paused ? '播放动画' : '暂停动画';
   motion.disabled = reduced.matches;
