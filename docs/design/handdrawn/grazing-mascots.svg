@@ -1,5 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 240" role="img" aria-labelledby="title desc" class="run still" style="--step:.72s">
-<title id="title">牛马轻快跑步</title><desc id="desc">戴圆框眼镜、系围巾的小牛和小马。减少动态效果时静止。</desc><style>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 240" role="img" aria-labelledby="title desc" class="graze " style="--step:1s">
+<title id="title">牛马低头吃草</title><desc id="desc">戴圆框眼镜、系围巾的小牛和小马。减少动态效果时静止。</desc><style>
 .ink{stroke:#514737;stroke-width:2.3;stroke-linecap:round;stroke-linejoin:round}
 .body{transform-origin:105px 131px;animation:bounce var(--step) ease-in-out infinite}
 .leg{transform-origin:0px 0px;animation:stride var(--step) ease-in-out infinite}.rear{animation-delay:calc(var(--step) * -.5)}

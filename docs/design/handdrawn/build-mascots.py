@@ -1,0 +1,84 @@
+"""Build dependency-free SVG variants from one shared character drawing."""
+from pathlib import Path
+ROOT = Path(__file__).parent
+STYLE = '''
+.ink{stroke:#514737;stroke-width:2.3;stroke-linecap:round;stroke-linejoin:round}
+.body{transform-origin:105px 131px;animation:bounce var(--step) ease-in-out infinite}
+.leg{transform-origin:0px 0px;animation:stride var(--step) ease-in-out infinite}.rear{animation-delay:calc(var(--step) * -.5)}
+.tail{transform-origin:56px 116px;animation:tail 1s ease-in-out infinite alternate}
+.head{transform-origin:133px 100px;animation:nod var(--step) ease-in-out infinite}
+.ear{transform-origin:136px 55px;animation:ear 2.4s ease-in-out infinite}
+.eye{transform-box:fill-box;transform-origin:center;animation:blink 4.6s linear infinite}
+.dust{animation:dust var(--step) linear infinite}.ground{animation:ground .65s linear infinite}
+.horse{--delay:-.17s}.horse .body{animation-delay:var(--delay)}
+.fast .body{animation-name:sprint}.fast .leg{animation-name:gallop}
+.graze .body{animation:breathe 3s ease-in-out infinite}.graze .leg{animation:none}
+.graze .head{animation:graze 6s ease-in-out infinite}.graze .horse .head{animation-delay:-2s}
+.graze .jaw{animation:chew .45s ease-in-out infinite}.graze .grass-bite{animation:chew .45s ease-in-out infinite}
+.graze .dust,.graze .ground{display:none}.grass{display:none}.graze .grass{display:block}
+@keyframes bounce{0%,100%{transform:translateY(0)}50%{transform:translateY(-6px)}}
+@keyframes sprint{0%,100%{transform:translateY(0) rotate(3deg)}45%{transform:translateY(-10px) rotate(1deg)}}
+@keyframes stride{0%,100%{transform:rotate(-23deg)}50%{transform:rotate(23deg)}}
+@keyframes gallop{0%,100%{transform:rotate(-39deg)}50%{transform:rotate(35deg)}}
+@keyframes nod{50%{transform:rotate(-3deg)}}
+@keyframes tail{to{transform:rotate(17deg)}}
+@keyframes ear{0%,75%,100%{transform:rotate(0)}82%{transform:rotate(-10deg)}}
+@keyframes blink{0%,42%,46%,100%{transform:scaleY(1)}44%{transform:scaleY(.1)}}
+@keyframes dust{0%{opacity:0;transform:translate(8px,0) scale(.7)}30%{opacity:.4}100%{opacity:0;transform:translate(-20px,-7px) scale(1.1)}}
+@keyframes ground{to{transform:translateX(-36px)}}
+@keyframes breathe{50%{transform:translateY(1px)}}
+@keyframes graze{0%,12%,92%,100%{transform:translateY(5px) rotate(0)}28%,80%{transform:translateY(43px) rotate(46deg)}}
+@keyframes chew{50%{transform:translate(1px,1.6px)}}
+@media(prefers-reduced-motion:reduce){*{animation:none!important}.dust,.ground{display:none}}
+.still *{animation:none!important}.still .dust,.still .ground{display:none}
+.graze.still .head{transform:translateY(43px) rotate(46deg)}
+'''
+
+def leg(x, far, horse):
+    fill = '#bd976d' if horse else '#ded7bf'
+    return f'''<g transform="translate({x} 139)"><g class="leg {'rear' if far else ''}">
+    <path d="M-6 0L-5 28Q-3 35 5 34L10 33 6 26 7 0" fill="{fill}"/>
+    <path d="M-5 27L-6 36Q1 40 13 35L9 28Z" fill="#605145"/><path d="M3 31l1 5" fill="none" stroke="#a39178" stroke-width="1.2"/>
+    </g></g>'''
+
+def animal(horse=False):
+    skin = '#dfbb87' if horse else '#fff8e6'
+    tail = '<path d="M56 116Q17 109 20 147Q29 133 42 139L56 126" fill="#8d674e"/><path d="M47 121l-18 16m13-13-18 15" stroke="#bc9473" stroke-width="1"/>' if horse else '<path d="M56 116Q26 104 25 131" fill="none"/><path d="M25 127q-9 7-5 15 10-2 10-11" fill="#7b6957"/>'
+    ears = '<path d="M130 56l-7-29q-13 6-7 33m31-3 11-29q12 8 3 32" fill="#dfbb87"/><path d="M123 49l-2-13m33 15 5-13" stroke="#be8b79"/>' if horse else '<path d="M125 58Q96 45 102 66q12 10 25 3M160 58q24-17 25 2-7 12-21 12" fill="#fff8e6"/><path d="M112 59l10 5m51-5-8 7" stroke="#d5a795"/><path d="M128 51q-19-7-13-24 3 14 18 15m20 0q16-4 15-18 11 19-7 28" fill="#d2bc84"/>'
+    face = '<path d="M119 64q7-23 32-16 22 4 21 33l21 20q9 20-11 25-26 7-42-16l-21-14z" fill="#dfbb87"/>' if horse else '<path d="M117 63q0-21 29-20 30 0 31 31l-2 29q-7 19-29 19-32 0-34-24z" fill="#fff8e6"/>'
+    detail = '<path d="M119 65l-9 20 7 7-12 9 19 9 7-40m-8-15 8-17 8 16 11-10 6 13" fill="#8d674e"/><path d="M116 91l7-8m-5 16 7-6" stroke="#bd9270" stroke-width="1"/>' if horse else '<path d="M117 59q12-9 19 3l-6 20q-13 0-15-11" stroke="none" fill="#8c7d65"/><path d="M137 47l6-9 5 9 7-6" fill="#ae9974"/>'
+    muzzle = '<path d="M169 95q23 0 26 14 0 13-20 13l-15-14" fill="#f1d8b2"/><path d="M183 104l1 3m-10 9q7 4 12-1" fill="none"/>' if horse else '<ellipse cx="147" cy="103" rx="30" ry="18" fill="#e7bdaa"/><path d="M132 101v3m26-3v3m-20 11q10 5 18-1" fill="none"/>'
+    glasses = '<rect x="126" y="70" width="22" height="18" rx="7"/><rect x="155" y="72" width="22" height="18" rx="7"/><path d="M148 77h7"/>'
+    return f'''<g class="{'horse' if horse else 'cow'}" transform="translate({'357' if horse else '63'} 9)">
+    <ellipse cx="111" cy="190" rx="74" ry="5" fill="#d9d1b9" opacity=".45" stroke="none"/>
+    <g class="dust" stroke="none" fill="#b8a889"><circle cx="37" cy="183" r="5"/><circle cx="24" cy="181" r="3"/><circle cx="13" cy="185" r="2"/></g>
+    <g class="body ink"><g class="tail">{tail}</g>
+    {leg(77,True,horse)}{leg(133,False,horse)}
+    <path d="M58 109Q74 91 110 101l34 10q13 6 10 29-2 17-39 18-47 2-59-17-9-17 2-32" fill="{skin}"/>
+    {'<path d="M66 106q27-10 23 20-11 12-29 3m46 19q3-22 23-16l9 19" fill="#9c8b71" stroke="none"/>' if not horse else '<path d="M68 140q31 18 69 3" stroke="#e9cc9d" stroke-width="6" fill="none"/>'}
+    {leg(64,False,horse)}{leg(120,True,horse)}
+    <path d="M123 120q-9-25 0-41l29 9 4 42" fill="{skin}"/>
+    <path d="M118 113q17 10 39 0l-1 12q-23 10-38-1z" fill="{'#c78461' if horse else '#82a9b1'}"/>
+    <path d="M125 121l-9 24 16-5 4-16" fill="{'#c78461' if horse else '#82a9b1'}"/>
+    <g class="head"><g class="ear">{ears}</g>{face}{detail}
+    <g class="jaw">{muzzle}</g>
+    <g fill="none" stroke="#4f514a" stroke-width="2">{glasses}</g>
+    <g class="eye" fill="#453e33" stroke="none"><ellipse cx="138" cy="77" rx="2.3" ry="3.3"/><ellipse cx="166" cy="79" rx="2.3" ry="3.3"/></g>
+    <path d="M132 63q5-3 10 0m18 2 10 1" fill="none" stroke-width="1.5"/>
+    <circle cx="{'171' if horse else '122'}" cy="93" r="4" fill="#dca28b" stroke="none" opacity=".6"/>
+    <g class="grass grass-bite" fill="none" stroke="#718352" stroke-width="2"><path d="M{'178 117l12 8m-12-8 16 2' if horse else '155 114l17 7m-17-7 15-1'}"/></g>
+    </g></g>
+    <g class="grass" fill="none" stroke="#859565" stroke-width="2" stroke-linecap="round"><path d="M162 192l-6-16m6 16 8-20m-8 20 18-9m-28 11-4-12m32 12 8-16m-1 15 11-8"/><path d="M130 195q24-9 69 0" stroke="#c2cba7"/></g>
+    </g>'''
+
+for action,cls,title,step in [('running','run','牛马轻快跑步','.72s'),('sprinting','fast','牛马加速快跑','.34s'),('grazing','graze','牛马低头吃草','1s')]:
+    for still in [False,True]:
+        name = f'{action}-mascots{"-still" if still else ""}.svg'
+        svg=f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 240" role="img" aria-labelledby="title desc" class="{cls} {'still' if still else ''}" style="--step:{step}">
+<title id="title">{title}</title><desc id="desc">戴圆框眼镜、系围巾的小牛和小马。减少动态效果时静止。</desc><style>{STYLE}</style>
+<path d="M78 200h180m117 0h180" stroke="#d2c9b0" stroke-width="1.5" fill="none"/>
+<g class="ground" stroke="#b7b09e" opacity=".4" stroke-linecap="round"><path d="M103 208h22m98-3h20m170 3h23m91-3h15"/></g>
+{animal()}{animal(True)}</svg>'''
+        (ROOT/name).write_text(svg)
+# Keep the previous static URL usable.
+(ROOT/'resting-mascots.svg').write_text((ROOT/'running-mascots-still.svg').read_text())
