@@ -2814,6 +2814,8 @@
   async function reloadTalkHistory(worker) {
     const box = document.getElementById(`talkHistory-${worker}`);
     if (!box) return;
+    box.innerHTML = "";
+    box.appendChild(loadingText("加载中…"));
     const [jobsRes, requestsRes] = await Promise.all([
       api(`/api/jobs?worker=${encodeURIComponent(worker)}&limit=20`),
       api(`/api/talk-requests?worker=${encodeURIComponent(worker)}&limit=20`),
@@ -2920,7 +2922,7 @@
     const target = $("#workerDetail");
     if (!target) return;
     target.innerHTML = "";
-    target.appendChild(el("div", { class: "skeleton skeleton--row" }));
+    target.appendChild(loadingText("加载中…"));
     const res = await api(`/api/workers/${encodeURIComponent(name)}`);
     if (myId !== currentDetailId) return;
     if (!res.ok) {

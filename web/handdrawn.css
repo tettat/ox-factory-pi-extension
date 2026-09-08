@@ -34,12 +34,15 @@
 [data-skin="handdrawn"] .brand__logo { box-shadow:1px 2px 0 #a9997555; }
 .skin-switch { max-width:130px; font:inherit; padding:5px 7px; border:1px solid var(--border-soft); border-radius:6px; background:var(--bg-surface); color:var(--text-primary); }
 .factory-loading-mascot { display:none; }
-[data-skin="handdrawn"] .factory-loading-host { position:relative; min-height:86px; }
+[data-skin="handdrawn"] .factory-loading-host {
+  position:relative; min-height:129px; display:flex; flex-direction:column;
+  align-items:center; justify-content:center; gap:8px; text-align:center;
+}
 [data-skin="handdrawn"] .factory-loading-mascot { display:flex; justify-content:center; align-items:center; order:-1; pointer-events:none; }
-[data-skin="handdrawn"] .factory-loading-mascot img { width:120px; height:76px; object-fit:contain; }
+[data-skin="handdrawn"] .factory-loading-mascot img { width:180px; height:114px; object-fit:contain; }
 /* Keep text placeholders; only decorative skeleton rows are replaced. */
 [data-skin="handdrawn"] .factory-loading-host > .skeleton { display:none; }
-[data-skin="handdrawn"] .factory-loading-host:not(.page-loading) .factory-loading-mascot img { width:96px; height:64px; }
+[data-skin="handdrawn"] .factory-loading-host:not(.page-loading) .factory-loading-mascot img { width:144px; height:96px; }
 @media(prefers-reduced-motion:reduce) {
   [data-skin="handdrawn"] .skeleton { animation:none!important; }
 }

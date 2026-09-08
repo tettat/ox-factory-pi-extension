@@ -49,3 +49,16 @@ test('switching back before delay prevents loading a mascot',()=>{
 test('asset failure restores ordinary placeholder instead of blocking loading',()=>{
  const f=fixture('handdrawn'),host=f.node();f.api.decorateLoading(host);f.flush();const visual=host.children[0];visual.children[0].error();assert.equal(visual.removed,true);
 });
+
+test('worker detail and talk history refresh loading placeholders use the skin decorator',()=>{
+ const source=readFileSync(new URL('../web/app.js',import.meta.url),'utf8');
+ assert.match(source,/target\.appendChild\(loadingText\("加载中…"\)\)/);
+ assert.match(source,/box\.appendChild\(loadingText\("加载中…"\)\)/);
+});
+
+test('handdrawn loading mascots are larger and centered inside their host container',()=>{
+ const css=readFileSync(new URL('../web/handdrawn.css',import.meta.url),'utf8');
+ assert.match(css,/\.factory-loading-host\s*\{[^}]*display:flex[^}]*align-items:center[^}]*justify-content:center/s);
+ assert.match(css,/\.factory-loading-mascot img\s*\{[^}]*width:180px;[^}]*height:114px/s);
+ assert.match(css,/\.factory-loading-host:not\(\.page-loading\) \.factory-loading-mascot img\s*\{[^}]*width:144px;[^}]*height:96px/s);
+});
