@@ -103,3 +103,90 @@ test('Codex cumulative updates do not accumulate the same usage notification twi
  assert.deepEqual(first,second);
  assert.equal(estimateApiCost({...job,...second,apiPrice:price}).usd,0.0078);
 });
+
+test('default price table covers active factory models that can be priced',()=>{
+ const prices=readApiPrices('/path/that/does/not/exist');
+ for(const model of [
+  'gpt-6-astra',
+  'gpt-5.6-sol',
+  'gpt-5.5',
+  'gpt-5.4',
+  'MiniMax-M3',
+  'deepseek-v4-flash',
+  'deepseek-v4-pro',
+  'opensource/glm5.2',
+  'super-relay/opensource/glm5.2',
+  'modelhub/gpt-5.5-2026-04-24',
+  'gpt-5.5-2026-04-24',
+ ]) assert.ok(prices[model], `${model} should have a default reference price`);
+});
+
+test('OpenAI long-context requests apply the documented full-request multiplier',()=>{
+ const prices=readApiPrices('/path/that/does/not/exist');
+ const cost=estimateApiCost({
+  model:'gpt-5.5',
+  tokenUsageSchema:'codex-inclusive-v1',
+  inputTokens:300000,
+  cachedInputTokens:100000,
+  outputTokens:1000,
+  status:'done',
+ },prices);
+ assert.equal(cost.status,'estimated');
+ assert.equal(cost.usd,2.145);
+ assert.equal(cost.pricingTier,'long-context');
+});
+
+test('schema-less provider usage can opt into exclusive input accounting',()=>{
+ const prices=readApiPrices('/path/that/does/not/exist');
+ const cost=estimateApiCost({
+  model:'MiniMax-M3',
+  inputTokens:21,
+  cachedInputTokens:188086,
+  outputTokens:393,
+  status:'done',
+ },prices);
+ assert.equal(cost.status,'estimated');
+ assert.equal(cost.usd,0.01176306);
+ assert.equal(cost.nativeCurrency,'CNY');
+ assert.equal(cost.inputTokenMode,'exclusive');
+});
+
+test('MiniMax M3 switches to long-context tier above 512k input tokens',()=>{
+ const prices=readApiPrices('/path/that/does/not/exist');
+ const cost=estimateApiCost({
+  model:'MiniMax-M3',
+  inputTokens:600000,
+  cachedInputTokens:100000,
+  outputTokens:10000,
+  status:'done',
+ },prices);
+ assert.equal(cost.status,'estimated');
+ assert.equal(cost.usd,0.396);
+ assert.equal(cost.pricingTier,'long-context');
+});
+
+test('DeepSeek v4 peak/off-peak windows use Beijing time',()=>{
+ const prices=readApiPrices('/path/that/does/not/exist');
+ const offPeak=estimateApiCost({
+  model:'deepseek-v4-flash',
+  inputTokens:1000000,
+  cachedInputTokens:0,
+  outputTokens:1000000,
+  createdAt:'2026-09-06T02:30:00.000Z',
+  status:'done',
+ },prices);
+ const peak=estimateApiCost({
+  model:'deepseek-v4-flash',
+  inputTokens:1000000,
+  cachedInputTokens:0,
+  outputTokens:1000000,
+  createdAt:'2026-09-07T02:30:00.000Z',
+  status:'done',
+ },prices);
+ assert.equal(offPeak.status,'estimated');
+ assert.equal(peak.status,'estimated');
+ assert.equal(offPeak.pricingTier,'off-peak');
+ assert.equal(peak.pricingTier,'peak');
+ assert.equal(offPeak.usd,0.8571428571);
+ assert.equal(peak.usd,1.7142857143);
+});
