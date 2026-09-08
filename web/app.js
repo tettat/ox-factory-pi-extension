@@ -3185,7 +3185,7 @@
     $("#drawerEyebrow").textContent = "JOB";
     $("#drawerTitle").textContent = id;
     $("#drawerBody").innerHTML = "";
-    $("#drawerBody").appendChild(el("div", { class: "skeleton skeleton--row" }));
+    $("#drawerBody").appendChild(loadingText("加载中…"));
     const res = await api(`/api/jobs/${encodeURIComponent(id)}`);
     const body = $("#drawerBody");
     if (!res.ok) {

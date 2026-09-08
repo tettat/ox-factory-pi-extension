@@ -56,6 +56,16 @@ test('worker detail and talk history refresh loading placeholders use the skin d
  assert.match(source,/box\.appendChild\(loadingText\("加载中…"\)\)/);
 });
 
+test('job detail drawer loading placeholder uses the skin decorator',()=>{
+ const source=readFileSync(new URL('../web/app.js',import.meta.url),'utf8');
+ const start=source.indexOf('async function openJobDrawer');
+ const end=source.indexOf('async function cancelJobFromDrawer');
+ assert.ok(start>0 && end>start, 'openJobDrawer block should be locatable');
+ const block=source.slice(start,end);
+ assert.match(block,/appendChild\(loadingText\("加载中…"\)\)/);
+ assert.doesNotMatch(block,/appendChild\(el\("div", \{ class: "skeleton skeleton--row" \}\)\)/);
+});
+
 test('handdrawn loading mascots are larger and centered inside their host container',()=>{
  const css=readFileSync(new URL('../web/handdrawn.css',import.meta.url),'utf8');
  assert.match(css,/\.factory-loading-host\s*\{[^}]*display:flex[^}]*align-items:center[^}]*justify-content:center/s);
