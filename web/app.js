@@ -187,6 +187,12 @@
     return node;
   }
 
+  function loadingText(label, tag = "p") {
+    const node = el(tag, { class: "muted", text: label });
+    window.FactorySkin?.decorateLoading(node);
+    return node;
+  }
+
   function todayLocal() {
     // 本地时区 YYYY-MM-DD（避免后端 localDateString 依赖）
     const d = new Date();
@@ -2380,7 +2386,7 @@
     card.appendChild(hint);
 
     // 历史 talk jobs（最近 20 条）
-    const historyBox = el("div", { class: "talk-panel__history", id: `talkHistory-${worker}` }, [el("p", { class: "muted", text: "加载中…" })]);
+    const historyBox = el("div", { class: "talk-panel__history", id: `talkHistory-${worker}` }, [loadingText("加载中…")]);
     card.appendChild(historyBox);
 
     const showFeedbackError = (message) => {
@@ -3066,7 +3072,7 @@
 
     wrap.appendChild(el("section", { class: "section" }, [
       el("div", { class: "card card--flush" }, [
-        el("div", { class: "jobs-summary", id: "jobsSummary" }, [el("span", { class: "muted", text: "加载中…" })]),
+        el("div", { class: "jobs-summary", id: "jobsSummary" }, [loadingText("加载中…", "span")]),
         el("div", { class: "table-wrap" }, [
           el("table", { class: "table table--jobs" }, [
             el("thead", {}, [el("tr", {}, [
@@ -4014,6 +4020,7 @@
       ]),
     ]);
     wrap.appendChild(qualityHost);
+    window.FactorySkin?.decorateLoading(qualityHost.querySelector(".card"));
     queueMicrotask(async () => {
       try {
         const node = await renderQualityMetrics();
@@ -5173,7 +5180,7 @@
   }
 
   async function openFactoryTaskDrawer(id) {
-    openDrawer(el("div", { class: "skeleton skeleton--row" }), { eyebrow: "TASK", title: "加载中…" });
+    openDrawer(loadingText("加载中…"), { eyebrow: "TASK", title: "加载中…" });
     const res = await api(`/api/factory-tasks/${encodeURIComponent(id)}`);
     if (!res.ok) {
       openDrawer(errorBox("加载任务详情失败", res.detail), { eyebrow: "TASK", title: id });
@@ -5533,7 +5540,7 @@
     wrap.appendChild(el("section", { class: "filters" }, [select]));
     wrap.appendChild(el("section", { class: "section" }, [
       el("div", { class: "card" }, [
-        el("div", { id: "messagesBody" }, [el("p", { class: "muted", text: "加载中…" })]),
+        el("div", { id: "messagesBody" }, [loadingText("加载中…")]),
       ]),
     ]));
     main.appendChild(wrap);
@@ -5745,11 +5752,13 @@ async function route() {
     const query = new URLSearchParams(queryPart || "");
     const main = $("#main");
     main.innerHTML = "";
-    main.appendChild(el("div", { class: "page-loading" }, [
+    main.appendChild(el("div", { class: "page-loading", role: "status", "aria-label": "正在加载页面" }, [
       el("div", { class: "skeleton skeleton--title" }),
       el("div", { class: "skeleton skeleton--row" }),
       el("div", { class: "skeleton skeleton--row" }),
     ]));
+
+    window.FactorySkin?.decorateLoading(main.querySelector(".page-loading"));
 
     // 高亮 nav
     for (const a of $$(".sidenav__list a")) a.classList.remove("sidenav__link--active");

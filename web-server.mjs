@@ -2876,7 +2876,8 @@ function serveFile(res, filePath) {
   const type = MIME[ext] || "application/octet-stream";
   try {
     const buf = readFileSync(filePath);
-    res.writeHead(200, { "content-type": type, "cache-control": "no-store" });
+    const skinAsset = ext === ".svg" && filePath.startsWith(join(WEB_DIR, "skins", "handdrawn") + "/");
+    res.writeHead(200, { "content-type": type, "cache-control": skinAsset ? "private, max-age=300" : "no-store" });
     res.end(buf);
   } catch (err) {
     return errorResponse(res, 500, "Failed to read file", String(err.message || err));

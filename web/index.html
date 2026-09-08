@@ -9,6 +9,8 @@
     <link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🐂</text></svg>" />
     <link rel="stylesheet" href="vendor/katex/katex.min.css" />
     <link rel="stylesheet" href="styles.css" />
+    <link rel="stylesheet" href="handdrawn.css" />
+    <script src="factory-skin.js" defer></script>
   </head>
   <body>
     <!-- 顶部状态条 -->
@@ -45,6 +47,7 @@
             <span class="metric__label" data-i18n="metrics.tokensToday">今日 Token</span>
           </div>
         </div>
+        <select class="skin-switch" id="skinSwitch" aria-label="页面皮肤"><option value="classic">经典皮肤</option><option value="handdrawn">牛马手绘</option></select>
         <button class="btn btn--ghost lang-switch" id="langSwitch" type="button" title="切换语言" aria-label="切换语言">
           <span class="btn__icon" aria-hidden="true">🌐</span>
           <span class="btn__text" id="langSwitchText">中 / EN</span>
