@@ -65,7 +65,8 @@ test('worker preview distinguishes running, queued, completed unread, failures a
   assert.match(preview({finishedUnreadJobs:2}), /^已结束/);
   assert.match(preview({lastJob:{status:'failed'}}), /^任务失败/);
   assert.match(preview({lastJob:{status:'aborted'}}), /^已停止/);
-  assert.equal(preview({lastTalkReply:{contentPreview:'old result'}}), '空闲');
+  assert.equal(preview({lastTalkReply:{contentPreview:'old result'}}), 'old result');
+  assert.equal(preview({lastTalkReply:{contentPreview:'   '}}), '');
   assert.equal(preview({status:'vacation'}), '休假中');
 });
 

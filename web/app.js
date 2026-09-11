@@ -1061,7 +1061,7 @@
     if (status === "failed" || status === "stale") return "任务失败 · " + (worker.lastTalkReply?.contentPreview || "请查看任务详情");
     if (status === "aborted") return "已停止 · " + (worker.lastTalkReply?.contentPreview || "请查看任务详情");
     if (worker.finishedUnreadJobs > 0) return "已结束 · " + (worker.lastTalkReply?.contentPreview || "有任务结果待查看");
-    return "空闲";
+    return String(worker?.lastTalkReply?.contentPreview || "").trim();
   }
 
   function workerCardTalkPreviewNode(worker) {
