@@ -69,6 +69,19 @@ test('worker preview distinguishes running, queued, completed unread, failures a
   assert.equal(preview({status:'vacation'}), '休假中');
 });
 
+
+test('worker status dot renders without a hidden free worker variable', () => {
+  const source = readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
+  const fn = source.match(/  function workerStatusDot\(status, activeJobs = 0\) \{[\s\S]*?\n  \}/)[0];
+  const workerStatusDot = vm.runInNewContext(`const el=(tag, props)=>({tag, props}); (${fn.trim()})`);
+  const idle = workerStatusDot('idle');
+  assert.equal(idle.tag, 'span');
+  assert.equal(idle.props.class, 'dot dot--idle');
+  assert.equal(idle.props.title, 'idle');
+  const busy = workerStatusDot('idle', 1);
+  assert.equal(busy.props.class, 'dot dot--busy');
+});
+
 test('API ranking prioritizes unread results then running workers over recent idle workers', () => {
   const dir = mkdtempSync(join(tmpdir(), 'task-unread-rank-'));
   try {

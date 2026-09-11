@@ -762,8 +762,8 @@
     return Boolean(job?.id) && !JOB_TERMINAL_STATUSES.has(String(job.status || ""));
   }
 
-  function workerStatusDot(status) {
-    return el("span", { class: `dot dot--${w.activeJobs > 0 ? "busy" : status || "idle"}`, title: status || "idle" });
+  function workerStatusDot(status, activeJobs = 0) {
+    return el("span", { class: `dot dot--${activeJobs > 0 ? "busy" : status || "idle"}`, title: status || "idle" });
   }
 
   function normalizedAvatarStatus(status) {
@@ -1333,7 +1333,7 @@
           workerAvatarNode(w),
           el("div", { class: "worker-preview__body" }, [
             el("div", { class: "worker-preview__name" }, [
-              workerStatusDot(w.status),
+              workerStatusDot(w.status, w.activeJobs),
               el("span", { text: w.name }),
               w.status === "vacation" ? el("span", { class: "worker-card__vacation-badge", text: "🏖 休假" }) : null,
             ]),

@@ -10,4 +10,4 @@
 ## 验证
 
 新增 test/task-unread.test.mjs：事件聚合、运行转完成、终态/排队、API 输出与已读、UI 状态文案、排序。
-pnpm run check 通过；全量测试存在历史文档 docs/ox-factory-quality-checklist.md 缺失导致的失败（该文件未被 Git 跟踪）。排除此文档断言后运行其余测试。未修改主分支、未 reload，未作真实浏览器视觉验收。
+pnpm run check 通过；补齐主 worktree 的本地 ignored 文档后，pnpm test 通过。未 reload，未作真实浏览器视觉验收。
