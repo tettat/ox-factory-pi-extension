@@ -682,6 +682,9 @@ export function buildWorkersView(workersDir, jobs, tokenReport, messages, regist
           }
         : null,
       lastTalkReply,
+      finishedUnreadJobs: unreadJobState.finishedUnreadJobs || 0,
+      activeJobs: unreadJobState.activeJobs || 0,
+      queuedJobs: unreadJobState.queuedJobs || 0,
       unreadMessages: unread,
       unreadJobUpdates,
       unreadJobEvents,
@@ -690,6 +693,8 @@ export function buildWorkersView(workersDir, jobs, tokenReport, messages, regist
       lastInteractionAt,
     };
   }).sort((a, b) => {
+    const rank = (worker) => worker.finishedUnreadJobs > 0 ? 2 : worker.activeJobs > 0 ? 1 : 0;
+    if (rank(a) !== rank(b)) return rank(b) - rank(a);
     const aInteraction = String(a.lastInteractionAt || "");
     const bInteraction = String(b.lastInteractionAt || "");
     if (aInteraction || bInteraction) return bInteraction.localeCompare(aInteraction);
@@ -1235,6 +1240,9 @@ async function handleWorkerDetail(workersDir, res, name, url = null) {
     unreadMessages,
     unreadJobUpdates,
     unreadJobEvents,
+    finishedUnreadJobs: unreadJobState.finishedUnreadJobs || 0,
+    activeJobs: unreadJobState.activeJobs || 0,
+    queuedJobs: unreadJobState.queuedJobs || 0,
     unreadCount: unreadMessages + unreadJobUpdates,
     lastUnreadAt: unreadJobState.lastUnreadAt || null,
     inbox: inbox.map((m) => ({

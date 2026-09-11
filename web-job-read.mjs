@@ -116,6 +116,7 @@ export function markWebJobRead(workersDir, job, { readBy = "web" } = {}) {
     worker: job.worker || null,
     eventOffset: cursor.eventOffset,
     lastEventAt: cursor.lastEventAt,
+    status: job.status || "",
     readAt: nowIso(),
     readBy,
   };
@@ -133,6 +134,9 @@ export function buildWorkerJobUnreadSummary(workersDir, jobs = []) {
     if (!byWorker.has(name)) {
       byWorker.set(name, {
         worker: name,
+        finishedUnreadJobs: 0,
+        activeJobs: 0,
+        queuedJobs: 0,
         unreadJobs: 0,
         unreadEvents: 0,
         lastUnreadAt: null,
@@ -160,10 +164,14 @@ export function buildWorkerJobUnreadSummary(workersDir, jobs = []) {
     const readOffset = Number(read?.eventOffset || 0);
     const unreadEvents = Math.max(0, Number(cursor.eventOffset || 0) - readOffset);
     const unread = unreadEvents > 0;
+    const terminal = ["done", "failed", "aborted", "stale"].includes(job.status);
+    // Legacy read markers have no status: retain their event-based read state.
+    const finishedUnread = terminal && (unread || !read || (read.status !== undefined && read.status !== job.status));
     const item = {
       jobId: job.id,
       worker: job.worker || "",
       unread,
+      finishedUnread,
       unreadEvents,
       eventOffset: cursor.eventOffset,
       readOffset,
@@ -173,6 +181,9 @@ export function buildWorkerJobUnreadSummary(workersDir, jobs = []) {
     };
     byJob.set(job.id, item);
     const workerState = ensureWorker(job.worker || "");
+    if (finishedUnread) workerState.finishedUnreadJobs += 1;
+    if (["running", "orphan-running"].includes(job.status)) workerState.activeJobs += 1;
+    if (job.status === "queued") workerState.queuedJobs += 1;
     if (unread) {
       workerState.unreadJobs += 1;
       workerState.unreadEvents += unreadEvents;
@@ -193,7 +204,7 @@ export function markWorkerJobsRead(workersDir, jobs = [], { readBy = "web" } = {
   for (const job of jobs || []) {
     if (!job?.id) continue;
     const unread = summary.byJob.get(job.id);
-    if (!unread?.unread) continue;
+    if (!unread?.unread && !unread?.finishedUnread) continue;
     unreadEvents += Number(unread.unreadEvents || 0);
     reads.push(markWebJobRead(workersDir, job, { readBy }));
   }

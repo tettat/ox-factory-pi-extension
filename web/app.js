@@ -763,7 +763,7 @@
   }
 
   function workerStatusDot(status) {
-    return el("span", { class: `dot dot--${status || "idle"}`, title: status || "idle" });
+    return el("span", { class: `dot dot--${w.activeJobs > 0 ? "busy" : status || "idle"}`, title: status || "idle" });
   }
 
   function normalizedAvatarStatus(status) {
@@ -1050,11 +1050,18 @@
   }
 
   function unreadBadgeTitle(worker) {
-    return `未读 job 更新 ${worker.unreadJobUpdates || 0} · 未读 event ${worker.unreadJobEvents || 0} · 最后未读 ${worker.lastUnreadAt ? fmtRelative(worker.lastUnreadAt) : "-"}`;
+    return `${worker.finishedUnreadJobs || 0} 个已结束任务未读（每个任务计 1）`;
   }
 
   function workerCardTalkPreviewText(worker) {
-    return String(worker?.lastTalkReply?.contentPreview || "").trim();
+    if (worker.activeJobs > 0) return "正在输入…";
+    if (worker.queuedJobs > 0) return "等待执行…";
+    if (worker.status === "vacation") return "休假中";
+    const status = worker.lastJob?.status;
+    if (status === "failed" || status === "stale") return "任务失败 · " + (worker.lastTalkReply?.contentPreview || "请查看任务详情");
+    if (status === "aborted") return "已停止 · " + (worker.lastTalkReply?.contentPreview || "请查看任务详情");
+    if (worker.finishedUnreadJobs > 0) return "已结束 · " + (worker.lastTalkReply?.contentPreview || "有任务结果待查看");
+    return "空闲";
   }
 
   function workerCardTalkPreviewNode(worker) {
@@ -2101,8 +2108,10 @@
     // 初次渲染时，根据当前 URL 选中的 worker 高亮 active card
     const initialWorker = decodeURIComponent((location.hash.split("?")[0].split("/")[2] || ""));
 
-    // 最近交互靠前 · 已读只清 badge，不改变 lastInteractionAt，因此不会让员工掉下去。
+    // 已结束未读优先，其次执行中，再按最近交互排序。
     const sortedWorkers = [...workers].sort((a, b) => {
+      const rank = (w) => w.finishedUnreadJobs > 0 ? 2 : w.activeJobs > 0 ? 1 : 0;
+      if (rank(a) !== rank(b)) return rank(b) - rank(a);
       const la = a.lastInteractionAt ? new Date(a.lastInteractionAt).getTime() : 0;
       const lb = b.lastInteractionAt ? new Date(b.lastInteractionAt).getTime() : 0;
       if (lb !== la) return lb - la;
@@ -2130,13 +2139,13 @@
           el("span", { class: "muted workers__search-count", id: "workerSearchCount" }),
         ]),
         ...sortedWorkers.map((w) => {
-          const unread = Number(w.unreadCount || 0);
+          const unread = Number(w.finishedUnreadJobs || 0);
           const hasUnread = unread > 0;
           const status = w.status || "idle";
           return el("a", {
             class: `worker-card${status === "vacation" ? " worker-card--vacation" : ""}${w.name === initialWorker ? " worker-card--active" : ""}${hasUnread ? " worker-card--unread" : ""}`,
             href: `#/workers/${encodeURIComponent(w.name)}`,
-            data: { name: w.name, role: w.role || "", model: w.model || "", unread, lastInteractionAt: w.lastInteractionAt || "" },
+            data: { name: w.name, role: w.role || "", model: w.model || "", unread, activeJobs: w.activeJobs || 0, lastInteractionAt: w.lastInteractionAt || "" },
             onclick: (e) => {
               e.preventDefault();
               navigateToWorker(w.name);
@@ -2146,7 +2155,7 @@
             el("div", { class: "worker-card__body" }, [
               el("div", { class: "worker-card__headline" }, [
                 el("span", { class: "worker-card__name", text: w.name }),
-                el("span", { class: `worker-card__status-dot dot dot--${status || "idle"}`, title: status || "idle" }),
+                el("span", { class: `worker-card__status-dot dot dot--${w.activeJobs > 0 ? "busy" : status || "idle"}`, title: status || "idle" }),
                 status === "vacation" ? el("span", { class: "worker-card__vacation-badge", text: "休假" }) : null,
               ]),
               workerCardTalkPreviewNode(w),
@@ -2940,7 +2949,7 @@
       jobEvents: previousUnreadJobEvents,
       total: previousUnreadMessages + previousUnreadJobUpdates,
     };
-    const hasUnreadForWorker = previousUnreadMessages > 0 || previousUnreadJobUpdates > 0 || previousUnreadJobEvents > 0;
+    const hasUnreadForWorker = d.finishedUnreadJobs > 0 || previousUnreadMessages > 0 || previousUnreadJobUpdates > 0 || previousUnreadJobEvents > 0;
     if (hasUnreadForWorker) {
       const marked = await markWorkerReadFromUi(name);
       if (myId !== currentDetailId) return;
@@ -3195,8 +3204,8 @@
     }
     const d = res.data;
     if (d.read?.marked) {
-      const cleared = markTalkJobReadLocally(d.id || id);
-      if (cleared > 0) decrementWorkerCardUnreadLocally(d.worker, cleared);
+      markTalkJobReadLocally(d.id || id);
+      void refreshWorkerUnreadBadges();
     }
     body.innerHTML = "";
     body.appendChild(el("div", { class: "drawer__meta" }, [
@@ -5682,6 +5691,11 @@
 
   // 静默重新拉 /api/workers 刷新侧边列表的未读气泡。
   // 任何进入某个 worker detail / 打开 job drawer / 关闭 drawer 后都可能需要。
+  // 独立于语音/系统通知开关；隐藏页面不轮询，不重建详情和输入框。
+  setInterval(() => {
+    if (!document.hidden) void refreshWorkerUnreadBadges();
+  }, 5000);
+
   async function refreshWorkerUnreadBadges() {
     if (STATE.currentPage !== "workers" && STATE.currentPage !== "") return;
     if (STATE.unreadRefreshInFlight) return;
@@ -5700,8 +5714,14 @@
       const name = card.dataset.name;
       const w = map.get(name);
       if (!w) continue;
-      const unread = Number(w.unreadCount || 0);
+      const unread = Number(w.finishedUnreadJobs || 0);
       card.dataset.unread = String(unread);
+      card.dataset.activeJobs = String(w.activeJobs || 0);
+      const dot = card.querySelector(".worker-card__status-dot");
+      if (dot) {
+        dot.className = `worker-card__status-dot dot dot--${w.activeJobs > 0 ? "busy" : w.status || "idle"}`;
+        dot.title = workerCardTalkPreviewText(w);
+      }
       card.dataset.lastInteractionAt = w.lastInteractionAt || "";
       card.classList.toggle("worker-card--unread", unread > 0);
           // 找现存的 badge，并同步最近 talk 返回摘要
@@ -5726,8 +5746,10 @@
         existing.remove();
       }
     }
-    // 2. 按最近交互重排 DOM（保留 active card 仍 active；已读不会改变顺序）
+    // 2. 与初次渲染保持同一优先级，保留选中卡片。
     const ordered = cards.slice().sort((a, b) => {
+      const rank = (card) => Number(card.dataset.unread) > 0 ? 2 : Number(card.dataset.activeJobs) > 0 ? 1 : 0;
+      if (rank(a) !== rank(b)) return rank(b) - rank(a);
       const la = a.dataset.lastInteractionAt ? new Date(a.dataset.lastInteractionAt).getTime() : 0;
       const lb = b.dataset.lastInteractionAt ? new Date(b.dataset.lastInteractionAt).getTime() : 0;
       if (lb !== la) return lb - la;

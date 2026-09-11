@@ -3115,7 +3115,7 @@ test("web inbox messages can be marked read from the UI", () => {
   assert.match(appSource, /syncWorkerCardTalkPreview/);
   assert.doesNotMatch(appSource, /cssEscape/);
   assert.match(appSource, /lastInteractionAt/);
-  assert.match(appSource, /最近交互靠前/);
+  assert.match(appSource, /已结束未读优先/);
 });
 
 test("web worker detail uses lightweight default payloads for fast switching", () => {
