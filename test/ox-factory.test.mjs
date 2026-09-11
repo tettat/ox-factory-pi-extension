@@ -3502,6 +3502,20 @@ test("web job detail exposes stop action for active jobs", () => {
   assert.match(webStyleSource, /\.drawer__actions/);
 });
 
+test("web dashboard exposes a persisted wide job drawer preference", () => {
+  const webAppSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
+  const webStyleSource = readFileSync(join(testDir, "../web/styles.css"), "utf8");
+
+  assert.match(webAppSource, /DRAWER_WIDE_STORAGE_KEY/);
+  assert.match(webAppSource, /drawerWide:\s*readDrawerWideSetting\(\)/);
+  assert.match(webAppSource, /function applyDrawerWideSetting/);
+  assert.match(webAppSource, /id:\s*"drawerWideEnabled"/);
+  assert.match(webAppSource, /界面偏好/);
+  assert.match(webAppSource, /drawer\.classList\.toggle\("drawer--wide"/);
+  assert.match(webStyleSource, /\.drawer--wide\s+\.drawer__panel/);
+  assert.match(webStyleSource, /width:\s*min\(920px,\s*96vw\)/);
+});
+
 test("worker talk list exposes request edit cancel and active job stop controls", () => {
   const webServerSource = readFileSync(join(testDir, "../web-server.mjs"), "utf8");
   const webAppSource = readFileSync(join(testDir, "../web/app.js"), "utf8");

@@ -1209,6 +1209,7 @@ img { max-width: 100%; }
 .drawer--open { pointer-events: auto; }
 .drawer--open .drawer__backdrop { opacity: 1; }
 .drawer--open .drawer__panel { transform: translateX(0); }
+.drawer--wide .drawer__panel { width: min(920px, 96vw); }
 .drawer__head {
   display: flex; align-items: flex-start; justify-content: space-between;
   padding: 18px 22px;

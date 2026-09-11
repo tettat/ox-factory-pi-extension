@@ -9,6 +9,7 @@
   const REFRESH_DEBOUNCE_MS = 200;
   const DRAWER_OPEN_CLASS = "drawer--open";
   const LANG_STORAGE_KEY = "oxFactoryLang";
+  const DRAWER_WIDE_STORAGE_KEY = "oxFactoryDrawerWide";
   const NOTIFICATION_LAST_SEEN_KEY = "oxFactoryNotificationsLastSeen";
   const NOTIFICATION_SPOKEN_IDS_KEY = "oxFactoryNotificationsSpokenIds";
   const TALK_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"]);
@@ -96,6 +97,7 @@
     notificationPollInFlight: false,
     currentPage: "overview",
     drawerJob: null,
+    drawerWide: readDrawerWideSetting(),
     tokensDate: null,
     tokensTrendDays: null,
     qualityDateMode: "all",
@@ -113,6 +115,22 @@
       if (saved === "zh" || saved === "en") return saved;
     } catch {}
     return "zh";
+  }
+
+  function readDrawerWideSetting() {
+    try {
+      const saved = localStorage.getItem(DRAWER_WIDE_STORAGE_KEY);
+      return saved === "1" || saved === "true";
+    } catch {}
+    return false;
+  }
+
+  function applyDrawerWideSetting(enabled = STATE.drawerWide, opts = {}) {
+    STATE.drawerWide = Boolean(enabled);
+    const drawer = $("#drawer");
+    if (drawer) drawer.classList.toggle("drawer--wide", STATE.drawerWide);
+    if (opts.persist === false) return;
+    try { localStorage.setItem(DRAWER_WIDE_STORAGE_KEY, STATE.drawerWide ? "1" : "0"); } catch {}
   }
 
   function t(key) {
@@ -2087,6 +2105,7 @@
     const bodyEl = $("#drawerBody");
     bodyEl.innerHTML = "";
     bodyEl.appendChild(contentNode);
+    drawer.classList.toggle("drawer--wide", STATE.drawerWide);
     drawer.classList.add(DRAWER_OPEN_CLASS);
     drawer.setAttribute("aria-hidden", "false");
   }
@@ -3189,6 +3208,7 @@
   async function openJobDrawer(id) {
     STATE.drawerJob = id;
     const drawer = $("#drawer");
+    drawer.classList.toggle("drawer--wide", STATE.drawerWide);
     drawer.classList.add(DRAWER_OPEN_CLASS);
     drawer.setAttribute("aria-hidden", "false");
     $("#drawerEyebrow").textContent = "JOB";
@@ -5336,6 +5356,7 @@
 
   async function openTaskRequestDrawer(id) {
     const drawer = $("#drawer");
+    drawer.classList.toggle("drawer--wide", STATE.drawerWide);
     drawer.classList.add(DRAWER_OPEN_CLASS);
     drawer.setAttribute("aria-hidden", "false");
     $("#drawerEyebrow").textContent = "TASK";
@@ -5433,6 +5454,24 @@
     const settings = STATE.notificationSettings || res.data?.settings || {};
     const rule = settings.jobTerminal || {};
     const statuses = new Set(Array.isArray(rule.statuses) ? rule.statuses : []);
+    const drawerWideInput = el("input", {
+      id: "drawerWideEnabled",
+      type: "checkbox",
+      checked: STATE.drawerWide,
+      onchange: (event) => {
+        applyDrawerWideSetting(event.currentTarget.checked);
+        toast(event.currentTarget.checked ? "已开启宽任务详情侧栏" : "已关闭宽任务详情侧栏", "success");
+      },
+    });
+    const preferenceCard = el("div", { class: "card notification-settings" }, [
+      cardHead("界面偏好", "只保存在当前浏览器；开启后查看 Job / 派活 / 任务详情时使用更宽的右侧栏。"),
+      el("div", { class: "notification-settings__grid" }, [
+        el("label", { class: "notification-settings__field notification-settings__field--switch" }, [
+          el("span", { class: "notification-settings__label", text: "宽任务详情侧栏" }),
+          drawerWideInput,
+        ]),
+      ]),
+    ]);
     const form = el("form", { class: "card notification-settings" }, [
       cardHead("任务完成提醒", "第一版使用 Web Speech API。浏览器可能要求先点击一次“测试播放/启用声音”。"),
       el("div", { class: "notification-settings__grid" }, [
@@ -5523,6 +5562,7 @@
       toast("提醒配置已保存", "success");
     });
 
+    wrap.appendChild(el("section", { class: "section" }, [preferenceCard]));
     wrap.appendChild(el("section", { class: "section" }, [form]));
     wrap.appendChild(el("section", { class: "section" }, [
       el("div", { class: "card" }, [
@@ -6015,6 +6055,7 @@ async function route() {
   document.addEventListener("DOMContentLoaded", () => {
     bind();
     applyStaticI18n();
+    applyDrawerWideSetting(STATE.drawerWide, { persist: false });
     void loadNotificationSettings();
     route();
   });
