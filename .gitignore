@@ -37,3 +37,18 @@ docs/pi-*-handoff.md
 docs/worker-compaction-monitoring-report.md
 docs/ox-projects/ox-factory-*.md
 docs/pi-display-only-output-plan.md
+
+# Private runtime and deployment data for any host or Mobile Connector
+.pi/
+.netlify/
+output/
+outputs/
+.playwright-cli/
+.worktrees/
+.update/
+.publish-device-hub/
+*.pem
+*.key
+mobile/STATUS.md
+mobile/qa/
+mobile/deploy/*LOCAL*

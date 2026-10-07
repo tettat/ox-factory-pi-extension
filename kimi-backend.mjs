@@ -10,7 +10,7 @@ function clean(value) {
 
 function defaultKimiCommand() {
   if (clean(process.env.OX_KIMI_COMMAND)) return clean(process.env.OX_KIMI_COMMAND);
-  const bundled = join(homedir(), ".kimi-code", "bin", "kimi");
+  const bundled = join(homedir(), ".kimi-code", "bin", process.platform === "win32" ? "kimi.exe" : "kimi");
   if (existsSync(bundled)) return bundled;
   return "kimi";
 }
@@ -19,8 +19,9 @@ function kimiCommand(worker = {}) {
   return clean(worker.kimiCommand) || defaultKimiCommand();
 }
 
-export function buildKimiTaskContent({ worker, task, project, additionalContext, agentDef, workersDir }) {
+export function buildKimiTaskContent({ worker, task, project, additionalContext, agentDef, workersDir, systemPromptOverride }) {
   const taskContent = buildWorkerTaskPrompt({ task, project, additionalContext });
+  if (systemPromptOverride !== undefined) return [clean(systemPromptOverride), taskContent].filter(Boolean).join("\n\n---\n\n");
   if (worker?.kimiSessionInitialized) return taskContent;
 
   const systemPrompt = buildWorkerSystemPrompt(worker, {
@@ -44,7 +45,7 @@ export function buildKimiCliArgs({ worker = {}, taskContent = "" } = {}) {
   const args = [];
   const sessionId = clean(worker.kimiSessionId);
   if (worker.kimiSessionInitialized && sessionId) {
-    args.push("-r", sessionId);
+    args.push("--session", sessionId);
   }
 
   args.push("--output-format", "stream-json");
@@ -120,7 +121,7 @@ export function kimiStreamLineToEvents(line, state = {}) {
 export async function runKimiWorkerStreaming(options, onEvent) {
   const { worker, task, project, cwd, additionalContext, signal, agentDef, workersDir, onWorkerPatch } = options;
   const workCwd = cwd || worker.kimiCwd || process.cwd();
-  const taskContent = buildKimiTaskContent({ worker, task, project, additionalContext, agentDef, workersDir });
+  const taskContent = buildKimiTaskContent({ worker, task, project, additionalContext, agentDef, workersDir, systemPromptOverride: options.systemPromptOverride });
   const command = kimiCommand(worker);
   const args = buildKimiCliArgs({ worker, taskContent });
   const state = {

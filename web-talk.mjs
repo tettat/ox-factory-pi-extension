@@ -1,5 +1,6 @@
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { createHash } from "node:crypto";
 import {
   TALK_IMAGE_MAX_COUNT,
   filterTalkAttachmentMentionsInText,
@@ -125,6 +126,23 @@ export function createWebTalkRequest(workersDir, input) {
   const mode = normalizeWebTalkMode(input?.mode || input?.deliveryMode || "auto");
   if (!worker) throw new Error("worker 不能为空");
   if (!message && attachments.length === 0) throw new Error("message 或 attachments 至少需要一个");
+  // Optional transport idempotency: the Pi consumer keeps its existing request schema.
+  // Persist the key in the same append as the intent, so a connector crash cannot
+  // turn an acknowledged-or-unknown delivery into a second talk request.
+  const idempotencyKey = String(input?.idempotencyKey || "").trim();
+  if (idempotencyKey && !/^[a-zA-Z0-9:_-]{8,240}$/.test(idempotencyKey)) throw new Error("invalid talk idempotency key");
+  const lockId = idempotencyKey ? `dedupe_${createHash('sha256').update(idempotencyKey).digest('hex')}` : null;
+  const fd = lockId ? tryAcquireRequestLock(workersDir, lockId) : null;
+  if (lockId && fd == null) throw new Error("talk request creation busy; retry later");
+  try {
+  if (idempotencyKey) {
+    const existing = readJsonl(webTalkRequestsFile(workersDir)).find(e => REQUEST_EVENT_TYPES.has(e.type) && e.idempotencyKey === idempotencyKey);
+    if (existing) {
+      const shape = x => JSON.stringify([x.worker, x.message, x.from, x.mode, (x.attachments || []).map(a => a.id), x.attachmentMentions || []]);
+      if (shape(existing) !== shape({ worker, message, from, mode, attachments, attachmentMentions })) throw new Error("talk idempotency conflict");
+      return getWebTalkRequest(workersDir, existing.id) || { ...existing, status: "pending" };
+    }
+  }
   const request = {
     type: "request",
     protocolVersion: 2,
@@ -136,10 +154,12 @@ export function createWebTalkRequest(workersDir, input) {
     attachments,
     attachmentMentions,
     mode,
+    ...(idempotencyKey ? { idempotencyKey } : {}),
     createdAt: nowIso(),
   };
   appendJsonl(webTalkRequestsFile(workersDir), request);
   return { ...request, status: "pending" };
+  } finally { if (lockId) releaseRequestLock(workersDir, lockId, fd); }
 }
 
 export function listWebTalkRequests(workersDir, { worker, limit = 200 } = {}) {

@@ -2,7 +2,8 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
+import { piProviderArgs } from "./pi-provider-invocation.mjs";
 import {
   CodexAppServerClient,
   codexNotificationToStreamEvents,
@@ -14,6 +15,7 @@ import {
   normalizeCodexModel,
 } from "./codex-backend.mjs";
 import { runClaudeWorkerStreaming } from "./claude-backend.mjs";
+import { runKimiWorkerStreaming } from "./kimi-backend.mjs";
 
 const DEFAULT_OUTSOURCE_SYSTEM_PROMPT = [
   "你是牛马工厂临时外包 agent。",
@@ -35,7 +37,13 @@ export function getPiInvocation(args, options = {}) {
 
   // outsource-cli/outsource-runner 内部启动 Pi 子进程时，args 是给 Pi CLI 的。
   // 不能再用当前脚本递归启动自己，否则 `--mode json` 会被 outsource-cli 当成子命令解析。
-  if (callerIsOutsource) return { command: "pi", args };
+  if (callerIsOutsource) {
+    // Windows npm shims cannot be spawned with shell:false. Prefer the actual
+    // Pi CLI beside the Node runtime, without invoking a shell.
+    const cli = join(dirname(execPath), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "bundle", "cli.js");
+    if ((options.platform ?? process.platform) === "win32" && exists(cli)) return { command: execPath, args: [cli, ...args] };
+    return { command: "pi", args };
+  }
 
   if (currentScript && !isBunVirtualScript && exists(currentScript)) {
     return { command: execPath, args: [currentScript, ...args] };
@@ -94,8 +102,9 @@ function normalizeSkills(profile = {}) {
   return value.split(",").map((item) => item.trim()).filter(Boolean);
 }
 
-export function buildOutsourcePiArgs({ profile = {}, task = "", systemPromptPath = "" } = {}) {
+export function buildOutsourcePiArgs({ profile = {}, task = "", systemPromptPath = "", workersDir } = {}) {
   const args = ["--mode", "json", "-p", "--no-session"];
+  args.push(...piProviderArgs(profile, workersDir || join(process.cwd(), ".pi", "workers")));
   args.push("--name", `outsource-${profile.name || "agent"}`);
   if (profile.model) args.push("--model", String(profile.model));
   if (profile.thinking) args.push("--thinking", String(profile.thinking));
@@ -135,9 +144,9 @@ function emptyResult(profile = {}) {
   };
 }
 
-export async function runOutsourcePiStreaming({ profile = {}, task = "", cwd, signal } = {}, onEvent = () => {}) {
+export async function runOutsourcePiStreaming({ profile = {}, task = "", cwd, workersDir, signal } = {}, onEvent = () => {}) {
   const { tmpDir, file } = createSystemPromptFile(profile);
-  const { args } = buildOutsourcePiArgs({ profile, task, systemPromptPath: file });
+  const { args } = buildOutsourcePiArgs({ profile, task, systemPromptPath: file, workersDir });
   const result = emptyResult(profile);
   let collectedText = "";
   let emittedError = false;
@@ -290,9 +299,24 @@ export async function runOutsourceCodexStreaming({ profile = {}, task = "", cwd,
       if (message.method === "turn/started" && params.turn?.id) {
         turnId = params.turn.id;
         result.codexTurnId = turnId;
+        onEvent({ type: "codex_turn", threadId, turnId });
       }
       if (message.method === "thread/tokenUsage/updated") {
-        tokenUsageTracker.remember(params, turnId);
+        if (turnId && params.turnId && params.turnId !== turnId) return;
+        const liveUsage = tokenUsageTracker.remember(params, turnId);
+        if (hasNonZeroTokenUsage(liveUsage)) {
+          // Publish inclusive cumulative counters, just like employee jobs.
+          // Raw usage retains optional cache-write/context fields for billing.
+          onEvent({ type: "usage", ...liveUsage, model: result.model,
+            tokenUsageSchema: "codex-inclusive-v1", threadId, turnId,
+            rawTokenUsage: params.tokenUsage || params.usage || null });
+        }
+      }
+      if (message.method === "item/started" && params.item?.type) {
+        // Preserve otherwise-unmapped native actions (web search, file changes,
+        // collaboration tools, etc.) for downstream protocol audits.
+        onEvent({ type: "codex_item", kind: params.item.type, itemId: params.item.id,
+          threadId, turnId });
       }
       for (const event of codexNotificationToStreamEvents(message)) {
         if (event.type === "text") result.output += event.text || "";
@@ -313,6 +337,7 @@ export async function runOutsourceCodexStreaming({ profile = {}, task = "", cwd,
     });
     turnId = start.turn.id;
     result.codexTurnId = turnId;
+    onEvent({ type: "codex_turn", threadId, turnId });
 
     if (signal) {
       const interrupt = () => {
@@ -362,8 +387,14 @@ export async function runOutsourceCodexStreaming({ profile = {}, task = "", cwd,
     result.stopReason = "error";
     result.errorMessage = error?.message || String(error);
     result.stderr = result.errorMessage;
+    // A transport failure must not turn already-observed paid usage into zero.
+    Object.assign(result, tokenUsageTracker.get(turnId));
     onEvent({ type: "error", message: result.errorMessage });
-    onEvent({ type: "done", turns: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0, model: result.model, exitCode: 1, stopReason: "error", text: result.output, codexThreadId: result.codexThreadId, codexTurnId: result.codexTurnId });
+    onEvent({ type: "done", turns: 0, inputTokens: result.inputTokens,
+      cachedInputTokens: result.cachedInputTokens, outputTokens: result.outputTokens,
+      reasoningOutputTokens: result.reasoningOutputTokens, totalTokens: result.totalTokens,
+      model: result.model, exitCode: 1, stopReason: "error", text: result.output,
+      codexThreadId: result.codexThreadId, codexTurnId: result.codexTurnId });
     return result;
   } finally {
     client.close();
@@ -402,10 +433,30 @@ export async function runOutsourceClaudeStreaming({ profile = {}, task = "", pro
   );
 }
 
+export function buildOutsourceKimiWorker(profile = {}) {
+  return {
+    id: `outsource-${profile.name || "agent"}`,
+    role: "programmer",
+    backend: "kimi",
+    model: profile.model || "",
+    kimiSessionInitialized: false,
+  };
+}
+
+export async function runOutsourceKimiStreaming({ profile = {}, task = "", project = "", cwd, workersDir, signal } = {}, onEvent = () => {}) {
+  return runKimiWorkerStreaming({
+    worker: buildOutsourceKimiWorker(profile),
+    task, project, cwd, workersDir: workersDir || process.cwd(), signal,
+    additionalContext: "",
+    systemPromptOverride: String(profile.systemPrompt || DEFAULT_OUTSOURCE_SYSTEM_PROMPT),
+  }, onEvent);
+}
+
 export async function runOutsourceAgentStreaming(options = {}, onEvent = () => {}) {
   const profile = options.profile || {};
   const backend = String(profile.backend || "pi").toLowerCase();
   if (backend === "codex") return runOutsourceCodexStreaming(options, onEvent);
   if (backend === "claude") return runOutsourceClaudeStreaming(options, onEvent);
+  if (backend === "kimi") return runOutsourceKimiStreaming(options, onEvent);
   return runOutsourcePiStreaming(options, onEvent);
 }

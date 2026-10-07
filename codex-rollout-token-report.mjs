@@ -14,6 +14,7 @@ import { buildFactoryTokenReport } from "./token-report.mjs";
 
 const TOKEN_KEYS = [
   "inputTokens",
+  "uncachedInputTokens",
   "cachedInputTokens",
   "outputTokens",
   "reasoningOutputTokens",
@@ -24,6 +25,7 @@ const TOKEN_KEYS = [
 function zeroUsage() {
   return {
     inputTokens: 0,
+    uncachedInputTokens: 0,
     cachedInputTokens: 0,
     outputTokens: 0,
     reasoningOutputTokens: 0,
@@ -54,6 +56,7 @@ export function normalizeCodexUsage(value) {
     value.cache_read_input_tokens,
   );
   const outputTokens = firstNumber(value.outputTokens, value.output_tokens, value.output, value.completionTokens, value.completion_tokens);
+  const uncachedInputTokens = Math.max(0, inputTokens - cachedInputTokens);
   const reasoningOutputTokens = firstNumber(
     value.reasoningOutputTokens,
     value.reasoning_output_tokens,
@@ -61,12 +64,10 @@ export function normalizeCodexUsage(value) {
     value.reasoning_output,
   );
   const totalTokens = firstNumber(value.totalTokens, value.total_tokens, value.total, inputTokens + outputTokens);
-  const totalWithCachedTokens = firstNumber(
-    value.totalWithCachedTokens,
-    value.total_with_cached_tokens,
-    inputTokens + cachedInputTokens + outputTokens,
-  );
-  return { inputTokens, cachedInputTokens, outputTokens, reasoningOutputTokens, totalTokens, totalWithCachedTokens };
+  // Codex inputTokens is inclusive: cachedInputTokens is a subset, not an
+  // additional amount. Keep the legacy field as a compatibility alias.
+  const totalWithCachedTokens = totalTokens;
+  return { inputTokens, uncachedInputTokens, cachedInputTokens, outputTokens, reasoningOutputTokens, totalTokens, totalWithCachedTokens };
 }
 
 export function subtractUsage(after, before = zeroUsage()) {
@@ -514,6 +515,7 @@ function repairPatchForMatch(match, report) {
     outputTokens: usage.outputTokens,
     reasoningOutputTokens: usage.reasoningOutputTokens,
     totalTokens: usage.totalTokens,
+    tokenUsageSchema: "codex-inclusive-v1",
     tokenSource: "codex-rollout-delta",
     tokenRepairedAt: new Date().toISOString(),
     tokenRepair: {
@@ -583,13 +585,14 @@ export function repairCodexJobTokenMetadata(report, { workersDir, apply = false 
 }
 
 function formatUsageSummary(usage) {
+  const normalized = normalizeCodexUsage(usage);
   return [
-    formatTokenCount(usage.inputTokens),
-    formatTokenCount(usage.cachedInputTokens),
-    formatTokenCount(usage.outputTokens),
-    formatTokenCount(usage.reasoningOutputTokens),
-    formatTokenCount(usage.totalTokens),
-    formatTokenCount(usage.totalWithCachedTokens),
+    formatTokenCount(normalized.inputTokens),
+    formatTokenCount(normalized.uncachedInputTokens),
+    formatTokenCount(normalized.cachedInputTokens),
+    formatTokenCount(normalized.outputTokens),
+    formatTokenCount(normalized.reasoningOutputTokens),
+    formatTokenCount(normalized.totalTokens),
   ];
 }
 
@@ -605,7 +608,7 @@ export function formatCodexRolloutTokenReport(report) {
     "",
     "## 回算合计（rollout total_token_usage delta）",
     "",
-    "| 输入 | 缓存输入 | 输出 | 推理输出 | 总 | 含缓存合计 |",
+    "| 输入（含缓存） | 非缓存输入 | 缓存输入 | 输出 | 推理输出（输出子集） | 总 |",
     "|---:|---:|---:|---:|---:|---:|",
     `| ${formatUsageSummary(report.summary.totals).join(" | ")} |`,
   ];
@@ -616,15 +619,15 @@ export function formatCodexRolloutTokenReport(report) {
       "",
       "## 当前工厂 token_report 口径",
       "",
-      "| 输入 | 缓存输入 | 输出 | 推理输出 | 总 | 含缓存合计 | 来源 |",
+      "| 输入（含缓存） | 非缓存输入 | 缓存输入 | 输出 | 推理输出（输出子集） | 总 | 来源 |",
       "|---:|---:|---:|---:|---:|---:|---|",
       `| ${formatUsageSummary(reported).join(" | ")} | ${report.currentFactoryReport.source || "—"} |`,
       "",
       "## 差异倍数（rollout / 当前上报）",
       "",
-      "| 输入 | 缓存输入 | 输出 | 推理输出 | 总 | 含缓存合计 |",
+      "| 输入（含缓存） | 非缓存输入 | 缓存输入 | 输出 | 推理输出（输出子集） | 总 |",
       "|---:|---:|---:|---:|---:|---:|",
-      `| ${ratio(report.summary.totals.inputTokens, reported.inputTokens)} | ${ratio(report.summary.totals.cachedInputTokens, reported.cachedInputTokens)} | ${ratio(report.summary.totals.outputTokens, reported.outputTokens)} | ${ratio(report.summary.totals.reasoningOutputTokens, reported.reasoningOutputTokens)} | ${ratio(report.summary.totals.totalTokens, reported.totalTokens)} | ${ratio(report.summary.totals.totalWithCachedTokens, reported.totalWithCachedTokens)} |`,
+      `| ${ratio(report.summary.totals.inputTokens, reported.inputTokens)} | ${ratio(report.summary.totals.uncachedInputTokens, Math.max(0, reported.inputTokens - reported.cachedInputTokens))} | ${ratio(report.summary.totals.cachedInputTokens, reported.cachedInputTokens)} | ${ratio(report.summary.totals.outputTokens, reported.outputTokens)} | ${ratio(report.summary.totals.reasoningOutputTokens, reported.reasoningOutputTokens)} | ${ratio(report.summary.totals.totalTokens, reported.totalTokens)} |`,
     );
   }
 
@@ -632,7 +635,7 @@ export function formatCodexRolloutTokenReport(report) {
     "",
     "## 任务段明细",
     "",
-    "| 开始 | 结束 | 输入 | 缓存输入 | 输出 | 推理输出 | 总 | 含缓存合计 | 任务摘要 |",
+    "| 开始 | 结束 | 输入（含缓存） | 非缓存输入 | 缓存输入 | 输出 | 推理输出（输出子集） | 总 | 任务摘要 |",
     "|---|---|---:|---:|---:|---:|---:|---:|---|",
   );
   for (const segment of report.segments) {
@@ -651,12 +654,12 @@ export function formatCodexRolloutTokenReport(report) {
       `- 未匹配 rollout 段：${report.jobRepair.unmatchedSegments.length}`,
       `- 写入状态：${report.jobRepair.applied ? "已写入" : "未写入，仅预览"}`,
       "",
-      "| Job | 旧总 Token | 新总 Token | 旧含缓存估算 | 新含缓存估算 | 任务摘要 |",
+      "| Job | 旧总 Token | 新总 Token | 旧重复计缓存值 | 新总 Token（缓存只计一次） | 任务摘要 |",
       "|---|---:|---:|---:|---:|---|",
     );
     for (const change of report.jobRepair.changes) {
       const oldWithCached = (change.old.inputTokens || 0) + (change.old.cachedInputTokens || 0) + (change.old.outputTokens || 0);
-      const newWithCached = (change.new.inputTokens || 0) + (change.new.cachedInputTokens || 0) + (change.new.outputTokens || 0);
+      const newWithCached = change.new.totalTokens || (change.new.inputTokens || 0) + (change.new.outputTokens || 0);
       lines.push(`| ${change.jobId} | ${formatTokenCount(change.old.totalTokens)} | ${formatTokenCount(change.new.totalTokens)} | ${formatTokenCount(oldWithCached)} | ${formatTokenCount(newWithCached)} | ${compactText(change.task, 60)} |`);
     }
     if (report.jobRepair.changes.length === 0) lines.push("| — | 0 | 0 | 0 | 0 | 无匹配变更 |");

@@ -1581,6 +1581,7 @@ test("outsource Pi runner does not recursively spawn outsource CLI with Pi flags
   const invocation = getPiInvocation(piArgs, {
     currentScript: "/tmp/ox-factory-host/.pi/extensions/ox-factory/outsource-cli.mjs",
     execPath: "/usr/local/bin/node",
+    platform: "linux",
     exists: () => true,
   });
 
@@ -1594,6 +1595,7 @@ test("outsource worker does not recursively spawn itself with Pi flags", () => {
   const invocation = getPiInvocation(piArgs, {
     currentScript: "/tmp/ox-factory-host/.pi/extensions/ox-factory/outsource-worker.mjs",
     execPath: "/usr/local/bin/node",
+    platform: "linux",
     exists: () => true,
   });
 
@@ -1793,17 +1795,24 @@ test("codex worker and outsource execution have no default wall-clock timeout", 
   assert.match(indexSource, /不填\/0=不超时/);
 });
 
-test("outsource mode is tracked in quality checklist and market report", () => {
-  const checklist = readFileSync(join(testDir, "../docs/ox-factory-quality-checklist.md"), "utf8");
-  const tracker = readFileSync(join(testDir, "../docs/ox-factory-improvement-tracker.md"), "utf8");
-  const report = readFileSync(join(testDir, "../docs/ox-factory-subagent-market-report.md"), "utf8");
-
-  assert.match(checklist, /OF-037/);
-  assert.match(checklist, /外包模式/);
-  assert.match(checklist, /白纸/);
-  assert.match(tracker, /OF-037/);
-  assert.match(report, /OutsourceAgentProfile|外包模式/);
+test("outsource profiles preserve validated Codex full-access settings", () => {
+  const profile = normalizeOutsourceProfile({
+    name: "full-access",
+    backend: "codex",
+    codexServerUrl: "ws://127.0.0.1:48178",
+    codexApprovalPolicy: "never",
+    codexSandbox: "danger-full-access",
+  });
+  assert.equal(profile.codexServerUrl, "ws://127.0.0.1:48178");
+  assert.equal(profile.codexApprovalPolicy, "never");
+  assert.equal(profile.codexSandbox, "danger-full-access");
+  assert.throws(
+    () => normalizeOutsourceProfile({ name: "bad", backend: "codex", codexSandbox: "everything" }),
+    /非法 Codex sandbox/,
+  );
 });
+
+// Internal operating reports are not part of the public source contract.
 
 test("web task requests are event-sourced for dashboard delegation", () => {
   const webServerSource = readFileSync(join(testDir, "../web-server.mjs"), "utf8");
@@ -2019,7 +2028,9 @@ test("token report prefers session usage and uses job tokens only as fallback", 
           message: {
             role: "assistant",
             model: "MiniMax-M3",
-            usage: { input: 1000, cacheRead: 800, cacheWrite: 0, output: 200, reasoningOutputTokens: 50, totalTokens: 2000 },
+            // Aggregate cached input and read/write components describe the same
+            // tokens and must not be added twice.
+            usage: { input: 1000, cachedInputTokens: 800, cacheRead: 800, cacheWrite: 0, output: 200, reasoningOutputTokens: 50, totalTokens: 2000 },
           },
         }),
       ].join("\n") + "\n",
@@ -2055,14 +2066,16 @@ test("token report prefers session usage and uses job tokens only as fallback", 
       outputTokens: 40,
       reasoningOutputTokens: 7,
       totalTokens: 340,
+      tokenUsageSchema: "codex-inclusive-v1",
       model: "gpt-5.5",
     });
 
     const report = buildFactoryTokenReport({ workersDir, date: "2026-06-30" });
     const paipai = report.workers.find((worker) => worker.worker === "LocalAdmin");
-    assert.equal(paipai.reported.inputTokens, 1000);
+    assert.equal(paipai.reported.inputTokens, 1800);
+    assert.equal(paipai.reported.uncachedInputTokens, 1000);
     assert.equal(paipai.reported.outputTokens, 200);
-    assert.equal(paipai.reported.totalTokens, 1200);
+    assert.equal(paipai.reported.totalTokens, 2000);
     assert.equal(paipai.reported.cachedInputTokens, 800);
     assert.equal(paipai.reported.reasoningOutputTokens, 50);
     assert.equal(paipai.reported.totalWithCachedTokens, 2000);
@@ -2071,18 +2084,21 @@ test("token report prefers session usage and uses job tokens only as fallback", 
 
     const codex = report.workers.find((worker) => worker.worker === "小码");
     assert.equal(codex.reported.inputTokens, 300);
+    assert.equal(codex.reported.uncachedInputTokens, 180);
     assert.equal(codex.reported.outputTokens, 40);
     assert.equal(codex.reported.cachedInputTokens, 120);
     assert.equal(codex.reported.reasoningOutputTokens, 7);
     assert.equal(codex.reported.totalTokens, 340);
-    assert.equal(codex.reported.totalWithCachedTokens, 460);
+    assert.equal(codex.reported.totalWithCachedTokens, 340);
     assert.equal(codex.source, "job");
 
-    assert.equal(report.totals.inputTokens, 1300);
+    assert.equal(report.totals.inputTokens, 2100);
+    assert.equal(report.totals.uncachedInputTokens, 1180);
     assert.equal(report.totals.cachedInputTokens, 920);
     assert.equal(report.totals.outputTokens, 240);
     assert.equal(report.totals.reasoningOutputTokens, 57);
-    assert.equal(report.totals.totalWithCachedTokens, 2460);
+    assert.equal(report.totals.totalTokens, 2340);
+    assert.equal(report.totals.totalWithCachedTokens, 2340);
     assert.match(formatFactoryTokenReport(report), /工厂 Token 报告/);
     assert.doesNotMatch(formatFactoryTokenReport(report), /成本|¥|cost/i);
   } finally {
@@ -2166,17 +2182,18 @@ test("codex rollout token report sums per-task cumulative usage deltas", () => {
   assert.equal(segments[0].prompt, "今天在北京时间");
   assert.deepEqual(segments[0].usage, {
     inputTokens: 80,
+    uncachedInputTokens: 30,
     cachedInputTokens: 50,
     outputTokens: 10,
     reasoningOutputTokens: 5,
     totalTokens: 90,
-    totalWithCachedTokens: 140,
+    totalWithCachedTokens: 90,
   });
 
   const summary = summarizeSegments(segments);
   assert.equal(summary.segmentCount, 1);
   assert.equal(summary.totals.totalTokens, 90);
-  assert.equal(summary.totals.totalWithCachedTokens, 140);
+  assert.equal(summary.totals.totalWithCachedTokens, 90);
 });
 
 test("codex rollout token repair can patch matched done job metadata", () => {
@@ -2326,11 +2343,11 @@ test("token report CLI prints token-only output", () => {
     assert.match(output, /9\.50M/);
     assert.match(output, /360K/);
     assert.match(output, /1\.20K/);
-    assert.match(output, /2\.10M/);
+    assert.match(output, /11\.24M/);
     assert.match(output, /11\.60M/);
     assert.doesNotMatch(output, /1,738,735/);
-    assert.match(output, /缓存输入 Token/);
-    assert.match(output, /含缓存合计/);
+    assert.match(output, /缓存输入/);
+    assert.match(output, /输入 Token（含缓存）/);
     assert.doesNotMatch(output, /成本|¥|cost/i);
 
     const jsonOutput = execFileSync(process.execPath, [
@@ -2343,11 +2360,12 @@ test("token report CLI prints token-only output", () => {
     ], { encoding: "utf8" });
     const jsonReport = JSON.parse(jsonOutput);
     const dongzi = jsonReport.workers.find((worker) => worker.worker === "DeveloperA");
-    assert.equal(dongzi.reported.inputTokens, 1738735);
+    assert.equal(dongzi.reported.inputTokens, 11238735);
+    assert.equal(dongzi.reported.uncachedInputTokens, 1738735);
     assert.equal(dongzi.reported.cachedInputTokens, 9500000);
     assert.equal(dongzi.reported.outputTokens, 360000);
     assert.equal(dongzi.reported.reasoningOutputTokens, 1200);
-    assert.equal(dongzi.reported.totalTokens, 2098735);
+    assert.equal(dongzi.reported.totalTokens, 11598735);
     assert.equal(dongzi.reported.totalWithCachedTokens, 11598735);
   } finally {
     rmSync(workersDir, { recursive: true, force: true });
@@ -3194,16 +3212,20 @@ test("worker list keeps IM metadata and unread controls in stable card regions",
   assert.match(styleSource, /\.worker-card__talk-preview\s*\{[^}]*-webkit-line-clamp:\s*1/s);
 });
 
-test("worker cards are compact one-line talk entries with avatar and status dot only", () => {
+test("worker cards are compact one-line talk entries with avatar, model tag, and status dot", () => {
   const appSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
   const styleSource = readFileSync(join(testDir, "../web/styles.css"), "utf8");
 
   assert.match(appSource, /function workerAvatarNode/);
   assert.match(appSource, /worker-card__status-dot/);
+  assert.match(appSource, /function workerModelTag/);
+  assert.match(appSource, /thinking \? `\$\{model\}: \$\{thinking\}` : model/);
+  assert.match(appSource, /workerModelTag\(w\)/);
   assert.match(appSource, /worker\?\.avatar/);
   assert.doesNotMatch(appSource, /worker-card__role/);
   assert.doesNotMatch(appSource, /worker-card__meta/);
   assert.match(styleSource, /\.worker-card__talk-preview\s*\{[^}]*-webkit-line-clamp:\s*1/s);
+  assert.match(styleSource, /\.worker-model-tag\s*\{[^}]*text-overflow:\s*ellipsis/s);
 });
 
 test("overview worker preview list uses configured worker avatars", () => {
@@ -3211,7 +3233,16 @@ test("overview worker preview list uses configured worker avatars", () => {
   const previewBlock = appSource.match(/function workerPreview\(workers\) \{[\s\S]*?\n  \}/)?.[0] || "";
 
   assert.match(previewBlock, /workerAvatarNode\(w\)/);
+  assert.match(previewBlock, /workerModelTag\(w\)/);
   assert.doesNotMatch(previewBlock, /avatar__char[^]*\(w\.name \|\| "\?"\)\.slice\(0,\s*1\)/);
+});
+
+test("worker detail places the model tag beside the display name", () => {
+  const appSource = readFileSync(join(testDir, "../web/app.js"), "utf8");
+  const detailHeading = appSource.match(/el\("h2", \{\}, \[[\s\S]*?\n        \]\)/)?.[0] || "";
+
+  assert.match(detailHeading, /workerDisplayName\(d\)/);
+  assert.match(detailHeading, /workerModelTag\(d\)/);
 });
 
 test("worker detail uses preloaded jobs for initial talk history", () => {
@@ -3649,7 +3680,7 @@ test("kimi backend builds resume prompt args without unsupported auto flags", ()
     taskContent: "完成一个页面",
   });
 
-  assert.deepEqual(args, ["-r", "session_demo", "--output-format", "stream-json", "--model", "moonshot-v1", "-p", "完成一个页面"]);
+  assert.deepEqual(args, ["--session", "session_demo", "--output-format", "stream-json", "--model", "moonshot-v1", "-p", "完成一个页面"]);
   assert.equal(args.includes("--auto"), false);
   assert.equal(args.includes("--yolo"), false);
 });

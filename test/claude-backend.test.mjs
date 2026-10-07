@@ -45,7 +45,7 @@ console.log(JSON.stringify({ type: 'stream_event', event: { type: 'content_block
 console.log(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, num_turns: 1, result: 'Hello', stop_reason: 'end_turn', session_id: sessionId, usage: { input_tokens: 10, cache_read_input_tokens: 2, cache_creation_input_tokens: 1, output_tokens: 4 } }));
 `;
 
-test("Claude backend first run uses --session-id, streams output, and maps token usage", async () => {
+test("Claude backend first run uses --session-id, streams output, and maps token usage", { skip: process.platform === "win32" && "POSIX executable-shebang fixture; not a native Windows Claude CLI" }, async () => {
   const tmp = mkdtempSync(join(tmpdir(), "ox-claude-test-"));
   try {
     mkdirSync(join(tmp, "workers"), { recursive: true });
@@ -90,7 +90,7 @@ test("Claude backend first run uses --session-id, streams output, and maps token
   }
 });
 
-test("Claude backend initialized worker resumes the stored session instead of creating a new one", async () => {
+test("Claude backend initialized worker resumes the stored session instead of creating a new one", { skip: process.platform === "win32" && "POSIX executable-shebang fixture; not a native Windows Claude CLI" }, async () => {
   const tmp = mkdtempSync(join(tmpdir(), "ox-claude-test-"));
   try {
     mkdirSync(join(tmp, "workers"), { recursive: true });

@@ -1,5 +1,15 @@
 # Ox Factory 安装指南
 
+## 连接已有手机 Hub
+
+新电脑先安装并运行本机工厂，再按照 [Mobile Connector 接入说明](mobile/README.md) 操作：在手机生成一次性接入码，在新电脑执行 `enroll`，启动 Connector，再运行 `doctor`。
+
+不需要重新部署 Hub，也不要复制其他电脑的 `.pi`、模型登录信息或 Connector 配置。Mobile 要求 Node 22.12+。仓库内的 Connector 与工厂模块使用同一版本和目录布局。
+
+开发验收先在仓库根目录执行 `npm ci --ignore-scripts`，再执行 `npm ci --ignore-scripts --prefix mobile` 和 `npm run verify`。只运行 Connector 时仅需要 Mobile 的生产依赖。
+
+`internlab/` 模型是可选本地集成，需要宿主另行安装对应 provider extension；普通 Pi/Codex/Claude/Kimi 使用不依赖这个插件。仓库不包含任何用户私有 provider 凭证。
+
 Ox Factory / 牛马工厂是一个 **源码型 Pi extension**。推荐通过 `pi install`
 安装，不需要 npm 发布，也不需要把你的 `.pi/workers` 运行数据放进仓库。
 

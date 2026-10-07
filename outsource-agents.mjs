@@ -55,7 +55,7 @@ function normalizeList(value, fallback = []) {
 
 function normalizeBackend(value) {
   const backend = nonEmptyString(value, "pi").toLowerCase();
-  if (!["pi", "codex", "claude"].includes(backend)) {
+  if (!["pi", "codex", "claude", "kimi"].includes(backend)) {
     throw new Error(`不支持的外包后端: ${value}`);
   }
   return backend;
@@ -107,6 +107,22 @@ function normalizeClaudePermissionMode(value) {
   return mode;
 }
 
+function normalizeCodexApprovalPolicy(value) {
+  const policy = nonEmptyString(value);
+  if (!policy) return "";
+  const allowed = new Set(["on-request", "never"]);
+  if (!allowed.has(policy)) throw new Error(`非法 Codex approval policy: ${value}`);
+  return policy;
+}
+
+function normalizeCodexSandbox(value) {
+  const sandbox = nonEmptyString(value);
+  if (!sandbox) return "";
+  const allowed = new Set(["read-only", "workspace-write", "danger-full-access"]);
+  if (!allowed.has(sandbox)) throw new Error(`非法 Codex sandbox: ${value}`);
+  return sandbox;
+}
+
 function summarize(text, max = 1000) {
   const value = String(text ?? "");
   if (value.length <= max) return value;
@@ -156,6 +172,9 @@ export function normalizeOutsourceProfile(input = {}) {
     maxTurns: normalizePositiveNumber(input.maxTurns ?? input.max_turns, 1, 1, 50),
     defaultWait: input.defaultWait == null ? true : Boolean(input.defaultWait),
     timeoutMs: normalizeNonNegativeNumber(input.timeoutMs ?? input.timeout_ms, 0),
+    codexServerUrl: nonEmptyString(input.codexServerUrl || input.codex_server_url),
+    codexApprovalPolicy: normalizeCodexApprovalPolicy(input.codexApprovalPolicy || input.codex_approval_policy),
+    codexSandbox: normalizeCodexSandbox(input.codexSandbox || input.codex_sandbox),
     claudeCommand: nonEmptyString(input.claudeCommand || input.claude_command),
     claudePermissionMode: normalizeClaudePermissionMode(input.claudePermissionMode || input.claude_permission_mode),
     claudeTools: nonEmptyString(input.claudeTools || input.claude_tools),
@@ -168,6 +187,9 @@ export function normalizeOutsourceProfile(input = {}) {
   if (!profile.thinking) delete profile.thinking;
   if (!profile.model) delete profile.model;
   if (!profile.systemPrompt) delete profile.systemPrompt;
+  if (!profile.codexServerUrl) delete profile.codexServerUrl;
+  if (!profile.codexApprovalPolicy) delete profile.codexApprovalPolicy;
+  if (!profile.codexSandbox) delete profile.codexSandbox;
   if (!profile.claudeCommand) delete profile.claudeCommand;
   if (!profile.claudePermissionMode) delete profile.claudePermissionMode;
   if (!profile.claudeTools) delete profile.claudeTools;
@@ -256,7 +278,7 @@ export function createOutsourceRun(workersDir, input = {}) {
   return getOutsourceRun(workersDir, run.id);
 }
 
-export function appendOutsourceRunEvent(workersDir, event = {}) {
+export function appendOutsourceRunEvent(workersDir, event = {}, { readBack = true } = {}) {
   const runId = nonEmptyString(event.runId || event.id);
   if (!runId) throw new Error("outsource run event 缺少 runId");
   const entry = {
@@ -266,7 +288,9 @@ export function appendOutsourceRunEvent(workersDir, event = {}) {
     createdAt: event.createdAt || nowIso(),
   };
   appendJsonl(outsourceRunsFile(workersDir), entry);
-  return getOutsourceRun(workersDir, runId);
+  // Stream producers do not consume the derived run. Avoid replaying the entire
+  // shared ledger for every delta; retain the old return contract by default.
+  return readBack ? getOutsourceRun(workersDir, runId) : entry;
 }
 
 export function markOutsourceRunRunning(workersDir, { runId, jobId, pid, owner, startedAt } = {}) {
@@ -500,10 +524,10 @@ export function formatOutsourceProfiles(profiles = []) {
   return [
     "## 外包 Profiles",
     "",
-    "| name | backend | model | tools | skills | wait | desc |",
-    "|---|---|---|---|---|---|---|",
+    "| name | backend | model | thinking | access | tools | skills | wait | desc |",
+    "|---|---|---|---|---|---|---|---|---|",
     ...profiles.map((profile) =>
-      `| ${profile.name} | ${profile.backend || "pi"} | ${profile.model || "-"} | ${(profile.tools || []).join(", ") || "-"} | ${Array.isArray(profile.skills) ? profile.skills.join(", ") : String(profile.skills)} | ${profile.defaultWait !== false ? "yes" : "no"} | ${(profile.description || "-").replace(/\|/g, "\\|")} |`
+      `| ${profile.name} | ${profile.backend || "pi"} | ${profile.model || "-"} | ${profile.thinking || "-"} | ${profile.codexSandbox || profile.claudePermissionMode || "default"} | ${(profile.tools || []).join(", ") || "-"} | ${Array.isArray(profile.skills) ? profile.skills.join(", ") : String(profile.skills)} | ${profile.defaultWait !== false ? "yes" : "no"} | ${(profile.description || "-").replace(/\|/g, "\\|")} |`
     ),
   ].join("\n");
 }

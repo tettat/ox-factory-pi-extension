@@ -1,4 +1,5 @@
 import { readApiPrices } from "./api-cost.mjs";
+import { piProviderArgs } from "./pi-provider-invocation.mjs";
 /**
  * 牛马工厂 — Worker 进程管理
  *
@@ -210,6 +211,7 @@ export async function spawnWorker(options: SpawnOptions): Promise<SpawnResult> {
 
   const args: string[] = ["--mode", "json", "-p", "--session", worker.sessionFile, "--name", `${worker.role}-${worker.id}`];
 
+  args.push(...piProviderArgs(worker, getWorkersDir()));
   if (worker.model) {
     args.push("--model", worker.model);
   }
@@ -350,8 +352,9 @@ export type StreamEvent =
   | { type: "codex_thread"; threadId: string; text?: string }
   | { type: "claude_session"; sessionId: string; text?: string }
   | { type: "kimi_session"; sessionId: string; text?: string }
+  | { type: "compaction"; phase: "started" | "completed"; itemId?: string; text: string }
   | { type: "done"; turns: number; inputTokens: number; cachedInputTokens?: number; outputTokens: number; reasoningOutputTokens?: number; totalTokens?: number; model?: string; exitCode?: number; stopReason?: string; text?: string; codexThreadId?: string; codexTurnId?: string; claudeSessionId?: string; kimiSessionId?: string }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string; willRetry?: boolean };
 
 export async function spawnWorkerStreaming(
   options: SpawnOptions,
@@ -416,6 +419,7 @@ export async function spawnWorkerStreaming(
 
   const args: string[] = ["--mode", "json", "-p", "--session", worker.sessionFile, "--name", `${worker.role}-${worker.id}`];
 
+  args.push(...piProviderArgs(worker, getWorkersDir()));
   if (worker.model) args.push("--model", worker.model);
   if (worker.thinking) args.push("--thinking", worker.thinking);
 

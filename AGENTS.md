@@ -1,8 +1,8 @@
 # Ox Factory Agent Context
 
 This repository contains the standalone Pi extension for 牛马工厂 / ox-factory.
-It is independent from the surrounding `alpha_mind` repository. Treat this
-folder as the project root when working on ox-factory.
+Treat this folder as the source repository root. Host projects and runtime
+data live separately from the extension source.
 
 ## Shape
 

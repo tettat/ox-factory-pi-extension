@@ -272,6 +272,9 @@ export function codexNotificationToStreamEvents(message) {
     case "item/reasoning/summaryTextDelta":
       return params.delta ? [{ type: "thinking", text: params.delta }] : [];
     case "item/started":
+      if (item.type === "contextCompaction") {
+        return [{ type: "compaction", phase: "started", itemId: item.id, text: "正在压缩上下文，等待 Codex 返回；不会重置会话。" }];
+      }
       if (item.type === "commandExecution") {
         return [{ type: "tool_start", name: "bash", args: { command: item.command, cwd: item.cwd } }];
       }
@@ -289,6 +292,9 @@ export function codexNotificationToStreamEvents(message) {
         ? [{ type: "tool_output", name: params.tool || "mcp", text: params.delta || params.message }]
         : [];
     case "item/completed":
+      if (item.type === "contextCompaction") {
+        return [{ type: "compaction", phase: "completed", itemId: item.id, text: "上下文压缩完成，继续原会话。" }];
+      }
       if (item.type === "commandExecution") {
         return [{
           type: "tool_end",
@@ -315,7 +321,11 @@ export function codexNotificationToStreamEvents(message) {
       }
       return [];
     case "error":
-      return [{ type: "error", message: messageText(params.message || params.error, "codex app-server error") }];
+      return [{
+        type: "error",
+        message: messageText(params.message || params.error, "codex app-server error"),
+        ...(typeof params.willRetry === "boolean" ? { willRetry: params.willRetry } : {}),
+      }];
     default:
       return [];
   }
@@ -340,11 +350,19 @@ function wsToHttpReadyz(url) {
 
 async function isReady(url) {
   try {
-    const response = await fetch(wsToHttpReadyz(url), { signal: AbortSignal.timeout(1000) });
-    return response.ok;
+    const response = await fetch(wsToHttpReadyz(url), { signal: AbortSignal.timeout(3000) });
+    if (response.ok) return true;
   } catch {
-    return false;
+    // A busy app-server or older version may not answer HTTP readiness quickly.
   }
+  // Verify the actual protocol before attempting to launch another app-server.
+  const client = new CodexAppServerClient(url);
+  try {
+    await client.connect();
+    await client.initialize();
+    return true;
+  } catch { return false; }
+  finally { client.close(); }
 }
 
 function shouldAutoStart(url) {
@@ -366,7 +384,13 @@ export async function ensureCodexAppServer(url, { workersDir = process.cwd(), ti
     cwd: process.cwd(),
     detached: true,
     stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env },
+    windowsHide: true,
+    env: {
+      ...process.env,
+      ...(url === process.env.OX_CODEX_ISOLATED_URL && process.env.OX_CODEX_ISOLATED_HOME
+        ? { CODEX_HOME: process.env.OX_CODEX_ISOLATED_HOME, CODEX_SQLITE_HOME: process.env.OX_CODEX_ISOLATED_HOME }
+        : {}),
+    },
   });
   child.stdout.pipe(logStream, { end: false });
   child.stderr.pipe(logStream, { end: false });

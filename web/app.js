@@ -95,6 +95,11 @@
     notificationSettings: null,
     notificationPollTimer: null,
     notificationPollInFlight: false,
+    eventSource: null,
+    liveRefreshTimer: null,
+    liveFallbackTimer: null,
+    liveTopics: new Set(),
+    liveRefreshInFlight: false,
     currentPage: "overview",
     drawerJob: null,
     drawerWide: readDrawerWideSetting(),
@@ -179,6 +184,7 @@
       else if (k === "text") node.textContent = v;
       else if (k.startsWith("on") && typeof v === "function") {
         node.addEventListener(k.slice(2).toLowerCase(), v);
+        (node._factoryHandlers ||= {})[k.slice(2).toLowerCase()] = v;
       } else if (k === "data" && typeof v === "object") {
         for (const [dk, dv] of Object.entries(v)) node.dataset[dk] = dv;
       } else {
@@ -752,6 +758,202 @@
     }
   }
 
+  function selectedWorkerFromHash() {
+    const path = (location.hash || "").split("?")[0].replace(/^#\/?/, "").split("/").filter(Boolean);
+    return path[0] === "workers" && path[1] ? decodeURIComponent(path[1]) : null;
+  }
+
+  // Patch a completed snapshot in place. Preserve focus, scroll, expanded details,
+  // and unchanged DOM; refresh listeners too so they never retain stale job data.
+  const recentListScroll = new WeakMap();
+  document.addEventListener('scroll', e => {
+    if (e.target && typeof e.target === 'object') recentListScroll.set(e.target, Date.now());
+  }, { capture: true, passive: true });
+
+  function snapshotKey(node) {
+    if (node.nodeType !== Node.ELEMENT_NODE) return null;
+    if (node.id) return 'id:' + node.id;
+    for (const key of ['liveKey', 'jobId', 'requestId', 'messageId', 'name', 'publicFeed']) {
+      if (node.dataset[key]) return key + ':' + node.dataset[key];
+    }
+    return null;
+  }
+  function canReorderSnapshot(target) {
+    for (let n = target; n; n = n.parentNode) if (Date.now() - (recentListScroll.get(n) || 0) <= 800) return false;
+    const focused = document.activeElement;
+    const selection = document.defaultView?.getSelection?.();
+    return !target.contains(focused) && !(selection?.toString() && target.contains(selection.anchorNode))
+      && Date.now() - (recentListScroll.get(target) || 0) > 800;
+  }
+  function snapshotProtected(node) {
+    const selection = document.defaultView?.getSelection?.();
+    return node.contains(document.activeElement) || Boolean(selection?.toString() && (node.contains(selection.anchorNode) || node.contains(selection.focusNode)));
+  }
+  function moveSnapshotNode(target, node, before) {
+    // moveBefore retains focus/selection/iframe state on supporting browsers.
+    if (node.parentNode === target && typeof target.moveBefore === 'function') target.moveBefore(node, before);
+    else if (!snapshotProtected(node)) target.insertBefore(node, before);
+  }
+  function preserveSnapshotScroll(target, mutate) {
+    const scrollNodes = [target, ...target.querySelectorAll('*')];
+    const root = document.scrollingElement;
+    if (root && !scrollNodes.includes(root)) scrollNodes.push(root);
+    const saved = scrollNodes.filter(n => n.scrollTop > 0 || n.scrollLeft > 0).map(n => {
+      const top = n.getBoundingClientRect().top;
+      const anchor = [...n.querySelectorAll('[data-live-key], [data-job-id], .worker-card')]
+        .find(a => a.getBoundingClientRect().bottom > top);
+      return { n, x: n.scrollLeft, y: n.scrollTop, anchor, anchorTop: anchor?.getBoundingClientRect().top };
+    });
+    mutate();
+    for (const item of saved) if (item.n.isConnected) {
+      item.n.scrollLeft = item.x;
+      item.n.scrollTop = item.y + (item.anchor?.isConnected ? item.anchor.getBoundingClientRect().top - item.anchorTop : 0);
+    }
+  }
+  function patchSnapshotNode(current, next) {
+    if (!current || current.nodeType !== next.nodeType || current.nodeName !== next.nodeName) {
+      // A background snapshot must not destroy a focused subtree.
+      if (current && snapshotProtected(current)) return current;
+      if (current) current.replaceWith(next);
+      return next;
+    }
+    if (next.nodeType === Node.TEXT_NODE) {
+      if (snapshotProtected(current)) return current;
+      if (current.nodeValue !== next.nodeValue) current.nodeValue = next.nodeValue;
+      return current;
+    }
+    if (next.nodeType !== Node.ELEMENT_NODE) return current;
+    if (current.dataset.publicFeed && current.dataset.publicFeed === next.dataset.publicFeed) return current;
+    for (const [type, handler] of Object.entries(current._factoryHandlers || {})) current.removeEventListener(type, handler);
+    current._factoryHandlers = next._factoryHandlers;
+    for (const [type, handler] of Object.entries(next._factoryHandlers || {})) current.addEventListener(type, handler);
+    for (const attr of [...current.attributes]) {
+      if (attr.name === 'open' && current.tagName === 'DETAILS') continue;
+      if (!next.hasAttribute(attr.name)) current.removeAttribute(attr.name);
+    }
+    for (const attr of [...next.attributes]) {
+      if (attr.name === 'open' && current.tagName === 'DETAILS') continue;
+      // Native form state belongs to the user, not to a background snapshot.
+      if (['INPUT', 'TEXTAREA', 'SELECT'].includes(current.tagName) && ['value', 'checked', 'selected'].includes(attr.name)) continue;
+      if (current.getAttribute(attr.name) !== attr.value) current.setAttribute(attr.name, attr.value);
+    }
+    if (['INPUT', 'TEXTAREA', 'SELECT'].includes(current.tagName)) return current;
+    reconcileSnapshotChildren(current, next);
+    return current;
+  }
+  function reconcileSnapshotChildren(target, next) {
+    const existing = [...target.childNodes], keyed = new Map(existing.map(n => [snapshotKey(n), n]).filter(([k]) => k));
+    const retained = new Set(), reorder = canReorderSnapshot(target);
+    [...next.childNodes].forEach((candidate, index) => {
+      const key = snapshotKey(candidate);
+      let old = key ? keyed.get(key) : existing[index];
+      if (old && (retained.has(old) || (!key && snapshotKey(old)))) old = null;
+      const node = old ? patchSnapshotNode(old, candidate) : candidate;
+      retained.add(node);
+      if (!node.parentNode) target.insertBefore(node, target.childNodes[index] || null);
+      else if (reorder && target.childNodes[index] !== node) moveSnapshotNode(target, node, target.childNodes[index] || null);
+    });
+    for (const node of [...target.childNodes]) if (!retained.has(node) && !snapshotProtected(node)) node.remove();
+  }
+  function patchSnapshotChildren(target, next) {
+    preserveSnapshotScroll(target, () => reconcileSnapshotChildren(target, next));
+  }
+
+  async function refreshOverviewSilently() {
+    if (STATE.currentPage !== "overview" && STATE.currentPage !== "") return;
+    const res = await api("/api/overview");
+    if (!res.ok || (STATE.currentPage !== "overview" && STATE.currentPage !== "")) return;
+    STATE.lastOverview = res.data;
+    setTopbar(res.data);
+    const next = document.createElement("div");
+    renderOverview(res.data, STATE.lastOutsourceBundle || null, next);
+    patchSnapshotChildren($("#main"), next);
+  }
+
+  async function refreshWorkersLive() {
+    if (STATE.currentPage !== "workers" && STATE.currentPage !== "") return;
+    await refreshWorkerUnreadBadges();
+    const worker = selectedWorkerFromHash();
+    if (!worker) return;
+    // Never rebuild the selected employee's composer/header for a background event.
+    await reloadTalkHistory(worker);
+  }
+
+  async function applyLiveRefresh() {
+    if (STATE.liveRefreshInFlight || document.visibilityState === "hidden") return;
+    const topics = new Set(STATE.liveTopics);
+    if (topics.has("jobs") || topics.has("talk")) void refreshPublicFeeds();
+    STATE.liveTopics.clear();
+    STATE.liveRefreshInFlight = true;
+    try {
+      const page = STATE.currentPage || "overview";
+      if (page === "overview" && (topics.has("overview") || topics.has("jobs") || topics.has("workers") || topics.has("hub"))) {
+        await refreshOverviewSilently();
+      } else if (page === "workers" && (topics.has("workers") || topics.has("jobs") || topics.has("talk") || topics.has("messages") || topics.has("hub"))) {
+        await refreshWorkersLive();
+      } else if (page === "jobs" && (topics.has("jobs") || topics.has("talk"))) {
+        await loadJobs();
+      } else if (page === "messages" && topics.has("messages")) {
+        await loadMessages();
+      } else if (page === "tasks" && topics.has("tasks") && !$("#drawer")?.classList.contains(DRAWER_OPEN_CLASS)) {
+        await refreshFactoryTaskBoard();
+      } else if (page === "task-requests" && topics.has("task-requests")) {
+        const node = await renderTaskRequests();
+        if (STATE.currentPage === "task-requests") { const next = document.createElement("div"); next.appendChild(node); patchSnapshotChildren($("#main"), next); }
+      } else if (page === "projects" && topics.has("projects")) {
+        const id = (location.hash || "").split("?")[0].split("/")[2];
+        const node = id ? await renderProjectDetail(decodeURIComponent(id)) : await renderProjects();
+        if (STATE.currentPage === page && !$("#main")?.contains(document.activeElement)) {
+          const next = document.createElement("div"); next.appendChild(node);
+          patchSnapshotChildren($("#main"), next);
+        }
+      } else if (page === "permissions" && topics.has(page)) {
+        const node = await renderPermissions();
+        if (STATE.currentPage === page) { const next = document.createElement("div"); next.appendChild(node); patchSnapshotChildren($("#main"), next); }
+      } else if (page === "outsource" && topics.has(page)) {
+        const next = document.createElement("div");
+        await renderOutsource(next);
+        if (STATE.currentPage === page) patchSnapshotChildren($("#main"), next);
+      }
+    } finally {
+      STATE.liveRefreshInFlight = false;
+      if (STATE.liveTopics.size) scheduleLiveRefresh([]);
+    }
+  }
+
+  function scheduleLiveRefresh(topics = []) {
+    for (const topic of topics) STATE.liveTopics.add(topic);
+    if (STATE.liveRefreshTimer) return;
+    STATE.liveRefreshTimer = setTimeout(() => {
+      STATE.liveRefreshTimer = null;
+      void applyLiveRefresh();
+    }, 900);
+  }
+
+  function startFallbackReconciliation(interval = 30_000) {
+    if (STATE.liveFallbackTimer) clearInterval(STATE.liveFallbackTimer);
+    STATE.liveFallbackTimer = setInterval(() => {
+      scheduleLiveRefresh(["overview", "workers", "jobs", "talk", "messages", "tasks", "task-requests", "hub"]);
+    }, interval);
+  }
+
+  function connectFactoryEvents() {
+    startFallbackReconciliation(30_000);
+    if (!("EventSource" in window)) return;
+    STATE.eventSource?.close?.();
+    const source = new EventSource("/api/events");
+    STATE.eventSource = source;
+    source.addEventListener("factory", (event) => {
+      try {
+        const payload = JSON.parse(event.data);
+        scheduleLiveRefresh(Array.isArray(payload?.topics) ? payload.topics : []);
+      }
+      catch { scheduleLiveRefresh(["overview", "workers"]); }
+    });
+    source.addEventListener("open", () => startFallbackReconciliation(60_000));
+    source.addEventListener("error", () => startFallbackReconciliation(10_000));
+  }
+
   // ---- 渲染状态徽章 ----
   const STATUS_KEYS = ["queued", "running", "orphan-running", "done", "stale", "failed", "aborted"];
   const STATUS_LABELS = {
@@ -789,8 +991,27 @@
     return value === "working" ? "busy" : value;
   }
 
+  function workerDisplayName(worker) {
+    const defaults = { Pi: "派派", Kimi: "柯南", Codex: "牛来" };
+    if (typeof worker === "object" && worker) return worker.displayName || defaults[worker.name] || worker.name || "";
+    const name = String(worker || "");
+    return STATE.workers.find((item) => item.name === name)?.displayName || defaults[name] || name;
+  }
+
+  function workerModelTag(worker) {
+    const model = String(worker?.model || "").trim();
+    if (!model) return null;
+    const thinking = String(worker?.thinking || "").trim();
+    const label = thinking ? `${model}: ${thinking}` : model;
+    return el("span", {
+      class: "tag tag--soft worker-model-tag",
+      text: label,
+      title: thinking ? `模型：${model} · 思考深度：${thinking}` : `模型：${model}`,
+    });
+  }
+
   function workerAvatarNode(worker, opts = {}) {
-    const name = typeof worker === "string" ? worker : (worker?.name || "");
+    const name = workerDisplayName(worker);
     const avatar = typeof worker === "object" ? String(worker?.avatar || "").trim() : "";
     const status = normalizedAvatarStatus(typeof worker === "object" ? worker?.status : opts.status);
     const className = `avatar${opts.large ? " avatar--lg" : ""} avatar--${status}`;
@@ -819,8 +1040,9 @@
   }
 
   // ---- Overview 页面 ----
-  function renderOverview(overview, outsourceBundle) {
-    const main = $("#main");
+  function renderOverview(overview, outsourceBundle, destination = null) {
+    if (outsourceBundle) STATE.lastOutsourceBundle = outsourceBundle;
+    const main = destination || $("#main");
     main.innerHTML = "";
     const t = overview.totals || {};
     const wrap = el("div", { class: "page page--overview" });
@@ -921,7 +1143,7 @@
     const top = tokens.top || [];
     const maxT = Math.max(1, ...top.map((t) => t.reported?.totalWithCachedTokens || 0));
     const tokenSection = el("section", { class: "section" }, [
-      cardHead("今日 Token Top 5", `合计 ${fmtNumber(tokens.totals?.totalWithCached || 0)}（含缓存） · 数据来源: ${(top[0]?.source) || "—"}`),
+      cardHead("今日 Token Top 5", `合计 ${fmtNumber(tokens.totals?.totalWithCached || 0)}（缓存只计一次） · 数据来源: ${(top[0]?.source) || "—"}`),
       top.length === 0
         ? emptyState("今日暂无 token 记录")
         : el("div", { class: "bar-list" },
@@ -1298,17 +1520,17 @@
   function barRow(row, max) {
     const r = row.reported || {};
     const input = r.inputTokens || 0;
+    const uncached = r.uncachedInputTokens ?? Math.max(0, input - (r.cachedInputTokens || 0));
     const cache = r.cachedInputTokens || 0;
     const output = r.outputTokens || 0;
     const reasoning = r.reasoningOutputTokens || 0;
     const total = r.totalWithCachedTokens || 0;
 
-    // 同一根条子里多段堆叠：cache / input / output / reasoning
+    // 缓存是输入的子集，推理是输出的子集；堆叠时都只能计一次。
     const segs = [
       { key: "cache",     label: "缓存",  val: cache },
-      { key: "input",     label: "输入",  val: input },
+      { key: "input",     label: "非缓存输入",  val: uncached },
       { key: "output",    label: "输出",  val: output },
-      { key: "reasoning", label: "推理",  val: reasoning },
     ].filter((s) => s.val > 0);
     const totalSegSum = segs.reduce((a, b) => a + b.val, 0) || 1;
     const fillPct = total > 0 ? Math.max(2, Math.min(100, (total / max) * 100)) : 0;
@@ -1323,6 +1545,11 @@
     const tooltip = el("div", { class: "bar-row__tip" }, [
       el("div", { class: "bar-row__tip-title", text: `${row.worker} · 合计 ${fmtNumber(total)}` }),
       ...tooltipRows,
+      ...(reasoning > 0 ? [el("div", { class: "bar-row__tip-row" }, [
+        el("span", { class: "bar-row__tip-dot bar-row__tip-dot--reasoning" }),
+        el("span", { class: "bar-row__tip-label", text: "其中推理输出" }),
+        el("span", { class: "bar-row__tip-value", text: fmtNumber(reasoning) }),
+      ])] : []),
     ]);
 
     return el("div", { class: "bar-row" }, [
@@ -1352,7 +1579,8 @@
           el("div", { class: "worker-preview__body" }, [
             el("div", { class: "worker-preview__name" }, [
               workerStatusDot(w.status, w.activeJobs),
-              el("span", { text: w.name }),
+              el("span", { text: workerDisplayName(w) }),
+              workerModelTag(w),
               w.status === "vacation" ? el("span", { class: "worker-card__vacation-badge", text: "🏖 休假" }) : null,
             ]),
             el("div", { class: "worker-preview__meta" }, [
@@ -1416,7 +1644,7 @@
     const cards = $$(".worker-card", list);
     let visible = 0;
     for (const card of cards) {
-      const name = String(card.dataset.name || "").toLowerCase();
+      const name = String(card.dataset.searchName || card.dataset.name || "").toLowerCase();
       const match = !q || name.includes(q);
       card.hidden = !match;
       if (match) visible += 1;
@@ -1430,8 +1658,8 @@
 
   // ---- 外包团队页面 ----
   // 信息架构：标题「外包团队」；区块「外包团队配置」(Profiles) + 「运行与消息」(Runs)
-  async function renderOutsource() {
-    const main = $("#main");
+  async function renderOutsource(destination = null) {
+    const main = destination || $("#main");
     main.innerHTML = "";
     const wrap = el("div", { class: "page page--outsource" });
 
@@ -2110,6 +2338,72 @@
     drawer.setAttribute("aria-hidden", "false");
   }
 
+  let workerProfileTimer = null;
+  function hideWorkerProfile() {
+    clearTimeout(workerProfileTimer);
+    document.getElementById("worker-profile-popover")?.remove();
+  }
+  function showWorkerProfile(anchor, initialWorker) {
+    hideWorkerProfile();
+    workerProfileTimer = setTimeout(() => {
+      if (!anchor.isConnected) return;
+      const w = anchor._liveWorker || initialWorker;
+      const responsibilities = (w.responsibilities || []).filter((r) => r.status !== "removed");
+      const profile = el("aside", { id: "worker-profile-popover", class: "worker-profile-popover", role: "tooltip" }, [
+        el("strong", { text: workerDisplayName(w) }),
+        el("div", { class: "muted", text: `${w.model || w.backend || "—"}:${w.thinking || "—"} · ${w.status || "idle"}` }),
+        el("div", { text: `角色：${w.role || "未设定"}` }),
+        el("div", { text: `设备：${w.deviceName || "本机工厂"}` }),
+        el("div", { class: "worker-profile-popover__heading", text: "当前职责 / 负责项目" }),
+        ...responsibilities.map((r) => el("div", { text: `${r.project || "通用职责"} · ${r.relation || "contributor"}：${r.scope || r.note || "—"}` })),
+        !responsibilities.length ? el("div", { class: "muted", text: w.responsibility || "尚未同步职责，可点击查看详情" }) : null,
+      ]);
+      document.body.appendChild(profile);
+      const rect = anchor.getBoundingClientRect();
+      profile.style.left = `${Math.max(8, Math.min(rect.right + 12, innerWidth - profile.offsetWidth - 8))}px`;
+      profile.style.top = `${Math.max(8, Math.min(rect.top, innerHeight - profile.offsetHeight - 8))}px`;
+    }, 250);
+  }
+
+  function createWorkerCard(w, initialWorker) {
+          const unread = Number(w.finishedUnreadJobs || 0);
+          const hasUnread = unread > 0;
+          const status = w.status || "idle";
+          return el("a", {
+            class: `worker-card${status === "vacation" ? " worker-card--vacation" : ""}${w.name === initialWorker ? " worker-card--active" : ""}${hasUnread ? " worker-card--unread" : ""}`,
+            href: `#/workers/${encodeURIComponent(w.name)}`,
+            data: { name: w.name, searchName: `${workerDisplayName(w)} ${w.name} ${w.deviceName || ""}`, role: w.role || "", model: w.model || "", unread, activeJobs: w.activeJobs || 0, lastInteractionAt: w.lastInteractionAt || "" },
+            onmouseenter: (e) => showWorkerProfile(e.currentTarget, w),
+            onmouseleave: hideWorkerProfile,
+            onfocus: (e) => showWorkerProfile(e.currentTarget, w),
+            onblur: hideWorkerProfile,
+            onclick: (e) => {
+              e.preventDefault();
+              navigateToWorker(w.name);
+            },
+          }, [
+            workerAvatarNode(w),
+            el("div", { class: "worker-card__body" }, [
+              el("div", { class: "worker-card__headline" }, [
+                el("span", { class: "worker-card__name", text: workerDisplayName(w) }),
+                workerModelTag(w),
+                el("span", { class: `worker-card__status-dot dot dot--${w.activeJobs > 0 ? "busy" : status}`, title: workerCardTalkPreviewText(w) || status }),
+                status === "vacation" ? el("span", { class: "worker-card__vacation-badge", text: "休假" }) : null,
+              ]),
+              workerCardTalkPreviewNode(w),
+            ]),
+            el("div", { class: "worker-card__aside" }, [
+              w.remote ? el("span", { class: "tag tag--soft", text: w.deviceName || "远端设备" }) : null,
+              hasUnread ? el("span", {
+                class: "worker-card__badge worker-card__badge--unread",
+                text: unread > 99 ? "99+" : String(unread),
+                title: unreadBadgeTitle(w),
+              }) : null,
+            ]),
+          ]);
+
+  }
+
   function renderWorkers(workers) {
     const main = $("#main");
     main.innerHTML = "";
@@ -2157,37 +2451,7 @@
           }),
           el("span", { class: "muted workers__search-count", id: "workerSearchCount" }),
         ]),
-        ...sortedWorkers.map((w) => {
-          const unread = Number(w.finishedUnreadJobs || 0);
-          const hasUnread = unread > 0;
-          const status = w.status || "idle";
-          return el("a", {
-            class: `worker-card${status === "vacation" ? " worker-card--vacation" : ""}${w.name === initialWorker ? " worker-card--active" : ""}${hasUnread ? " worker-card--unread" : ""}`,
-            href: `#/workers/${encodeURIComponent(w.name)}`,
-            data: { name: w.name, role: w.role || "", model: w.model || "", unread, activeJobs: w.activeJobs || 0, lastInteractionAt: w.lastInteractionAt || "" },
-            onclick: (e) => {
-              e.preventDefault();
-              navigateToWorker(w.name);
-            },
-          }, [
-            workerAvatarNode(w),
-            el("div", { class: "worker-card__body" }, [
-              el("div", { class: "worker-card__headline" }, [
-                el("span", { class: "worker-card__name", text: w.name }),
-                el("span", { class: `worker-card__status-dot dot dot--${w.activeJobs > 0 ? "busy" : status || "idle"}`, title: status || "idle" }),
-                status === "vacation" ? el("span", { class: "worker-card__vacation-badge", text: "休假" }) : null,
-              ]),
-              workerCardTalkPreviewNode(w),
-            ]),
-            el("div", { class: "worker-card__aside" }, [
-              hasUnread ? el("span", {
-                class: "worker-card__badge worker-card__badge--unread",
-                text: unread > 99 ? "99+" : String(unread),
-                title: unreadBadgeTitle(w),
-              }) : null,
-            ]),
-          ]);
-        }),
+        ...sortedWorkers.map((w) => createWorkerCard(w, initialWorker)),
       ]),
       el("div", { class: "workers__detail", id: "workerDetail" }, [
         emptyState("选择左侧员工查看详情"),
@@ -2737,6 +3001,62 @@
     });
   }
 
+  const publicFeedCache = new Map();
+  const publicFeedReads = new Set();
+  function publicFeedNode(jobId) {
+    return el('section', { class: 'public-feed', data: { publicFeed: jobId } }, [
+      el('h4', { text: '实时交流 · 不含思考与工具日志' }),
+      el('div', { class: 'public-feed__body', role: 'log' }, [el('p', { class: 'muted', text: '正在读取公开文字…' })]),
+      el('button', { type: 'button', class: 'btn btn--ghost public-feed__latest', hidden: true, text: '有新内容 · 跳到最新', onclick: e => {
+        const body = e.currentTarget.parentNode.querySelector('.public-feed__body'); body.scrollTop = body.scrollHeight; e.currentTarget.hidden = true;
+      } }),
+    ]);
+  }
+  function paintPublicFeed(node, blocks) {
+    const body = node.querySelector('.public-feed__body');
+    const signature = JSON.stringify(blocks);
+    if (body._signature === signature) return;
+    const follow = !body._signature || body.scrollHeight - body.scrollTop - body.clientHeight < 70;
+    const top = body.scrollTop;
+    const next = el('div', {}, blocks.length ? blocks.map(b => el('article', { class: 'public-feed__message' + (b.type === 'steer' ? ' public-feed__message--human' : '') }, [
+      el('div', { class: 'muted', text: (b.type === 'steer' ? '你 · steer 已记录（是否立即执行以接入状态为准）' : '员工') + ' · ' + fmtTime(b.time) }),
+      mdNode(b.text),
+    ])) : [el('p', { class: 'muted', text: '执行中，尚无公开文字输出。' })]);
+    patchSnapshotChildren(body, next); body._signature = signature;
+    body.scrollTop = follow ? body.scrollHeight : top;
+    node.querySelector('.public-feed__latest').hidden = follow;
+  }
+  async function refreshPublicFeeds() {
+    if (document.visibilityState === 'hidden') return;
+    const nodes = [...document.querySelectorAll('[data-public-feed]')];
+    await Promise.all([...new Set(nodes.map(n => n.dataset.publicFeed))].map(async id => {
+      if (publicFeedReads.has(id)) return;
+      publicFeedReads.add(id);
+      let state = publicFeedCache.get(id) || { blocks: [] };
+      try {
+        let offset = Math.max(0, state.blocks.length - 1), pages = 0;
+        let more;
+        do {
+          const res = await api('/api/jobs/' + encodeURIComponent(id) + '?conversation=1&markRead=0&offset=' + offset);
+          if (!res.ok || !Array.isArray(res.data?.blocks)) {
+            for (const node of nodes.filter(n => n.dataset.publicFeed === id)) if (!node.querySelector('.public-feed__body')._signature) node.querySelector('.public-feed__body').textContent = '实时交流接口尚未生效，稍后自动重试。';
+            return;
+          }
+          state.status = res.data.status;
+          state.blocks.splice(offset, state.blocks.length - offset, ...res.data.blocks);
+          offset = res.data.nextOffset; more = res.data.hasMore;
+        } while (more && ++pages < 5);
+        publicFeedCache.set(id, state);
+        if (publicFeedCache.size > 50) publicFeedCache.delete(publicFeedCache.keys().next().value);
+        for (const node of document.querySelectorAll('[data-public-feed]')) if (node.dataset.publicFeed === id) {
+          if (['done', 'failed', 'aborted', 'stale'].includes(state.status) && node.closest('#drawerBody')) { void openJobDrawer(id); continue; }
+          paintPublicFeed(node, state.blocks);
+        }
+      } finally { publicFeedReads.delete(id); }
+    }));
+  }
+  setInterval(() => { void refreshPublicFeeds(); }, 10000);
+
   function renderTalkJobItem(worker, j) {
     const queued = isEditableQueuedJob(j);
     const unreadBeforeOpen = Boolean(j.unreadBeforeOpen);
@@ -2769,6 +3089,7 @@
       (j.assignedBy || j.source) ? el("div", { class: "talk-list__meta", text: [j.assignedBy ? `指派: ${j.assignedBy}` : "", j.source ? `来源: ${j.source}` : ""].filter(Boolean).join(" · ") }) : null,
       j.task ? talkMessageNode(j.task, j.attachmentMentions, j.attachments) : null,
       talkAttachmentNodes(j.attachments || []),
+      j.status === "running" && j.deliveryMode !== "steer" ? publicFeedNode(j.id) : null,
     ]);
   }
 
@@ -2830,27 +3151,49 @@
       ...talkJobs.map((job) => ({ type: "job", at: talkJobSortTime(job), job })),
       ...talkRequests.map((request) => ({ type: "request", at: talkRequestSortTime(request), request })),
     ].sort((a, b) => String(b.at || "").localeCompare(String(a.at || ""))).slice(0, 40);
-    box.innerHTML = "";
-    if (!items.length) { box.appendChild(el("p", { class: "muted", text: "暂无对话记录。发第一条消息试试。", })); return; }
-    // 最新在上面
-    const list = el("ul", { class: "talk-list" }, items.map((item) =>
-      item.type === "job" ? renderTalkJobItem(worker, item.job) : renderTalkRequestItem(worker, item.request),
-    ));
-    box.appendChild(list);
+    if (!items.length) {
+      if (box.textContent !== "暂无对话记录。发第一条消息试试。") box.replaceChildren(el("p", { class: "muted", text: "暂无对话记录。发第一条消息试试。" }));
+      return;
+    }
+    let list = box.querySelector(".talk-list");
+    if (!list) { list = el("ul", { class: "talk-list" }); box.replaceChildren(list); }
+    const existing = new Map([...list.children].map((node) => [node.dataset.liveKey, node]));
+    const retained = new Set();
+    preserveSnapshotScroll(box, () => {
+    const reorder = canReorderSnapshot(list);
+    items.forEach((item, index) => {
+      const data = item.job || item.request;
+      const key = `${item.type}:${data.id}`;
+      // DOM changes only when visible content changes, not on heartbeat/token writes.
+      const candidate = item.type === "job" ? renderTalkJobItem(worker, data) : renderTalkRequestItem(worker, data);
+      const signature = candidate.outerHTML;
+      let node = existing.get(key);
+      if (!node || node._liveSignature !== signature) {
+        candidate.dataset.liveKey = key; candidate._liveSignature = signature;
+        node = node ? patchSnapshotNode(node, candidate) : candidate;
+        node._liveSignature = signature;
+      }
+      retained.add(node);
+      if (!node.parentNode || (reorder && list.children[index] !== node)) moveSnapshotNode(list, node, list.children[index] || null);
+    });
+    for (const node of [...list.children]) if (!retained.has(node) && !node.contains(document.activeElement)) node.remove();
+    });
   }
 
   async function reloadTalkHistory(worker) {
     const box = document.getElementById(`talkHistory-${worker}`);
     if (!box) return;
-    box.innerHTML = "";
-    box.appendChild(loadingText("加载中…"));
+    const requestVersion = box._requestVersion = (box._requestVersion || 0) + 1;
+    if (!box.children.length) box.appendChild(loadingText("加载中…"));
     const [jobsRes, requestsRes] = await Promise.all([
       api(`/api/jobs?worker=${encodeURIComponent(worker)}&limit=20`),
       api(`/api/talk-requests?worker=${encodeURIComponent(worker)}&limit=20`),
     ]);
-    if (!jobsRes.ok) { box.innerHTML = ""; box.appendChild(errorBox("加载对话历史失败", jobsRes.detail)); return; }
+    if (document.getElementById(`talkHistory-${worker}`) !== box || box._requestVersion !== requestVersion) return;
+    if (!jobsRes.ok) { if (!box.querySelector(".talk-list")) box.replaceChildren(errorBox("加载对话历史失败", jobsRes.detail)); return; }
     if (!requestsRes.ok) toast("加载 talk 请求状态失败，仅展示 job", "error");
     renderTalkHistory(worker, jobsRes.data.jobs || [], requestsRes.ok ? (requestsRes.data.requests || []) : []);
+    void refreshPublicFeeds();
   }
 
   async function stopTalkJobFromList(worker, jobId, button, options = {}) {
@@ -2991,13 +3334,13 @@
       el("div", { class: "worker-detail__title" }, [
         el("h2", {}, [
           d.status === "vacation" ? el("span", { class: "worker-card__vacation-badge", text: "🏖 休假" }) : null,
-          el("span", { text: ` ${d.name}` }),
+          el("span", { text: ` ${workerDisplayName(d)}` }),
+          workerModelTag(d),
           d.unreadCount > 0 ? el("span", { class: "worker-detail__unread-badge", text: `${d.unreadCount} 条未读` }) : null,
         ]),
         el("div", { class: "worker-detail__sub" }, [
           statusPill(d.status),
           el("span", { class: "tag tag--soft", text: `Backend: ${d.backend || "—"}` }),
-          el("span", { class: "tag tag--soft", text: `Model: ${d.model || "—"}` }),
           el("span", { class: "tag tag--soft", text: `Thinking: ${d.thinking || "—"}` }),
           el("span", { class: "tag tag--soft", text: `Role: ${d.role || "—"}` }),
         ]),
@@ -3006,7 +3349,14 @@
     target.appendChild(head);
 
     // 和 TA 对话 · Web 版 /talk 员工名
-    target.appendChild(buildTalkPanel(name, d, d.jobs || []));
+    if (d.remote) {
+      target.appendChild(el("section", { class: "panel" }, [
+        sectionHead("远端员工", `所在设备：${d.deviceName || d.deviceId || "未知设备"}`),
+        el("p", { class: "muted", text: d.deviceOnline ? "设备在线。跨设备对话/派活路由将在下一步接入。" : "设备当前离线。" }),
+      ]));
+    } else {
+      target.appendChild(buildTalkPanel(name, d, d.jobs || []));
+    }
 
     // 职责
     const responsibilities = d.responsibilities || [];
@@ -3143,7 +3493,7 @@
     if (res.ok) {
       STATE.workers = res.data.workers || [];
       sel.innerHTML = `<option value="">全部 (${STATE.workers.length})</option>` +
-        STATE.workers.map((w) => `<option value="${esc(w.name)}">${esc(w.name)}</option>`).join("");
+        STATE.workers.map((w) => `<option value="${esc(w.name)}">${esc(workerDisplayName(w))}</option>`).join("");
     }
   }
 
@@ -3173,8 +3523,10 @@
     if (date) params.set("date", date);
     const res = await api(`/api/jobs?${params}`);
     if (myId !== currentJobsId) return;
-    const tbody = $("#jobsBody");
+    const liveBody = $("#jobsBody");
     const summary = $("#jobsSummary");
+    if (!liveBody || !summary) return;
+    const tbody = document.createElement("tbody");
     if (!res.ok) {
       tbody.innerHTML = "";
       summary.innerHTML = "";
@@ -3188,10 +3540,11 @@
     tbody.innerHTML = "";
     if (STATE.jobs.length === 0) {
       tbody.appendChild(el("tr", {}, [el("td", { colspan: 7, class: "td--empty" }, [emptyState("暂无 job", "可以调整筛选条件，或等待员工产生任务。")])]));
+      patchSnapshotChildren(liveBody, tbody);
       return;
     }
     for (const job of STATE.jobs) {
-      const tr = el("tr", { onclick: () => openJobDrawer(job.id) }, [
+      const tr = el("tr", { data: { liveKey: "job:" + job.id }, onclick: () => openJobDrawer(job.id) }, [
         el("td", {}, [statusPill(job.status)]),
         el("td", { class: "td--mono", text: (job.id || "").slice(-6) }),
         el("td", { text: job.worker || "—" }),
@@ -3202,6 +3555,7 @@
       ]);
       tbody.appendChild(tr);
     }
+    patchSnapshotChildren(liveBody, tbody);
   }
 
   // ---- Drawer (Job 详情) ----
@@ -3263,6 +3617,7 @@
       el("p", {class:"muted", text:d.apiCost?.note || "等待可识别的模型价格与用量；历史数据不会按零费用处理。"}),
     ]));
     if (!["done", "failed", "aborted", "stale"].includes(d.status)) void pollDrawerCost(d.id || id, costValue);
+    if (d.status === "running") { body.appendChild(publicFeedNode(d.id || id)); void refreshPublicFeeds(); }
     const replyText = d.fullReply || d.latestReply || d.summary || "";
     if (replyText) {
       body.appendChild(el("div", { class: "drawer__section" }, [
@@ -3310,6 +3665,8 @@
   }
 
   function jobEventLabel(ev) {
+    if (ev.type === "error" && ev.willRetry === true) return "重连中";
+    if (ev.type === "compaction") return ev.phase === "completed" ? "压缩完成" : "压缩中";
     if (ev.isError || ev.type === "error") return "错误";
     if (ev.type === "text") return "回答";
     if (ev.type === "tool") return "工具";
@@ -3326,7 +3683,7 @@
   function renderJobEventItem(ev) {
     const itemClass = ev.type === "text"
       ? "timeline__item--assistant"
-      : `timeline__item--${ev.isError ? "error" : ev.type || "event"}`;
+      : `timeline__item--${ev.type === "error" && ev.willRetry === true ? "retry" : ev.isError ? "error" : ev.type || "event"}`;
     const text = ev.text || ev.message || "";
     const contentChildren = [
       el("div", { class: "timeline__meta" }, [
@@ -3459,19 +3816,19 @@
       const d = resDetail.data;
       const totals = d.totals || {};
       const kpi = el("section", { class: "kpi-row" }, [
-        kpiCard("输入", fmtNumber(totals.inputTokens), ""),
-        kpiCard("缓存输入", fmtNumber(totals.cachedInputTokens), ""),
+        kpiCard("输入（含缓存）", fmtNumber(totals.inputTokens), "非缓存 + 缓存"),
+        kpiCard("非缓存输入", fmtNumber(totals.uncachedInputTokens), "按常规输入计价"),
+        kpiCard("缓存输入", fmtNumber(totals.cachedInputTokens), "输入的子集"),
         kpiCard("输出", fmtNumber(totals.outputTokens), ""),
-        kpiCard("推理输出", fmtNumber(totals.reasoningOutputTokens), ""),
-        kpiCard("总 Token", fmtNumber(totals.totalTokens), "input + output"),
-        kpiCard("含缓存合计", fmtNumber(totals.totalWithCachedTokens), "input + cache + output"),
+        kpiCard("推理输出", fmtNumber(totals.reasoningOutputTokens), "输出的子集"),
+        kpiCard("总 Token", fmtNumber(totals.totalTokens), "输入（缓存只计一次）+ 输出"),
         kpiCard("参考费用", apiCostText(d.apiCost), `${d.apiCost?.pricedJobs || 0} 项可估 · ${d.apiCost?.unpricedJobs || 0} 项未知`),
       ]);
       wrap.appendChild(kpi);
       const max = Math.max(1, ...(d.workers || []).map((w) => w.reported?.totalWithCachedTokens || 0));
       wrap.appendChild(el("section", { class: "section" }, [
         el("div", { class: "card" }, [
-          cardHead(`员工 Token 明细 (${d.workers?.length || 0})`, `按 totalWithCachedTokens 降序 · 生成于 ${fmtTime(d.generatedAt)}`),
+          cardHead(`员工 Token 明细 (${d.workers?.length || 0})`, `按总 Token 降序 · 生成于 ${fmtTime(d.generatedAt)}`),
           (d.workers && d.workers.length)
             ? el("div", { class: "bar-list" }, d.workers.map((row) => barRow(row, max)))
             : emptyState(`${STATE.tokensDate} 暂无 token 记录`),
@@ -3515,7 +3872,7 @@
     // 趋势 bar chart
     wrap.appendChild(el("section", { class: "section" }, [
       el("div", { class: "card" }, [
-        cardHead(`近 ${STATE.tokensTrendDays} 天趋势`, "每日总 Token 总量与含缓存合计"),
+        cardHead(`近 ${STATE.tokensTrendDays} 天趋势`, "每日总 Token；缓存作为输入子集只计一次"),
         resTrend.ok ? renderTrendChart(resTrend.data) : errorBox("加载趋势失败", resTrend.detail),
       ]),
     ]));
@@ -3538,7 +3895,7 @@
       // 顶部汇总
       el("div", { class: "trend-chart__summary" }, [
         trendKpi("合计", fmtNumber(total), `${days.length} 天总消耗`),
-        trendKpi("日均", fmtNumber(avg), "含缓存平均"),
+        trendKpi("日均", fmtNumber(avg), "总 Token 平均"),
         trendKpi("峰值", fmtNumber(max), peakDay && peakDay.date ? String(peakDay.date) : "—"),
       ]),
       // bar chart
@@ -3551,7 +3908,7 @@
               el("div", {
                 class: "trend-chart__bar",
                 style: `height: ${pct}%;`,
-                title: `${d.date}\n总 ${fmtNumber(d.totalTokens)}\n含缓存 ${fmtNumber(d.totalWithCachedTokens)}`,
+                title: `${d.date}\n总 ${fmtNumber(d.totalTokens)}\n缓存输入（已包含）${fmtNumber(d.cachedInputTokens)}`,
               })),
             el("div", { class: "trend-chart__date", text: (d.date || "").slice(5) }),
             el("div", { class: "trend-chart__val", text: fmtNumber(d.totalWithCachedTokens) }),
@@ -3635,6 +3992,96 @@
     return wrap;
   }
 
+  function contributionLevel(count, nonZeroCounts) {
+    if (!count) return 0;
+    const sorted = nonZeroCounts.slice().sort((a, b) => a - b);
+    if (sorted.length <= 1) return 4;
+    const rank = sorted.findIndex((value) => value >= count);
+    return Math.max(1, Math.min(4, Math.ceil(((rank + 1) / sorted.length) * 4)));
+  }
+
+  function contributionHeatmap(activity) {
+    const days = recordList(activity?.days);
+    const section = el("div", { class: "contribution" });
+    section.appendChild(el("div", { class: "contribution__head" }, [
+      el("div", {}, [
+        el("strong", { text: activity?.label || "活动热力图" }),
+        activity?.description ? el("p", { class: "muted", text: activity.description }) : null,
+      ].filter(Boolean)),
+      el("span", { class: "contribution__total", text: `${Number(activity?.total || 0)} 次` }),
+    ]));
+    if (!days.length) {
+      section.appendChild(el("p", { class: "muted", text: "暂无可统计的数据。" }));
+      return section;
+    }
+
+    const nonZero = days.map((day) => Number(day.count || 0)).filter(Boolean);
+    const cells = [];
+    const first = new Date(`${days[0].date}T00:00:00Z`).getUTCDay();
+    for (let i = 0; i < first; i++) cells.push(null);
+    cells.push(...days);
+    const weeks = [];
+    for (let i = 0; i < cells.length; i += 7) weeks.push(cells.slice(i, i + 7));
+    const graph = el("div", { class: "contribution__scroll" }, [
+      el("div", { class: "contribution__graph", role: "img", "aria-label": `${activity?.label || "活动"}，共 ${activity?.total || 0} 次` },
+        weeks.map((week) => el("div", { class: "contribution__week" }, week.map((day) => day
+          ? el("span", {
+              class: `contribution__day contribution__day--${contributionLevel(Number(day.count || 0), nonZero)}`,
+              title: `${day.date} · ${Number(day.count || 0)} 次`,
+              "aria-label": `${day.date} ${Number(day.count || 0)} 次`,
+            })
+          : el("span", { class: "contribution__day contribution__day--empty", "aria-hidden": "true" }))))),
+    ]);
+    section.appendChild(graph);
+    section.appendChild(el("div", { class: "contribution__legend muted" }, [
+      el("span", { text: activity.start || "" }),
+      el("span", { text: "少" }),
+      ...[0, 1, 2, 3, 4].map((level) => el("span", { class: `contribution__day contribution__day--${level}`, "aria-hidden": "true" })),
+      el("span", { text: "多" }),
+      el("span", { text: activity.end || "" }),
+    ]));
+
+    const contributors = recordList(activity?.contributors);
+    if (contributors.length) {
+      section.appendChild(el("div", { class: "contribution__people" }, contributors.slice(0, 12).map((person) =>
+        el("div", { class: "contribution-person" }, [
+          el("div", {}, [
+            el("strong", { text: person.employee || person.name || "未归属" }),
+            person.employee && person.name !== person.employee ? el("span", { class: "muted", text: ` · Git: ${person.name}` }) : null,
+            person.email ? el("span", { class: "muted contribution-person__email", text: person.email }) : null,
+          ].filter(Boolean)),
+          el("span", { text: `${Number(person.total || 0)} 次` }),
+        ])
+      )));
+    }
+    return section;
+  }
+
+  function projectRepositorySection(repository) {
+    const remotes = Array.isArray(repository?.remoteUrls) ? repository.remoteUrls : [];
+    const repos = recordList(repository?.repositories);
+    if (!remotes.length && !repos.length) return null;
+    return el("section", { class: "section" }, [
+      sectionHead("代码仓库", "项目仓库入口与本机 Git 快照"),
+      el("div", { class: "project-repositories" }, [
+        ...remotes.map((url) => el("a", { class: "project-repository project-repository--remote", href: url, target: "_blank", rel: "noreferrer" }, [
+          el("strong", { text: "GitHub" }),
+          el("span", { text: url }),
+        ])),
+        ...repos.map((repo) => el("div", { class: "project-repository" }, [
+          el("div", { class: "project-repository__head" }, [
+            el("strong", { text: repo.branch || "Git repository" }),
+            repo.head ? el("span", { class: "tag tag--mono", text: repo.head }) : null,
+            Number(repo.dirty || 0) ? el("span", { class: "pill pill--running", text: `${repo.dirty} 未提交` }) : el("span", { class: "pill pill--done", text: "clean" }),
+          ].filter(Boolean)),
+          el("div", { class: "td--mono project-repository__path", text: repo.path || "—" }),
+          el("div", { class: "muted", text: [repo.upstream, repo.ahead ? `ahead ${repo.ahead}` : "", repo.behind ? `behind ${repo.behind}` : ""].filter(Boolean).join(" · ") || "未配置 upstream" }),
+          repo.lastCommit ? el("div", { class: "project-repository__commit", text: `${String(repo.lastCommit.hash || "").slice(0, 10)} · ${repo.lastCommit.author || "—"} · ${repo.lastCommit.subject || ""}` }) : null,
+        ].filter(Boolean))),
+      ]),
+    ]);
+  }
+
   // ---- Project 详情页 ----
   async function renderProjectDetail(projectId) {
     const wrap = el("div", { class: "page page--project-detail" });
@@ -3709,6 +4156,8 @@
     const links = recordList(p.links);
     const truth = isRecord(p.truth) ? p.truth : null;
     const recentJobs = recordList(jobs.recent);
+    const activity = isRecord(d.activity) ? d.activity : {};
+    const repositoryActivity = isRecord(activity.repository) ? activity.repository : {};
 
     // Hero 区
     wrap.appendChild(el("section", { class: "section" }, [
@@ -3745,6 +4194,20 @@
         trendKpi("Worktrees", String(worktrees.length), worktrees.length ? "见下方" : "未配置"),
       ]),
     ]));
+
+    const repositorySection = projectRepositorySection(repositoryActivity);
+    if (repositorySection) wrap.appendChild(repositorySection);
+
+    if (isRecord(activity.factory) || repositoryActivity.available) {
+      const heatmaps = [];
+      if (isRecord(activity.factory)) heatmaps.push(contributionHeatmap(activity.factory));
+      if (repositoryActivity.available && isRecord(repositoryActivity.localBranches)) heatmaps.push(contributionHeatmap(repositoryActivity.localBranches));
+      if (repositoryActivity.available && isRecord(repositoryActivity.mainline)) heatmaps.push(contributionHeatmap(repositoryActivity.mainline));
+      wrap.appendChild(el("section", { class: "section" }, [
+        sectionHead("项目活跃度", "过去一年；悬停方格查看日期和次数"),
+        el("div", { class: "contribution-stack" }, heatmaps),
+      ]));
+    }
 
     // Truth & Links
     if (truth || links.length > 0) {
@@ -4205,7 +4668,7 @@
           el("table", { class: "table quality-table" }, [
             el("thead", {}, [el("tr", {}, [
               el("th", { text: "模型" }),
-              ...["完成数", "耗时样本", "缺失耗时", "排除 steer", "平均耗时", "耗时中位数", "平均输入 Token", "平均输出 Token", "平均缓存 Token", "平均含缓存总 Token", "参考费用 $", "平均每计价任务 $", "计价样本", "未计价"].map(label => sortableNumericTh(label)),
+              ...["完成数", "耗时样本", "缺失耗时", "排除 steer", "平均耗时", "耗时中位数", "平均输入 Token", "平均输出 Token", "平均缓存 Token", "平均总 Token（缓存已含）", "参考费用 $", "平均每计价任务 $", "计价样本", "未计价"].map(label => sortableNumericTh(label)),
             ])]),
             el("tbody", {}, d.models.map(row => el("tr", {}, [
               el("td", { class: "td--mono", text: row.model }),
@@ -4900,9 +5363,8 @@
   async function refreshFactoryTaskBoard() {
     const node = await renderFactoryTaskBoard();
     if (STATE.currentPage !== "tasks") return;
-    const main = $("#main");
-    main.innerHTML = "";
-    main.appendChild(node);
+    const next = document.createElement("div"); next.appendChild(node);
+    patchSnapshotChildren($("#main"), next);
   }
 
   function updateFactoryTaskFilter(key, value) {
@@ -4999,7 +5461,7 @@
     const record = task || { priority: "normal", status: "TODO", mode: "auto", labels: [] };
     const assigneeSelect = el("select", { class: "input", name: "assignee" }, [
       el("option", { value: "", text: "未指派" }),
-      ...STATE.workers.map((worker) => el("option", { value: worker.name, text: worker.name, selected: worker.name === record.assignee })),
+      ...STATE.workers.filter((worker) => !worker.remote).map((worker) => el("option", { value: worker.name, text: workerDisplayName(worker), selected: worker.name === record.assignee })),
     ]);
     const triggerInput = el("input", { class: "input", name: "triggerAt", type: "datetime-local", value: toDatetimeLocal(record.triggerAt) });
     const runAfterSaveInput = el("input", {
@@ -5600,13 +6062,15 @@
       if (r.ok) {
         STATE.workers = r.data.workers || [];
         const sel = $("#msgWorker");
-        sel.innerHTML = STATE.workers.map((w) => `<option value="${esc(w.name)}">${esc(w.name)}</option>`).join("");
-        sel.value = STATE.workers[0]?.name || "主agent";
+        const localWorkers = STATE.workers.filter((worker) => !worker.remote);
+        sel.innerHTML = localWorkers.map((w) => `<option value="${esc(w.name)}">${esc(workerDisplayName(w))}</option>`).join("");
+        sel.value = localWorkers[0]?.name || "主agent";
       }
     } else {
       const sel = $("#msgWorker");
-      sel.innerHTML = STATE.workers.map((w) => `<option value="${esc(w.name)}">${esc(w.name)}</option>`).join("");
-      sel.value = STATE.workers[0]?.name || "主agent";
+      const localWorkers = STATE.workers.filter((worker) => !worker.remote);
+      sel.innerHTML = localWorkers.map((w) => `<option value="${esc(w.name)}">${esc(workerDisplayName(w))}</option>`).join("");
+      sel.value = localWorkers[0]?.name || "主agent";
     }
     loadMessages();
     return wrap;
@@ -5616,7 +6080,9 @@
     const worker = $("#msgWorker")?.value;
     if (!worker) return;
     const res = await api(`/api/messages?worker=${encodeURIComponent(worker)}&unreadOnly=0`);
-    const body = $("#messagesBody");
+    const liveBody = $("#messagesBody");
+    if (!liveBody || $("#msgWorker")?.value !== worker) return;
+    const body = document.createElement("div");
     if (!res.ok) {
       body.innerHTML = "";
       body.appendChild(errorBox("加载消息失败", res.detail));
@@ -5627,9 +6093,11 @@
     body.appendChild(el("div", { class: "muted", text: `共 ${d.total} 条 · 未读 ${d.unread}` }));
     if (!d.messages.length) {
       body.appendChild(emptyState("暂无消息"));
+      patchSnapshotChildren(liveBody, body);
       return;
     }
     body.appendChild(el("ul", { class: "msg-list" }, d.messages.map((m) => messageItem(m, { defaultOpen: false, showDirection: false, showRead: true, worker }))));
+    patchSnapshotChildren(liveBody, body);
   }
 
   async function renderReport() {
@@ -5720,6 +6188,7 @@
   // 仅更新 URL hash（pushState 不触发 hashchange）、侧边 active class、detail 区域。
   // 浏览器后退/前进通过 popstate → route() 走全量重渲染。
   function navigateToWorker(name) {
+    hideWorkerProfile();
     const newHash = `#/workers/${encodeURIComponent(name)}`;
     // pushState 避免触发 hashchange（hashchange 仍会触发 route()，会重渲染 main）
     history.pushState({ worker: name }, "", newHash);
@@ -5748,12 +6217,27 @@
     // 更新每张 worker-card 的未读 badge + 排序
     const list = $(".workers__list");
     if (!list) return;
+    const present = new Set($$(".worker-card", list).map((card) => card.dataset.name));
+    for (const w of workers) if (!present.has(w.name)) list.appendChild(createWorkerCard(w, selectedWorkerFromHash()));
     const cards = $$(".worker-card", list);
     // 1. 更新每张卡片：badge / class / dataset
     for (const card of cards) {
       const name = card.dataset.name;
       const w = map.get(name);
-      if (!w) continue;
+      if (!w) { card.remove(); continue; }
+      card._liveWorker = w;
+      const headline = card.querySelector(".worker-card__headline");
+      const oldModel = headline?.querySelector(".worker-model-tag");
+      const nextModel = workerModelTag(w);
+      if (oldModel && nextModel) patchSnapshotNode(oldModel, nextModel);
+      else if (nextModel) headline?.appendChild(nextModel);
+      else oldModel?.remove();
+      const displayName = card.querySelector(".worker-card__name");
+      if (displayName && displayName.textContent !== workerDisplayName(w)) displayName.textContent = workerDisplayName(w);
+      if (name === selectedWorkerFromHash()) {
+        const status = $(".worker-detail__sub")?.firstElementChild;
+        if (status) patchSnapshotNode(status, statusPill(w.status));
+      }
       const unread = Number(w.finishedUnreadJobs || 0);
       card.dataset.unread = String(unread);
       card.dataset.activeJobs = String(w.activeJobs || 0);
@@ -5764,6 +6248,7 @@
       }
       card.dataset.lastInteractionAt = w.lastInteractionAt || "";
       card.classList.toggle("worker-card--unread", unread > 0);
+      card.classList.toggle("worker-card--vacation", w.status === "vacation");
           // 找现存的 badge，并同步最近 talk 返回摘要
           const existing = card.querySelector(".worker-card__badge--unread");
           syncWorkerCardTalkPreview(card, w);
@@ -5787,7 +6272,7 @@
       }
     }
     // 2. 与初次渲染保持同一优先级，保留选中卡片。
-    const ordered = cards.slice().sort((a, b) => {
+    const ordered = cards.filter((card) => card.isConnected).sort((a, b) => {
       const rank = (card) => Number(card.dataset.unread) > 0 ? 2 : Number(card.dataset.activeJobs) > 0 ? 1 : 0;
       if (rank(a) !== rank(b)) return rank(b) - rank(a);
       const la = a.dataset.lastInteractionAt ? new Date(a.dataset.lastInteractionAt).getTime() : 0;
@@ -5797,7 +6282,10 @@
       const bn = b.dataset.name || "";
       return an.localeCompare(bn, "zh-Hans-CN");
     });
-    for (const card of ordered) list.appendChild(card);
+    if (canReorderSnapshot(list)) preserveSnapshotScroll(list, () => ordered.forEach((card, index) => {
+      const current = $$(".worker-card", list)[index];
+      if (current !== card) moveSnapshotNode(list, card, current || null);
+    }));
   }
 
   // 路由调用计数器：保证只有最后一次 route() 调用会渲染，避免竞态造成内容重复
@@ -6050,13 +6538,38 @@ async function route() {
     window.addEventListener("hashchange", route);
     // 后退 / 前进：重渲染整个 main（只特殊处理 workers 页内交互）
     window.addEventListener("popstate", route);
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") {
+        scheduleLiveRefresh(["overview", "workers", "jobs", "talk", "messages", "tasks", "task-requests", "hub"]);
+      }
+    });
   }
 
-  document.addEventListener("DOMContentLoaded", () => {
+  async function acceptHubJoinLink() {
+    const encoded = new URLSearchParams(location.search).get("hubJoin");
+    if (!encoded) return;
+    try {
+      const base64 = encoded.replace(/-/g, "+").replace(/_/g, "/");
+      const padded = base64 + "=".repeat((4 - base64.length % 4) % 4);
+      const bytes = Uint8Array.from(atob(padded), (char) => char.charCodeAt(0));
+      const config = JSON.parse(new TextDecoder().decode(bytes));
+      if (!confirm(`是否把这台牛马工厂接入 Hub？\n${config.url}`)) return;
+      const result = await api("/api/device-hub/join", { method: "POST", body: JSON.stringify(config) });
+      if (!result.ok) throw new Error(apiDetailMessage(result.detail, "接入失败"));
+      history.replaceState({}, "", location.pathname + location.hash);
+      toast("已接入 Device Hub", "success");
+    } catch (error) {
+      toast(`接入 Hub 失败：${error.message}`, "error");
+    }
+  }
+
+  document.addEventListener("DOMContentLoaded", async () => {
     bind();
     applyStaticI18n();
     applyDrawerWideSetting(STATE.drawerWide, { persist: false });
     void loadNotificationSettings();
+    connectFactoryEvents();
+    await acceptHubJoinLink();
     route();
   });
 })();

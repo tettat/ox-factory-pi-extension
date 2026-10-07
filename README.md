@@ -1,5 +1,7 @@
 # Ox Factory / 牛马工厂 Pi Extension
 
+For another computer joining an existing mobile Hub, see [Mobile Connector setup](mobile/README.md). Each computer gets its own enrollment and keeps its own factory state. Do not copy `.pi` or another device's credentials.
+
 Ox Factory is a local Pi extension for managing AI workers as a small software
 factory: hiring workers, dispatching jobs, tracking output, monitoring token
 usage, evaluating compaction, and maintaining lightweight project views.

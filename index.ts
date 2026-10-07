@@ -1294,13 +1294,23 @@ export default function (pi: ExtensionAPI) {
       if (recovery.recovered > 0) {
         ctx.ui?.notify?.(`保留 ${recovery.recovered} 个仍有新鲜 heartbeat 的员工 job 为 orphan-running`, "info");
       }
-      ensureWebTalkPoller(ctx);
-      ensureMainAgentTalkPoller(ctx);
-      ensureWorkerTaskPoller(ctx);
     }
+    ensureWebTalkPoller(ctx);
+    ensureMainAgentTalkPoller(ctx);
+    ensureWorkerTaskPoller(ctx);
     const entries = ctx.sessionManager.getEntries();
     mainSessionEntries = entries;
     restoreFromEntries(entries);
+  });
+
+  pi.on("session_shutdown", async () => {
+    if (webTalkPoller) clearInterval(webTalkPoller);
+    if (mainAgentTalkPoller) clearInterval(mainAgentTalkPoller);
+    if (workerTaskPoller) clearInterval(workerTaskPoller);
+    webTalkPoller = null;
+    mainAgentTalkPoller = null;
+    workerTaskPoller = null;
+    lastSessionCtx = null;
   });
 
   // Codex 代压缩后端。
@@ -1330,6 +1340,7 @@ export default function (pi: ExtensionAPI) {
     description: "雇佣一名新员工（创建独立 session）。用于建立开发团队。",
     parameters: Type.Object({
       name: Type.String({ description: "员工姓名（唯一标识）" }),
+      displayName: Type.Optional(Type.String({ description: "员工显示名；不改变用于调度、权限和 session 的唯一标识" })),
       role: RoleSchema,
       profile: Type.Optional(
         Type.String({ description: "预设配置名（lite/pro/balanced），自动填入模型和思考深度" }),
@@ -1460,7 +1471,7 @@ export default function (pi: ExtensionAPI) {
           };
         }
 
-        const w = hire(params.name, params.role as WorkerRole, model, thinking, { backend, ...codexOptions, ...claudeOptions, ...kimiOptions });
+        const w = hire(params.name, params.role as WorkerRole, model, thinking, { displayName: params.displayName, backend, ...codexOptions, ...claudeOptions, ...kimiOptions });
         const cfgLines: string[] = [
           `🎉 **${w.id}** 已入职！`,
           `- 职位: ${w.role}`,
@@ -1698,6 +1709,7 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       name: Type.Optional(Type.String({ description: "员工姓名" })),
       workerId: Type.Optional(Type.String({ description: "员工姓名/ID；兼容旧提示里的 workerId 写法" })),
+      displayName: Type.Optional(Type.String({ description: "员工显示名；传空字符串可清空，不影响调度 ID 和历史 session" })),
       avatar: Type.Optional(Type.String({ description: "员工头像。支持 emoji/短文本，或 http(s)/data:image 图片 URL；传空字符串可清空。" })),
       model: Type.Optional(Type.String({ description: "更换模型。Codex 员工默认保留原 thread 和记忆，从下一次 turn 生效。" })),
       thinking: Type.Optional(
@@ -1748,6 +1760,10 @@ export default function (pi: ExtensionAPI) {
 
         const patch: Partial<Worker> = {};
         const changes: string[] = [];
+        if (params.displayName !== undefined) {
+          patch.displayName = String(params.displayName || "").trim() || null;
+          changes.push(`显示名: ${w.displayName || w.id} → ${patch.displayName || w.id}`);
+        }
         if (params.avatar !== undefined) {
           patch.avatar = String(params.avatar || "").trim() || null;
           changes.push(`头像: ${w.avatar || "—"} → ${patch.avatar || "—"}`);
@@ -2472,7 +2488,7 @@ export default function (pi: ExtensionAPI) {
   function formatTalkLiveEvent(event: StreamEvent): string {
     if (event.type === "text") return event.text || "";
     if (event.type === "thinking") return "";
-    if (event.type === "tool_start" || event.type === "tool_output" || event.type === "tool_end" || event.type === "error") {
+    if (event.type === "tool_start" || event.type === "tool_output" || event.type === "tool_end" || event.type === "error" || event.type === "compaction") {
       return `\n${formatJobEvent(event)}\n`;
     }
     if (event.type === "done") return `\n${formatJobEvent(event)}\n`;
@@ -2511,7 +2527,7 @@ export default function (pi: ExtensionAPI) {
     }
     state.lines.push(text);
 
-    if (event.type === "tool_start" || event.type === "tool_output" || event.type === "tool_end" || event.type === "error" || event.type === "done") {
+    if (event.type === "tool_start" || event.type === "tool_output" || event.type === "tool_end" || event.type === "error" || event.type === "done" || event.type === "compaction") {
       flushTalkLive(job.id);
       return;
     }
@@ -2843,8 +2859,10 @@ export default function (pi: ExtensionAPI) {
           }
           if (ev.type === "tool_start") {
             ctx?.ui?.notify?.(`${w.id}: ${ev.name}`, "info");
+          } else if (ev.type === "compaction") {
+            ctx?.ui?.notify?.(`${w.id}: ${ev.text}`, "info");
           } else if (ev.type === "error") {
-            ctx?.ui?.notify?.(`${w.id} 出错: ${ev.message}`, "error");
+            ctx?.ui?.notify?.(`${w.id} ${ev.willRetry === true ? "正在重连" : "出错"}: ${ev.message}`, ev.willRetry === true ? "info" : "error");
           }
         },
       );
@@ -3565,13 +3583,18 @@ export default function (pi: ExtensionAPI) {
               displayText += `${formatJobEvent(event)}\n`;
               flushDisplay();
               break;
+            case "compaction":
+              thinkingActive = false;
+              displayText += `\n${formatJobEvent(event)}\n`;
+              flushDisplay();
+              break;
             case "done":
               if (thinkingActive) { displayText += "\n"; thinkingActive = false; }
               displayText += `\n---\n${event.turns} 轮 | ↑${event.inputTokens} ↓${event.outputTokens}`;
               if (event.model) displayText += ` | ${event.model}`;
               break;
             case "error":
-              displayText += `\n❌ ${event.message}\n`;
+              displayText += `\n${event.willRetry === true ? "↻" : "❌"} ${event.message}\n`;
               flushDisplay();
               break;
           }
@@ -3633,6 +3656,17 @@ export default function (pi: ExtensionAPI) {
       maxTurns: Type.Optional(Type.Number({ description: "最大轮数预留字段，默认 1" })),
       defaultWait: Type.Optional(Type.Boolean({ description: "未显式指定时是否等待结果返回，默认 true" })),
       timeoutMs: Type.Optional(Type.Number({ description: "默认等待超时；不填/0=不超时" })),
+      codexServerUrl: Type.Optional(Type.String({ description: "Codex app-server WebSocket 地址" })),
+      codexApprovalPolicy: Type.Optional(
+        StringEnum(["on-request", "never"] as const, {
+          description: "Codex 审批策略；全权限外包使用 never",
+        }),
+      ),
+      codexSandbox: Type.Optional(
+        StringEnum(["read-only", "workspace-write", "danger-full-access"] as const, {
+          description: "Codex 沙箱；全权限外包使用 danger-full-access",
+        }),
+      ),
       claudeCommand: Type.Optional(Type.String({ description: "Claude Code CLI 命令，默认 claude" })),
       claudePermissionMode: Type.Optional(
         StringEnum(["acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"] as const, {
@@ -3660,6 +3694,9 @@ export default function (pi: ExtensionAPI) {
             maxTurns: params.maxTurns,
             defaultWait: params.defaultWait,
             timeoutMs: params.timeoutMs,
+            codexServerUrl: params.codexServerUrl,
+            codexApprovalPolicy: params.codexApprovalPolicy,
+            codexSandbox: params.codexSandbox,
             claudeCommand: params.claudeCommand,
             claudePermissionMode: params.claudePermissionMode,
             claudeTools: params.claudeTools,

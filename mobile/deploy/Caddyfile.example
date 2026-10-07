@@ -1,0 +1,19 @@
+# Separate site block: merge with the existing proxy only after inventory.
+# Set OX_MOBILE_DOMAIN to the exact DNS hostname in hub-config.json origin.
+# Do not use a path prefix; PWA scope and __Host cookies require the origin root.
+{$OX_MOBILE_DOMAIN} {
+    encode zstd gzip
+    request_body {
+        max_size 16MB
+    }
+    # Management pairing stays accessible only through verified SSH / local CLI.
+    @management path /management/*
+    respond @management 404
+    reverse_proxy 127.0.0.1:8791 {
+        transport http {
+            dial_timeout 5s
+            response_header_timeout 30s
+        }
+    }
+    # Intentionally no access logging of credentials, cookies, or request bodies.
+}

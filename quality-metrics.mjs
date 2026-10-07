@@ -539,11 +539,20 @@ export function buildFactoryQualityReport({ workersDir, date, limit = DEFAULT_LI
     const summaryText = String(job.summary || "");
     const inputTokens = Number(job.inputTokens || 0);
     const cachedInputTokens = Number(job.cachedInputTokens || 0);
+    const inclusiveInput = job.tokenUsageSchema === "codex-inclusive-v1"
+      || Boolean(job.codexThreadId || job.codexTurnId);
+    const uncachedInputTokens = inclusiveInput
+      ? Math.max(0, inputTokens - cachedInputTokens)
+      : inputTokens;
+    const normalizedInputTokens = inclusiveInput
+      ? inputTokens
+      : inputTokens + cachedInputTokens;
     const outputTokens = Number(job.outputTokens || 0);
     const reasoningOutputTokens = Number(job.reasoningOutputTokens || 0);
-    const totalTokens = Number(job.totalTokens || 0);
-    const totalWithCachedTokens = Number(job.totalWithCachedTokens || 0)
-      || inputTokens + cachedInputTokens + outputTokens + reasoningOutputTokens;
+    const totalTokens = normalizedInputTokens + outputTokens || Number(job.totalTokens || 0);
+    // Compatibility field: cache and reasoning are subsets of input/output and
+    // must never be added a second time.
+    const totalWithCachedTokens = totalTokens;
     return {
       jobId: job.id,
       worker: job.worker,
@@ -561,7 +570,8 @@ export function buildFactoryQualityReport({ workersDir, date, limit = DEFAULT_LI
       elapsedMs: responseMs,
       elapsedSeconds: Number(job.elapsedSeconds || 0) || Math.round(responseMs / 1000),
       toolCalls: eventStats.toolCalls,
-      inputTokens,
+      inputTokens: normalizedInputTokens,
+      uncachedInputTokens,
       cachedInputTokens,
       outputTokens,
       reasoningOutputTokens,

@@ -436,7 +436,8 @@ export function formatJobEvent(event) {
   if (event.type === "codex_thread") return `[codex:thread] ${event.threadId || event.text || ""}`;
   if (event.type === "claude_session") return `[claude:session] ${event.sessionId || event.text || ""}`;
   if (event.type === "kimi_session") return `[kimi:session] ${event.sessionId || event.text || ""}`;
-  if (event.type === "error") return `[error] ${event.message || event.text || ""}`;
+  if (event.type === "compaction") return `[compact:${event.phase || "unknown"}] ${event.text || ""}`;
+  if (event.type === "error") return `[${event.willRetry === true ? "retry" : "error"}] ${event.message || event.text || ""}`;
   if (event.type === "late_event_after_terminal") {
     return `[late event after terminal] ${event.originalType || "unknown"} ignored because job is ${event.terminalStatus || "terminal"}`;
   }

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { CodexAppServerClient, getCodexServerUrl } from "./codex-backend.mjs";
 
 import {
   formatOutsourceProfiles,
@@ -39,6 +40,7 @@ function usage() {
     "",
     "备注：默认不设置墙钟超时；只有显式传 --timeout-ms 时才会超时返回。",
     "  node .pi/extensions/ox-factory/outsource-cli.mjs result --run-id ID [--wait] [--verbose] [--workers-dir DIR]",
+    "  node .pi/extensions/ox-factory/outsource-cli.mjs interrupt --from 员工 --run-id ID [--workers-dir DIR]",
     "",
     "说明：外包 agent 是白纸临时进程，不复用员工身份、记忆或 session。请把背景、文件路径、验收标准写进 task。",
   ].join("\n");
@@ -135,6 +137,36 @@ try {
       });
     }
     console.log(renderOutsourceResult(getOutsourceRun(workersDir, runId), flag("--verbose")));
+    process.exit(0);
+  }
+
+  if (command === "interrupt") {
+    const run = getOutsourceRun(workersDir, arg("--run-id"));
+    if (!run) throw new Error("未找到外包 run");
+    if (!arg("--from") || arg("--from") !== run.requestedBy) {
+      throw new Error("只能中断自己发起的外包 run");
+    }
+    if (["done", "failed", "cancelled", "aborted", "stale"].includes(run.status)) {
+      console.log(`already terminal ${run.id}`);
+      process.exit(0);
+    }
+    if (run.profileSnapshot?.backend !== "codex") throw new Error("interrupt 目前仅支持 Codex 外包");
+    const file = join(workersDir, "events", `${run.jobId}.jsonl`);
+    const events = existsSync(file) ? readFileSync(file, "utf8").split("\n").filter(Boolean).flatMap((line) => {
+      try { return [JSON.parse(line)]; } catch { return []; }
+    }) : [];
+    const active = events.filter((e) => e.type === "codex_turn" || e.type === "usage").reverse()
+      .find((e) => e.threadId && e.turnId);
+    if (!active) throw new Error("尚未获得活动 turn ID，请稍后重试");
+    const client = new CodexAppServerClient(getCodexServerUrl(run.profileSnapshot));
+    try {
+      await client.connect();
+      await client.initialize();
+      await client.request("turn/interrupt", { threadId: active.threadId, turnId: active.turnId }, 10000);
+      // The running dispatcher owns lifecycle/usage persistence. Do not forge a
+      // terminal state here: interruption acknowledgement is not completion.
+      console.log(`interrupt requested ${run.id}`);
+    } finally { client.close(); }
     process.exit(0);
   }
 

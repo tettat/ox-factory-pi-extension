@@ -132,6 +132,7 @@ export function spawnDetachedOutsourceRunProcess({ workersDir, run, job, execPat
     ], {
       cwd: run.cwd || job.cwd || process.cwd(),
       detached: true,
+      windowsHide: true,
       stdio: ["ignore", outFd, errFd],
       env: { ...process.env },
     });
@@ -307,7 +308,7 @@ export async function runExistingOutsourceRunJob(input = {}) {
         text: event.text || event.message || "",
         name: event.name || "",
         isError: Boolean(event.isError),
-      });
+      }, { readBack: false });
     },
   ).then((result = {}) => {
     const elapsedSeconds = Math.max(0, Math.round((Date.now() - startedMs) / 1000));

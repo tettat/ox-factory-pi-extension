@@ -1,0 +1,24 @@
+[Unit]
+Description=Ox Factory Mobile Hub (independent of existing factory services)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ox-mobile
+Group=ox-mobile
+WorkingDirectory=/opt/ox-mobile/current
+ExecStart=/usr/bin/node /opt/ox-mobile/current/mobile/cli.mjs hub --state /var/lib/ox-mobile
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ox-mobile
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

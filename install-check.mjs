@@ -48,7 +48,7 @@ function isInside(child, parent) {
 
 function walkFiles(root, visit) {
   for (const name of readdirSync(root)) {
-    if ([".git", "node_modules", ".pnpm-store"].includes(name)) continue;
+    if ([".git", "node_modules", ".pnpm-store", ".pi", ".netlify", "output", "outputs", ".playwright-cli"].includes(name)) continue;
     if (name === ".pi" && root === here) continue;
     const path = join(root, name);
     const stat = statSync(path);
@@ -116,6 +116,13 @@ walkFiles(here, (path) => {
   if ([".png", ".jpg", ".jpeg", ".gif", ".webp", ".zip"].some((suffix) => rel.endsWith(suffix))) return;
   let text = "";
   try { text = readFileSync(path, "utf8"); } catch { return; }
+  // Only these exact, public dummy strings are exempt; real values in tests
+  // and every other file continue to be scanned.
+  const testFixtures = {
+    "test/intake-client.test.mjs": ["ofi_test_token"],
+    "mobile/cli.test.mjs": ["fixture-private-device-credential"],
+  };
+  for (const literal of testFixtures[rel.replaceAll("\\", "/")] || []) text = text.replaceAll("Bearer " + literal, "FIXTURE");
   if (secretPattern.test(text)) secretHits.push(rel);
 });
 if (secretHits.length) {

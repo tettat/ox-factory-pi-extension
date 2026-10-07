@@ -38,7 +38,10 @@ function touchedDates(record) {
 function zeroTokens() {
   return {
     inputTokens: 0,
+    uncachedInputTokens: 0,
     cachedInputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
     outputTokens: 0,
     reasoningOutputTokens: 0,
     totalTokens: 0,
@@ -63,20 +66,43 @@ function firstNumber(...values) {
 function normalizeTokens(inputOrUsage, output, total) {
   if (inputOrUsage && typeof inputOrUsage === "object") {
     const usage = inputOrUsage;
-    const inputTokens = firstNumber(usage.inputTokens, usage.input_tokens, usage.input, usage.promptTokens, usage.prompt_tokens, usage.prompt);
-    const cachedInputTokens =
-      firstNumber(usage.cachedInputTokens, usage.cached_input_tokens, usage.cachedInput, usage.cached_input, usage.cached, usage.cacheReadInputTokens, usage.cache_read_input_tokens) +
-      firstNumber(usage.cacheRead, usage.cache_read, usage.cache_read_tokens) +
-      firstNumber(usage.cacheWrite, usage.cache_write, usage.cache_write_tokens, usage.cacheWrite1h, usage.cache_write_1h, usage.cacheWrite5m, usage.cache_write_5m);
+    const rawInputTokens = firstNumber(usage.inputTokens, usage.input_tokens, usage.input, usage.promptTokens, usage.prompt_tokens, usage.prompt);
+    const aggregateCachedInputTokens = firstNumber(usage.cachedInputTokens, usage.cached_input_tokens, usage.cachedInput, usage.cached_input, usage.cached);
+    const cacheReadTokens = firstNumber(
+      usage.cacheReadInputTokens,
+      usage.cache_read_input_tokens,
+      usage.cacheRead,
+      usage.cache_read,
+      usage.cache_read_tokens,
+    );
+    const cacheWriteTokens = firstNumber(
+      usage.cacheWrite,
+      usage.cache_write,
+      usage.cache_write_tokens,
+    ) + firstNumber(usage.cacheWrite1h, usage.cache_write_1h) + firstNumber(usage.cacheWrite5m, usage.cache_write_5m);
+    // Providers expose two incompatible input schemas:
+    // - Codex app-server: inputTokens already includes cached input.
+    // - Pi/Claude-style usage: input is uncached and cacheRead/cacheWrite are separate.
+    // Normalize reports to one schema where inputTokens includes cache exactly once.
+    const inclusiveInput = usage.tokenUsageSchema === "codex-inclusive-v1"
+      || Boolean(usage.codexThreadId || usage.codexTurnId)
+      || Object.hasOwn(usage, "uncachedInputTokens");
+    const cachedInputTokens = cacheReadTokens || cacheWriteTokens
+      ? cacheReadTokens + cacheWriteTokens
+      : aggregateCachedInputTokens;
+    const uncachedInputTokens = inclusiveInput
+      ? Math.max(0, rawInputTokens - cachedInputTokens)
+      : rawInputTokens;
+    const inputTokens = inclusiveInput
+      ? rawInputTokens
+      : rawInputTokens + cachedInputTokens;
     const outputTokens = firstNumber(usage.outputTokens, usage.output_tokens, usage.output, usage.completionTokens, usage.completion_tokens, usage.completion);
     const reasoningOutputTokens = firstNumber(usage.reasoningOutputTokens, usage.reasoning_output_tokens, usage.reasoningOutput, usage.reasoning_output);
-    // Keep `totalTokens` as the legacy provider-neutral total: input + output.
-    // Some Pi session entries include cacheRead in usage.totalTokens, while Codex
-    // reports cached input as a subset/side field. `totalWithCachedTokens` is the
-    // dashboard-like view that makes cached input explicit.
     const totalTokens = inputTokens + outputTokens || firstNumber(usage.totalTokens, usage.total_tokens, usage.total);
-    const totalWithCachedTokens = firstNumber(usage.totalWithCachedTokens, usage.total_with_cached_tokens, inputTokens + cachedInputTokens + outputTokens);
-    return { inputTokens, cachedInputTokens, outputTokens, reasoningOutputTokens, totalTokens, totalWithCachedTokens };
+    // Compatibility alias retained for old clients. It is intentionally equal to
+    // totalTokens: cachedInputTokens is a subset of normalized inputTokens.
+    const totalWithCachedTokens = totalTokens;
+    return { inputTokens, uncachedInputTokens, cachedInputTokens, cacheReadTokens, cacheWriteTokens, outputTokens, reasoningOutputTokens, totalTokens, totalWithCachedTokens };
   }
 
   const inputTokens = numeric(inputOrUsage);
@@ -84,7 +110,10 @@ function normalizeTokens(inputOrUsage, output, total) {
   const totalTokens = total == null ? inputTokens + outputTokens : numeric(total);
   return {
     inputTokens,
+    uncachedInputTokens: inputTokens,
     cachedInputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
     outputTokens,
     reasoningOutputTokens: 0,
     totalTokens,
@@ -95,7 +124,10 @@ function normalizeTokens(inputOrUsage, output, total) {
 function addTokens(target, inputOrUsage, output, total) {
   const usage = normalizeTokens(inputOrUsage, output, total);
   target.inputTokens += usage.inputTokens;
+  target.uncachedInputTokens += usage.uncachedInputTokens;
   target.cachedInputTokens += usage.cachedInputTokens;
+  target.cacheReadTokens += usage.cacheReadTokens;
+  target.cacheWriteTokens += usage.cacheWriteTokens;
   target.outputTokens += usage.outputTokens;
   target.reasoningOutputTokens += usage.reasoningOutputTokens;
   target.totalTokens += usage.totalTokens;
@@ -349,8 +381,11 @@ export function buildFactoryTokenTrend({ workersDir, days = 7, endDate = new Dat
       totalTokens: r.totals.totalTokens,
       totalWithCachedTokens: r.totals.totalWithCachedTokens,
       inputTokens: r.totals.inputTokens,
+      uncachedInputTokens: r.totals.uncachedInputTokens,
       outputTokens: r.totals.outputTokens,
       cachedInputTokens: r.totals.cachedInputTokens,
+      cacheReadTokens: r.totals.cacheReadTokens,
+      cacheWriteTokens: r.totals.cacheWriteTokens,
       reasoningOutputTokens: r.totals.reasoningOutputTokens,
     });
   }
@@ -384,7 +419,7 @@ export function formatFactoryTokenReport(report) {
   const lines = [
     `# 工厂 Token 报告 — ${report.date}`,
     "",
-    "| 员工 | 输入 Token | 缓存输入 Token | 输出 Token | 推理输出 Token | 总 Token | 含缓存合计 | 数据来源 | 备注 |",
+    "| 员工 | 输入 Token（含缓存） | 非缓存输入 | 缓存输入 | 输出 Token | 推理输出（输出子集） | 总 Token | 数据来源 | 备注 |",
     "|---|---:|---:|---:|---:|---:|---:|---|---|",
   ];
 
@@ -393,7 +428,7 @@ export function formatFactoryTokenReport(report) {
   } else {
     for (const worker of report.workers) {
       lines.push(
-        `| ${worker.worker} | ${formatTokenCount(worker.reported.inputTokens)} | ${formatTokenCount(worker.reported.cachedInputTokens)} | ${formatTokenCount(worker.reported.outputTokens)} | ${formatTokenCount(worker.reported.reasoningOutputTokens)} | ${formatTokenCount(worker.reported.totalTokens)} | ${formatTokenCount(worker.reported.totalWithCachedTokens)} | ${worker.source} | ${worker.warnings.join("<br>") || "—"} |`,
+        `| ${worker.worker} | ${formatTokenCount(worker.reported.inputTokens)} | ${formatTokenCount(worker.reported.uncachedInputTokens)} | ${formatTokenCount(worker.reported.cachedInputTokens)} | ${formatTokenCount(worker.reported.outputTokens)} | ${formatTokenCount(worker.reported.reasoningOutputTokens)} | ${formatTokenCount(worker.reported.totalTokens)} | ${worker.source} | ${worker.warnings.join("<br>") || "—"} |`,
       );
     }
   }
@@ -401,12 +436,12 @@ export function formatFactoryTokenReport(report) {
   lines.push("");
   lines.push("## 合计");
   lines.push("");
-  lines.push(`- 输入 Token：${formatTokenCount(report.totals.inputTokens)}`);
+  lines.push(`- 输入 Token（含缓存）：${formatTokenCount(report.totals.inputTokens)}`);
+  lines.push(`- 非缓存输入 Token：${formatTokenCount(report.totals.uncachedInputTokens)}`);
   lines.push(`- 缓存输入 Token：${formatTokenCount(report.totals.cachedInputTokens)}`);
   lines.push(`- 输出 Token：${formatTokenCount(report.totals.outputTokens)}`);
   lines.push(`- 推理输出 Token：${formatTokenCount(report.totals.reasoningOutputTokens)}`);
-  lines.push(`- 总 Token（输入+输出 / provider total）：${formatTokenCount(report.totals.totalTokens)}`);
-  lines.push(`- 含缓存合计（输入+缓存输入+输出）：${formatTokenCount(report.totals.totalWithCachedTokens)}`);
+  lines.push(`- 总 Token（输入含缓存且只计一次 + 输出）：${formatTokenCount(report.totals.totalTokens)}`);
 
   if (report.warnings.length > 0) {
     lines.push("");

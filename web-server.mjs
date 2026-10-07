@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { readPublicConversation } from './public-conversation.mjs';
 import { estimateApiCost, readApiPrices, summarizeApiCosts } from "./api-cost.mjs";
 // 牛马工厂本地 Web 协作驾驶舱
 // ---------------------------------------------------------------------------
@@ -8,9 +9,10 @@ import { estimateApiCost, readApiPrices, summarizeApiCosts } from "./api-cost.mj
 // ---------------------------------------------------------------------------
 
 import { createServer } from "node:http";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync, watch as watchFs } from "node:fs";
 import { extname, isAbsolute, join, resolve, dirname, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { cachedHubState, fetchHubState, findRemoteWorker, mergeHubWorkers, saveHubConnection, syncLocalFactory } from "./device-hub-client.mjs";
 
 import {
   listJobs,
@@ -117,10 +119,15 @@ import {
 } from "./responsibilities.mjs";
 import { listProjects as listStoredProjects, resolveProject as resolveStoredProject } from "./projects.mjs";
 import { markdownPreviewText } from "./markdown-preview.mjs";
+import { buildFactoryProjectActivity, buildProjectRepositoryActivity } from "./project-activity.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const WEB_DIR = join(__dirname, "web");
+const DEFAULT_WORKER_DISPLAY_NAMES = { Pi: "派派", Kimi: "柯南", Codex: "牛来" };
+function workerDisplayName(name, registryInfo = {}) {
+  return registryInfo.displayName || DEFAULT_WORKER_DISPLAY_NAMES[name] || name;
+}
 const VERSION = "phase-1-0.1.0";
 const REPO_ROOT = resolve(__dirname, "..", "..", "..");
 const QUALITY_CACHE_TTL_MS = 30_000;
@@ -131,12 +138,13 @@ const qualityMetricsCache = new Map();
 // CLI
 // ---------------------------------------------------------------------------
 function parseArgs(argv) {
-  const args = { port: 8787, workersDir: null, host: "127.0.0.1" };
+  const args = { port: 8787, workersDir: null, host: "127.0.0.1", background: true };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--port" || a === "-p") args.port = Number(argv[++i]);
     else if (a === "--workers-dir" || a === "-w") args.workersDir = argv[++i];
     else if (a === "--host" || a === "-H") args.host = argv[++i];
+    else if (a === "--no-background") args.background = false;
     else if (a === "--help" || a === "-h") {
       printHelp();
       process.exit(0);
@@ -162,6 +170,7 @@ function printHelp() {
       "  --workers-dir, -w   员工数据根目录 (默认: .pi/workers)",
       "  --port, -p          HTTP 端口 (默认: 8787)",
       "  --host, -H          监听地址 (默认: 127.0.0.1)",
+      "  --no-background     不启动调度器和 Hub 心跳（用于安全更新探针）",
       "  --help, -h          显示帮助",
       "",
     ].join("\n"),
@@ -243,6 +252,81 @@ function jsonResponse(res, status, body) {
   res.end(payload);
 }
 
+function eventTopicsForPath(file = "") {
+  const value = String(file).replace(/\\/g, "/").toLowerCase();
+  const topics = new Set(["overview"]);
+  if (value.includes("job")) ["jobs", "workers", "talk", "notifications"].forEach((topic) => topics.add(topic));
+  if (value.startsWith("events/") || value.includes("/events/")) ["jobs", "workers", "talk"].forEach((topic) => topics.add(topic));
+  if (value.includes("message")) ["messages", "workers"].forEach((topic) => topics.add(topic));
+  if (value.includes("talk")) ["talk", "workers", "jobs"].forEach((topic) => topics.add(topic));
+  if (value.includes("task")) ["tasks", "task-requests", "projects"].forEach((topic) => topics.add(topic));
+  if (value.includes("project") || value.includes("responsibilit")) topics.add("projects");
+  if (value.includes("permission")) topics.add("permissions");
+  if (value.includes("outsource")) topics.add("outsource");
+  if (value.includes("session") || value.includes("registr")) topics.add("workers");
+  if (topics.size === 1) topics.add("workers");
+  return [...topics];
+}
+
+export function createFactoryEventBroker({ workersDir, watch = true } = {}) {
+  const clients = new Set();
+  let sequence = 0;
+  let watcher = null;
+  let flushTimer = null;
+  const pendingTopics = new Set();
+  const pendingFiles = new Set();
+
+  const publish = (topics, detail = {}) => {
+    const data = JSON.stringify({ id: ++sequence, topics: [...new Set(topics || [])], at: new Date().toISOString(), ...detail });
+    for (const res of [...clients]) {
+      try { res.write(`id: ${sequence}\nevent: factory\ndata: ${data}\n\n`); }
+      catch { clients.delete(res); }
+    }
+  };
+  const queue = (file) => {
+    if (file) pendingFiles.add(String(file).replace(/\\/g, "/"));
+    for (const topic of eventTopicsForPath(file)) pendingTopics.add(topic);
+    if (flushTimer) return;
+    flushTimer = setTimeout(() => {
+      flushTimer = null;
+      const topics = [...pendingTopics];
+      const files = [...pendingFiles].slice(0, 12);
+      pendingTopics.clear();
+      pendingFiles.clear();
+      if (topics.length) publish(topics, { source: "filesystem", files });
+    }, 400);
+    flushTimer.unref?.();
+  };
+  const handle = (req, res) => {
+    res.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache, no-transform",
+      connection: "keep-alive", "x-accel-buffering": "no", "access-control-allow-origin": "*",
+    });
+    res.write(`retry: 1500\nevent: ready\ndata: ${JSON.stringify({ ok: true, at: new Date().toISOString() })}\n\n`);
+    clients.add(res);
+    const heartbeat = setInterval(() => { try { res.write(`: keepalive ${Date.now()}\n\n`); } catch {} }, 15_000);
+    heartbeat.unref?.();
+    const remove = () => { clearInterval(heartbeat); clients.delete(res); };
+    req.on("close", remove);
+    req.on("aborted", remove);
+  };
+  if (watch && workersDir) {
+    try { watcher = watchFs(workersDir, { recursive: true }, (_event, file) => queue(file)); }
+    catch (error) { process.stderr.write(`[events] filesystem watcher unavailable: ${error?.message || error}\n`); }
+    watcher?.unref?.();
+  }
+  return {
+    handle, publish,
+    close() {
+      if (flushTimer) clearTimeout(flushTimer);
+      watcher?.close?.();
+      for (const res of clients) { try { res.end(); } catch {} }
+      clients.clear();
+    },
+    get clientCount() { return clients.size; },
+  };
+}
+
 function errorResponse(res, status, message, detail) {
   jsonResponse(res, status, { error: { status, message, detail: detail || null } });
 }
@@ -273,6 +357,12 @@ function safeReadJsonl(file) {
   } catch {
     return [];
   }
+}
+
+function readJsonIfExists(file, fallback = null) {
+  if (!existsSync(file)) return fallback;
+  try { return JSON.parse(readFileSync(file, "utf8")); }
+  catch { return fallback; }
 }
 
 function readQueueFile(workersDir) {
@@ -654,6 +744,7 @@ export function buildWorkersView(workersDir, jobs, tokenReport, messages, regist
     ].filter(Boolean).sort().at(-1) || null;
     return {
       name,
+      displayName: workerDisplayName(name, regInfo),
       status,
       role: regInfo.role || null,
       avatar: regInfo.avatar || null,
@@ -675,6 +766,8 @@ export function buildWorkersView(workersDir, jobs, tokenReport, messages, regist
       tokenToday: token
         ? {
             input: token.reported.inputTokens,
+            uncachedInput: token.reported.uncachedInputTokens,
+            cachedInput: token.reported.cachedInputTokens,
             output: token.reported.outputTokens,
             total: token.reported.totalTokens,
             totalWithCached: token.reported.totalWithCachedTokens,
@@ -718,7 +811,7 @@ function isTrustedMutationOrigin(req) {
   }
 }
 
-export function buildRouter({ workersDir }) {
+export function buildRouter({ workersDir, eventBroker = null }) {
   return async function handle(req, res) {
     const url = new URL(req.url, `http://${req.headers.host || "127.0.0.1"}`);
     const pathname = url.pathname;
@@ -762,6 +855,15 @@ export function buildRouter({ workersDir }) {
         return await handleMainAgentTalkMessage(workersDir, res, body);
       } catch (err) {
         return errorResponse(res, 400, `读取请求体失败: ${err.message}`);
+      }
+    }
+    if (method === "POST" && pathname === "/api/device-hub/join") {
+      try {
+        const body = await readJsonBody(req);
+        const connection = saveHubConnection(workersDir, body);
+        return jsonResponse(res, 200, { ok: true, connection });
+      } catch (err) {
+        return errorResponse(res, 400, `接入 Hub 失败: ${err.message}`);
       }
     }
     if (method === "POST" && pathname === "/api/task-requests") {
@@ -871,7 +973,11 @@ export function buildRouter({ workersDir }) {
     }
 
     try {
-      if (pathname === "/api/health") return handleHealth(res);
+      if (pathname === "/api/events") {
+        if (!eventBroker) return errorResponse(res, 503, "实时事件通道未启用");
+        return eventBroker.handle(req, res);
+      }
+      if (pathname === "/api/health") return handleHealth(workersDir, res, eventBroker);
       if (pathname.startsWith("/api/talk-attachments/")) {
         return await handleTalkAttachmentContent(workersDir, res, pathname);
       }
@@ -1009,7 +1115,10 @@ async function readBinaryBody(req, maxBytes = TALK_IMAGE_MAX_BYTES) {
   });
 }
 
-function handleHealth(res) {
+function handleHealth(workersDir, res, eventBroker = null) {
+  const root = resolve(workersDir, "..", "..");
+  const maintenance = readJsonIfExists(join(root, ".pi", "service", "maintenance.json"));
+  const maintenanceActive = Boolean(maintenance?.until && Date.parse(maintenance.until) > Date.now());
   return jsonResponse(res, 200, {
     ok: true,
     version: VERSION,
@@ -1022,7 +1131,10 @@ function handleHealth(res) {
       mainAgentTalk: true,
       workerTalkRequests: true,
       workerTalkImages: true,
+      realtimeEvents: Boolean(eventBroker),
     },
+    realtimeClients: eventBroker?.clientCount || 0,
+    maintenance: maintenanceActive ? maintenance : null,
     timestamp: new Date().toISOString(),
   });
 }
@@ -1042,7 +1154,8 @@ async function handleOverview(workersDir, res) {
   const jobsToday = jobsAll.filter((j) => localDateString(j.createdAt) === today);
   const projectStrips = buildProjectStrips(workersDir);
   const projectCatalog = listStoredProjects(workersDir, { includeArchived: false });
-  const workers = buildWorkersView(workersDir, jobsAll, tokenReport, messages);
+  const localWorkers = buildWorkersView(workersDir, jobsAll, tokenReport, messages);
+  const workers = mergeHubWorkers(localWorkers, cachedHubState(workersDir));
 
   // Job 状态统计
   const jobStats = {
@@ -1165,7 +1278,8 @@ async function handleWorkers(workersDir, res) {
     Promise.resolve(buildFactoryTokenReport({ workersDir, date: localDateString(new Date()) })),
     Promise.resolve(listMessages(workersDir, { worker: "主agent", limit: 200 })),
   ]);
-  const workers = buildWorkersView(workersDir, jobsAll, tokenReport, messages);
+  const localWorkers = buildWorkersView(workersDir, jobsAll, tokenReport, messages);
+  const workers = mergeHubWorkers(localWorkers, cachedHubState(workersDir));
   return jsonResponse(res, 200, {
     generatedAt: new Date().toISOString(),
     workers,
@@ -1174,6 +1288,21 @@ async function handleWorkers(workersDir, res) {
 
 async function handleWorkerDetail(workersDir, res, name, url = null) {
   if (!name) return badRequest(res, "worker name required");
+  if (name.startsWith("remote:")) {
+    const remote = await findRemoteWorker(workersDir, name);
+    if (!remote) return notFound(res, `远端员工不存在或设备已从 Hub 移除: ${name}`);
+    const { device, worker } = remote;
+    return jsonResponse(res, 200, {
+      name, workerId: worker.id || worker.name,
+      displayName: worker.displayName || worker.id || worker.name,
+      status: device.online ? (worker.status || "idle") : "offline",
+      role: worker.role || null, backend: worker.backend || null,
+      avatar: /^(data:image\/|https?:\/\/)/i.test(worker.avatar || "") ? worker.avatar : null,
+      remote: true, deviceId: device.id, deviceName: device.name || device.id,
+      deviceOnline: Boolean(device.online), responsibilities: [], jobs: [], inbox: [],
+      talkRequests: [], pendingTalkRequests: [], jobCount: 0, unreadCount: 0,
+    });
+  }
   const registry = getWorkerRegistry(workersDir);
   const regInfo = registry.get(name) || {};
   const jobs = listJobs(workersDir, { worker: name, limit: 200 }).sort((a, b) =>
@@ -1194,6 +1323,7 @@ async function handleWorkerDetail(workersDir, res, name, url = null) {
   const unreadJobEvents = unreadJobState.unreadEvents || 0;
   return jsonResponse(res, 200, {
     name,
+    displayName: workerDisplayName(name, regInfo),
     status: regInfo.status === "vacation" ? "vacation" : pickStatus(jobs),
     role: regInfo.role || null,
     avatar: regInfo.avatar || null,
@@ -1314,6 +1444,13 @@ async function handleJobDetail(workersDir, res, id, url = null) {
   const jobFile = join(workersDir, "jobs", `${id}.json`);
   if (!existsSync(jobFile)) return notFound(res, `job ${id} not found`);
   const job = readJob(jobFile);
+  if (url?.searchParams.get("conversation") === "1") {
+    const blocks = readPublicConversation(job);
+    const offset = Math.max(0, Math.min(blocks.length, Number(url.searchParams.get("offset")) || 0));
+    const page = blocks.slice(offset, offset + 40);
+    return jsonResponse(res, 200, { id: job.id, status: job.status, blocks: page,
+      nextOffset: offset + page.length, total: blocks.length, hasMore: offset + page.length < blocks.length });
+  }
   const rawEvents = tailJobEvents(job, 500);
   const events = compactJobTimelineEvents(rawEvents).slice(-100);
   const markRead = url?.searchParams?.get("markRead") !== "0";
@@ -2512,6 +2649,14 @@ async function handleProjectDetail(workersDir, res, id) {
     return matchNames.has(String(r.project).toLowerCase());
   });
 
+  const registry = getWorkerRegistry(workersDir);
+  const repositoryActivity = buildProjectRepositoryActivity(project, {
+    baseDir: resolve(workersDir, "..", ".."),
+    workerNames: [...registry.keys()],
+    snapshotPath: join(workersDir, "cache", "project-git-activity.json"),
+  });
+  const factoryActivity = buildFactoryProjectActivity(project, relatedJobs);
+
   return jsonResponse(res, 200, {
     generatedAt: new Date().toISOString(),
     project,
@@ -2540,6 +2685,10 @@ async function handleProjectDetail(workersDir, res, id) {
       status: r.status,
       note: r.note,
     })),
+    activity: {
+      factory: factoryActivity,
+      repository: repositoryActivity,
+    },
   });
 }
 
@@ -2636,6 +2785,9 @@ async function handleOutsourceProfiles(workersDir, res) {
       maxTurns: Number(p.maxTurns || 0),
       defaultWait: Boolean(p.defaultWait),
       timeoutMs: Number(p.timeoutMs || 0),
+      codexServerUrl: p.codexServerUrl || "",
+      codexApprovalPolicy: p.codexApprovalPolicy || "",
+      codexSandbox: p.codexSandbox || "",
       createdAt: p.createdAt,
       updatedAt: p.updatedAt,
     })),
@@ -2657,6 +2809,9 @@ async function handleOutsourceProfile(workersDir, res, name) {
     maxTurns: Number(p.maxTurns || 0),
     defaultWait: Boolean(p.defaultWait),
     timeoutMs: Number(p.timeoutMs || 0),
+    codexServerUrl: p.codexServerUrl || "",
+    codexApprovalPolicy: p.codexApprovalPolicy || "",
+    codexSandbox: p.codexSandbox || "",
     createdAt: p.createdAt,
     updatedAt: p.updatedAt,
   });
@@ -2884,7 +3039,7 @@ function serveFile(res, filePath) {
   const type = MIME[ext] || "application/octet-stream";
   try {
     const buf = readFileSync(filePath);
-    const skinAsset = ext === ".svg" && filePath.startsWith(join(WEB_DIR, "skins", "handdrawn") + "/");
+    const skinAsset = ext === ".svg" && filePath.startsWith(`${join(WEB_DIR, "skins", "handdrawn")}${sep}`);
     res.writeHead(200, { "content-type": type, "cache-control": skinAsset ? "private, max-age=300" : "no-store" });
     res.end(buf);
   } catch (err) {
@@ -2979,7 +3134,8 @@ function main() {
     process.stderr.write(`[web-server] web dir not found: ${WEB_DIR}\n`);
     process.exit(2);
   }
-  const handler = buildRouter({ workersDir: args.workersDir });
+  const eventBroker = createFactoryEventBroker({ workersDir: args.workersDir });
+  const handler = buildRouter({ workersDir: args.workersDir, eventBroker });
   const taskScheduler = createFactoryTaskScheduler({
     workersDir: args.workersDir,
     onResult: (result) => {
@@ -2989,6 +3145,22 @@ function main() {
     },
     onError: (error) => process.stderr.write(`[task-scheduler] ${error?.message || String(error)}\n`),
   });
+  const syncHub = async () => {
+    const registry = getWorkerRegistry(args.workersDir);
+    const workers = [...registry.entries()].map(([name, worker]) => ({
+      name,
+      displayName: workerDisplayName(name, worker),
+      backend: worker.backend || null,
+      role: worker.role || null,
+      status: worker.status || "idle",
+      avatar: worker.avatar || null,
+    }));
+    const registered = await syncLocalFactory(args.workersDir, workers);
+    const state = await fetchHubState(args.workersDir, 1500);
+    if (state) eventBroker.publish(["hub", "workers", "overview"], { source: "hub" });
+    return registered;
+  };
+  let hubHeartbeat = null;
   const server = createServer((req, res) => {
     handler(req, res).catch((err) => {
       // eslint-disable-next-line no-console
@@ -3001,7 +3173,12 @@ function main() {
     });
   });
   server.listen(args.port, args.host, () => {
-    taskScheduler.start();
+    if (args.background) {
+      taskScheduler.start();
+      void syncHub();
+      hubHeartbeat = setInterval(() => void syncHub(), 5_000);
+      hubHeartbeat.unref?.();
+    }
     process.stdout.write(
       [
         "🐂🐴 牛马工厂本地 Web 协作驾驶舱",
@@ -3018,6 +3195,8 @@ function main() {
   const shutdown = () => {
     process.stdout.write("\n[web-server] shutting down…\n");
     taskScheduler.stop();
+    if (hubHeartbeat) clearInterval(hubHeartbeat);
+    eventBroker.close();
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 1500).unref();
   };
@@ -3025,6 +3204,6 @@ function main() {
   process.on("SIGTERM", shutdown);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   main();
 }
