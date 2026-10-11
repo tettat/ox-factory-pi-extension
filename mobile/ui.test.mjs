@@ -2,6 +2,17 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as UI from './web/ui.js';
 
+test('read indicators are icon-only, labelled accessibly and escape error details', () => {
+  const loading = UI.readIndicator('loading', '正在读取');
+  assert.match(loading, /aria-label="正在读取"/); assert.match(loading, /read-spinner/);
+  assert.doesNotMatch(loading, />正在读取</);
+  assert.match(UI.readIndicator('ready', '完成'), /data-state="ready"/);
+  assert.doesNotMatch(UI.readIndicator('ready', '完成'), /read-spinner/);
+  const error = UI.readIndicator('error', '\"><img src=x onerror=alert(1)>');
+  assert.doesNotMatch(error, /<img/); assert.match(error, /&lt;img/);
+  assert.match(UI.readIndicator('invalid', ''), /data-state="idle"/);
+});
+
 test('recent-message sort follows factory activity, not visits, stars or unread clearing', () => {
   const workers = [{ id: 'old', name: 'A', lastInteractionAt: '2026-09-23T00:00:00Z', unreadCount: 9 }, { id: 'new', name: 'B', lastInteractionAt: '2026-09-24T00:00:00Z', unreadCount: 0 }];
   const options = { sort: 'activity', deviceId: 'd', favorites: ['["d","old"]'], recent: { '["d","old"]': Date.now() } };

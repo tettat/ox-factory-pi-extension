@@ -17,6 +17,99 @@ function context({ deploymentPending = false, storageDenied = false } = {}) {
   vm.runInContext("state = { devices: [{ id: 'device-a', online: true }, { id: 'device-b', online: true }], commands: [] }; selected = 'device-b';", context);
   return context;
 }
+
+function readingContext() {
+  const c = context();
+  vm.runInContext("me = { id: 'session-read' }; selected = 'device-a'; openedWorker = 'worker-a'; renderTimeline = () => {};", c);
+  return c;
+}
+const readPhase = c => vm.runInContext("$('#chat-read-status').dataset.state", c);
+
+test('cached conversation keeps a real loading indicator until its full read completes', async () => {
+  const c = readingContext(); let finish, calls = 0;
+  c.read = () => { calls++; return new Promise(resolve => { finish = resolve; }); };
+  vm.runInContext("detail = { marker: 'cached' }; lastDetailAt = Date.now() - 60000; runCommand = () => read();", c);
+  const loading = vm.runInContext('refreshDetail()', c);
+  assert.equal(readPhase(c), 'loading');
+  assert.equal(vm.runInContext('detail.marker', c), 'cached');
+  await vm.runInContext('refreshDetail()', c);
+  assert.equal(calls, 1); assert.equal(readPhase(c), 'loading');
+  finish({ marker: 'fresh' }); await loading;
+  assert.equal(readPhase(c), 'ready');
+  assert.equal(vm.runInContext('detail.marker', c), 'fresh');
+  assert.doesNotMatch(vm.runInContext("$('#chat-read-status').innerHTML", c), /read-spinner/);
+});
+
+test('failed background reads retain cache and show failure rather than a success check', async () => {
+  const c = readingContext();
+  vm.runInContext("detail = { marker: 'cached' }; lastDetailAt = 1; runCommand = async () => { throw Error('fixture failure'); };", c);
+  await vm.runInContext('refreshDetail()', c);
+  assert.equal(readPhase(c), 'error'); assert.equal(vm.runInContext('detail.marker', c), 'cached');
+  assert.match(vm.runInContext("$('#chat-read-status').innerHTML", c), /保留上次内容/);
+  vm.runInContext("runCommand = async () => ({ marker: 'retried' });", c);
+  await vm.runInContext('refreshDetail()', c);
+  assert.equal(readPhase(c), 'ready'); assert.equal(vm.runInContext('detailErrors.size', c), 0);
+});
+
+test('switching workers and returning during a read restores the matching spinner without duplicate reads', async () => {
+  const c = readingContext(); let finish;
+  c.read = new Promise(resolve => { finish = resolve; });
+  vm.runInContext('runCommand = () => read;', c);
+  const loading = vm.runInContext('refreshDetail()', c);
+  vm.runInContext("openedWorker = 'worker-b'; syncDetailReadIndicator();", c);
+  assert.equal(readPhase(c), 'idle');
+  vm.runInContext("openedWorker = 'worker-a'; syncDetailReadIndicator();", c);
+  assert.equal(readPhase(c), 'loading');
+  finish({ worker: {} }); await loading;
+  assert.equal(readPhase(c), 'ready');
+});
+
+test('completion from a different device cannot stop the current device spinner', async () => {
+  const c = readingContext(); const finish = {};
+  c.read = id => new Promise(resolve => { finish[id] = resolve; });
+  vm.runInContext('runCommand = (_a, _b, options) => read(options.deviceId);', c);
+  const a = vm.runInContext('refreshDetail()', c);
+  vm.runInContext("selected = 'device-b';", c);
+  const b = vm.runInContext('refreshDetail()', c);
+  finish['device-a']({ marker: 'old-device' }); await a;
+  assert.equal(readPhase(c), 'loading'); assert.equal(vm.runInContext('detail', c), null);
+  finish['device-b']({ marker: 'current-device' }); await b;
+  assert.equal(readPhase(c), 'ready'); assert.equal(vm.runInContext('detail.marker', c), 'current-device');
+});
+
+test('logout prevents a late read from restoring cached data or its success indicator', async () => {
+  const c = readingContext(); let finish;
+  c.read = new Promise(resolve => { finish = resolve; });
+  vm.runInContext('runCommand = () => read;', c);
+  const loading = vm.runInContext('refreshDetail()', c);
+  vm.runInContext("clearPrivateBrowserState(); me = null; $('#chat-read-status').innerHTML = 'new-view';", c);
+  finish({ marker: 'old-secret' }); await loading;
+  assert.equal(vm.runInContext('detailCache.size', c), 0);
+  assert.equal(vm.runInContext("$('#chat-read-status').innerHTML", c), 'new-view');
+  assert.equal(vm.runInContext('detailReads.size', c), 0);
+});
+
+test('offline cached conversation does not pretend to be loading or newly synced', async () => {
+  const c = readingContext();
+  vm.runInContext("online = false; detail = { marker: 'cached' }; lastDetailAt = Date.now(); runCommand = () => { throw Error('must not send'); };", c);
+  await vm.runInContext('refreshDetail()', c);
+  assert.equal(readPhase(c), 'paused'); assert.equal(vm.runInContext('detail.marker', c), 'cached');
+});
+
+test('job result dialog shows a title spinner until success or failure, without loading prose', async () => {
+  const c = readingContext(); let finish;
+  c.read = new Promise(resolve => { finish = resolve; });
+  vm.runInContext('runCommand = () => read;', c);
+  const loading = vm.runInContext("openJob('fixture-job')", c);
+  const initial = vm.runInContext("$('#dialog-body').innerHTML", c);
+  assert.match(initial, /data-state="loading"/); assert.doesNotMatch(initial, /正在读取完整结果<|class="empty"/);
+  finish({ job: { worker: 'Fixture', status: 'done' }, reply: 'Ready' }); await loading;
+  assert.match(vm.runInContext("$('#dialog-body').innerHTML", c), /data-state="ready"/);
+  vm.runInContext("runCommand = async () => { throw Error('fixture failure'); };", c);
+  await vm.runInContext("openJob('fixture-job')", c);
+  assert.match(vm.runInContext("$('#dialog-body').innerHTML", c), /data-state="error"/);
+  assert.doesNotMatch(vm.runInContext("$('#dialog-body').innerHTML", c), /read-spinner/);
+});
 test('an explicitly pinned operation does not follow a changed device picker', async () => {
   const c = context(); let submitted;
   c.fetch = async (_url, options) => { submitted = JSON.parse(options.body); return { ok: true, json: async () => ({ command: { state: 'done', result: { ok: true, data: { accepted: true } } } }) }; };

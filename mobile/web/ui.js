@@ -1,5 +1,5 @@
 // Pure presentation helpers. No network, credentials, DOM writes or raw HTML input.
-export const VERSION = '0.4.1';
+export const VERSION = '0.4.2';
 export const labels = { idle: '空闲', busy: '忙碌', running: '执行中', queued: '排队中', pending: '等待接管', processing: '接管中', accepted: '已接管', reported: '已回传', done: '完成', completed: '完成', succeeded: '完成', failed: '失败', cancelled: '已取消', offline: '离线', vacation: '休假', TODO: '待开始' };
 export const roles = { owner: '所有者', operator: '操作员', viewer: '只读' };
 export const actions = { 'talk.send': '员工对话', 'task.assign': '派发任务', 'task.create': '创建看板任务', 'task.update': '更新看板任务', 'image.upload': '上传图片' };
@@ -131,6 +131,8 @@ const paths = {
   activity: '<path d="M3 12h4l3-8 4 16 3-8h4"/>',
   settings: '<path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="3"/><circle cx="15" cy="17" r="3"/>',
   refresh: '<path d="M20 7v5h-5M4 17v-5h5M5 7a8 8 0 0 1 13-2l2 2M4 17l2 2a8 8 0 0 0 13-2"/>',
+  check: '<path d="m5 12 4 4L19 6"/>',
+  warning: '<circle cx="12" cy="12" r="9"/><path d="M12 7v6m0 4h.01"/>',
   star: '<path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-3-5.6 3 1.1-6.2L3 9.6l6.2-.9z"/>',
   arrow: '<path d="M5 12h14m-5-5 5 5-5 5"/>',
   back: '<path d="M19 12H5m5-5-5 5 5 5"/>',
@@ -148,3 +150,8 @@ const paths = {
   expand: '<path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/>',
 };
 export function icon(name) { return `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name] || paths.activity}</svg>`; }
+export function readIndicator(phase, label) {
+  const state = ['loading', 'ready', 'error', 'paused'].includes(phase) ? phase : 'idle';
+  const glyph = state === 'loading' ? '<i class="read-spinner" aria-hidden="true"></i>' : state === 'ready' ? icon('check') : state === 'idle' ? '' : icon('warning');
+  return `<span class="read-indicator" data-state="${state}" role="img" aria-label="${esc(label)}" title="${esc(label)}">${glyph}</span>`;
+}

@@ -18,6 +18,7 @@ let online = navigator.onLine, polling = false, installPrompt = null, backendIss
 let pending = UI.pendingState(UI.json(sessionStore, 'ox-pending', {}));
 let outgoing = UI.outgoingState(UI.json(sessionStore, 'ox-outgoing', {}));
 const deliveryTasks = new Map(), deliveryFiles = new Map(), detailCache = new Map(), detailReads = new Set(), usageCache = new Map(), usageReads = new Set();
+const detailErrors = new Map();
 const projectCache = new Map(), projectReads = new Set(), projectErrors = new Map();
 let openedProject = '', projectQuery = '', projectFilter = '', projectSort = 'activity', projectPane = 'overview', taskScope = null;
 let favorites = UI.json(localStore, 'ox-favorites', []); if (!Array.isArray(favorites)) favorites = [];
@@ -49,7 +50,7 @@ function clearPrivateBrowserState() {
   try { sessionStore.clear(); } catch {}
   UI.remove(localStore, 'ox-directory-cache'); pending = {}; state = { devices: [], commands: [] }; detail = null; openedWorker = ''; selected = ''; lastStateAt = 0;
   outgoing = {}; for (const items of deliveryFiles.values()) for (const item of items) URL.revokeObjectURL(item.url);
-  deliveryFiles.clear(); detailCache.clear(); usageCache.clear();
+  deliveryFiles.clear(); detailCache.clear(); detailErrors.clear(); usageCache.clear();
   projectCache.clear(); projectErrors.clear(); openedProject = ''; taskScope = null;
   settingsEpoch++; copiedText.clear(); draftMemory.clear(); notified.clear(); notificationBaseline = false; cleanupAttachments(); closeModal();
 }
@@ -88,6 +89,7 @@ function connection() {
   const submit = $('#send'); if (submit) submit.disabled = !writable();
   const badge = $('#pending-badge'); if (badge) { const n = unconfirmed(); badge.hidden = !n; badge.textContent = n > 9 ? '9+' : String(n); }
   if ($('#chat-connection')) $('#chat-connection').textContent = !online ? '网络离线' : backendIssue ? '中转未就绪' : !d?.online || stale ? '工厂离线' : '在线';
+  syncDetailReadIndicator();
 }
 function showLogin() { if (document.body) document.body.dataset.view = 'login'; $('#login').hidden = false; $('#workspace').hidden = true; $('#nav').hidden = true; connection(); }
 function showWorkspace() {
@@ -361,7 +363,7 @@ function updateCompose() {
 async function openWorker(worker, assign = false) { route('workers', worker, assign); }
 function renderWorker() {
   const w = snap().workers?.find(x => x.id === openedWorker);
-  $('#content').innerHTML = `<section class="chat"><header class="chat-head"><button id="back" class="icon-button" aria-label="返回员工列表">${icon('back')}</button><div class="grow"><h2>${esc(w?.name || openedWorker)}</h2><div class="chat-subtitle"><span title="${esc(device()?.name)}">${esc(device()?.name || '当前工厂')}</span><span id="chat-connection"></span><span id="chat-read-status">${lastDetailAt ? UI.relative(lastDetailAt) + '更新 · 同步中' : '读取中'}</span></div></div><button id="reading-mode" class="icon-button" aria-label="专注阅读" aria-pressed="false">${icon('expand')}</button><button id="chat-tools-toggle" class="icon-button" aria-label="搜索与筛选对话" aria-expanded="false">${icon('search')}</button><button class="icon-button" data-tab="activity" aria-label="查看发送状态">${icon('activity')}</button></header><div id="chat-tools-panel" hidden><div class="chat-tools"><div class="chips">${[['', '全部'], ['request', '我发出的'], ['reply', '员工结果'], ['message', '站内信']].map(([id, label]) => `<button data-chat-filter="${id}" class="${chatFilter === id ? 'active' : ''}" aria-pressed="${chatFilter === id}">${label}</button>`).join('')}</div><button id="chat-refresh" class="icon-button" aria-label="刷新对话">${icon('refresh')}</button></div><label class="chat-search"><input type="search" id="chat-search" aria-label="搜索当前对话" placeholder="搜索已读取内容" value="${esc(chatQuery)}"></label></div><div id="timeline" class="timeline" role="log" aria-label="对话与执行时间线" aria-live="off"></div><div class="latest-row"><button id="jump-latest" hidden>有新内容 · 跳到最新 ↓</button></div><button id="resume-compose" class="resume-compose" hidden>${icon('send')}写消息</button><form id="compose" class="compose compact-compose"><div id="attachment-list" class="attachment-list" hidden></div><div id="compose-panel" hidden><div class="compose-options"><label>操作类型<select id="send-kind"><option value="talk.send" ${composeKind === 'talk.send' ? 'selected' : ''}>对话</option><option value="task.assign" ${composeKind === 'task.assign' ? 'selected' : ''}>派活</option></select></label><label>员工忙碌时<select id="send-mode"><option value="auto">自动排队</option><option value="queue">保持排队</option><option value="steer">优先插话</option></select></label><label id="project-label" hidden>项目<input id="project" list="known-projects" maxlength="160" placeholder="例如 mobile-pwa"><datalist id="known-projects">${[...new Set([...(snap().projects || []).map(p => p.id), ...distinct([...(snap().tasks || []), ...(snap().jobs || [])], 'project')])].map(v => `<option value="${esc(v)}"></option>`).join('')}</datalist></label></div><div class="compose-actions"><label id="image-label" class="attachment-picker" title="最多 6 张，每张 ${maxImageMiB} MiB">${icon('image')}添加图片<input id="images" class="file-input" type="file" aria-label="添加图片附件" accept="image/png,image/jpeg,image/webp,image/gif" multiple></label><span id="char-count" class="muted"></span></div><p id="draft-status" class="compose-note"></p><p id="send-hint" class="compose-note"></p><p class="compose-note">切换本应用页面不影响发送；关闭网页或系统挂起可能中断尚未到达中转的内容。</p></div><div class="compose-line"><button id="compose-toggle" class="icon-button" type="button" aria-label="附件与发送选项" aria-expanded="false">${icon('plus')}</button><textarea id="message" aria-label="内容" maxlength="16000" rows="1" placeholder="发消息…"></textarea><button id="send" class="primary" type="submit" data-write aria-label="发送对话">发送</button></div></form></section>`;
+  $('#content').innerHTML = `<section class="chat"><header class="chat-head"><button id="back" class="icon-button" aria-label="返回员工列表">${icon('back')}</button><div class="grow"><div class="chat-title"><h2>${esc(w?.name || openedWorker)}</h2><span id="chat-read-status" class="read-status-slot"></span></div><div class="chat-subtitle"><span title="${esc(device()?.name)}">${esc(device()?.name || '当前工厂')}</span><span id="chat-connection"></span></div></div><button id="reading-mode" class="icon-button" aria-label="专注阅读" aria-pressed="false">${icon('expand')}</button><button id="chat-tools-toggle" class="icon-button" aria-label="搜索与筛选对话" aria-expanded="false">${icon('search')}</button><button class="icon-button" data-tab="activity" aria-label="查看发送状态">${icon('activity')}</button></header><div id="chat-tools-panel" hidden><div class="chat-tools"><div class="chips">${[['', '全部'], ['request', '我发出的'], ['reply', '员工结果'], ['message', '站内信']].map(([id, label]) => `<button data-chat-filter="${id}" class="${chatFilter === id ? 'active' : ''}" aria-pressed="${chatFilter === id}">${label}</button>`).join('')}</div><button id="chat-refresh" class="icon-button" aria-label="刷新对话">${icon('refresh')}</button></div><label class="chat-search"><input type="search" id="chat-search" aria-label="搜索当前对话" placeholder="搜索已读取内容" value="${esc(chatQuery)}"></label></div><div id="timeline" class="timeline" role="log" aria-label="对话与执行时间线" aria-live="off"></div><div class="latest-row"><button id="jump-latest" hidden>有新内容 · 跳到最新 ↓</button></div><button id="resume-compose" class="resume-compose" hidden>${icon('send')}写消息</button><form id="compose" class="compose compact-compose"><div id="attachment-list" class="attachment-list" hidden></div><div id="compose-panel" hidden><div class="compose-options"><label>操作类型<select id="send-kind"><option value="talk.send" ${composeKind === 'talk.send' ? 'selected' : ''}>对话</option><option value="task.assign" ${composeKind === 'task.assign' ? 'selected' : ''}>派活</option></select></label><label>员工忙碌时<select id="send-mode"><option value="auto">自动排队</option><option value="queue">保持排队</option><option value="steer">优先插话</option></select></label><label id="project-label" hidden>项目<input id="project" list="known-projects" maxlength="160" placeholder="例如 mobile-pwa"><datalist id="known-projects">${[...new Set([...(snap().projects || []).map(p => p.id), ...distinct([...(snap().tasks || []), ...(snap().jobs || [])], 'project')])].map(v => `<option value="${esc(v)}"></option>`).join('')}</datalist></label></div><div class="compose-actions"><label id="image-label" class="attachment-picker" title="最多 6 张，每张 ${maxImageMiB} MiB">${icon('image')}添加图片<input id="images" class="file-input" type="file" aria-label="添加图片附件" accept="image/png,image/jpeg,image/webp,image/gif" multiple></label><span id="char-count" class="muted"></span></div><p id="draft-status" class="compose-note"></p><p id="send-hint" class="compose-note"></p><p class="compose-note">切换本应用页面不影响发送；关闭网页或系统挂起可能中断尚未到达中转的内容。</p></div><div class="compose-line"><button id="compose-toggle" class="icon-button" type="button" aria-label="附件与发送选项" aria-expanded="false">${icon('plus')}</button><textarea id="message" aria-label="内容" maxlength="16000" rows="1" placeholder="发消息…"></textarea><button id="send" class="primary" type="submit" data-write aria-label="发送对话">发送</button></div></form></section>`;
   $('#back').onclick = () => route('workers');
   $('#chat-tools-toggle').onclick = () => { const panel = $('#chat-tools-panel'); panel.hidden = !panel.hidden; $('#chat-tools-toggle').setAttribute('aria-expanded', String(!panel.hidden)); if (!panel.hidden) $('#chat-search').focus(); };
   const setReading = value => { readingOnly = value; $('#compose').hidden = value; $('#resume-compose').hidden = !value; $('#reading-mode').setAttribute('aria-pressed', String(value)); $('#reading-mode').setAttribute('aria-label', value ? '退出专注阅读' : '专注阅读'); if (value) $('#message').blur(); };
@@ -373,7 +375,7 @@ function renderWorker() {
   $('#send-mode').onchange = saveDraft; $('#project').oninput = saveDraft;
   $('#send-kind').onchange = e => { saveDraft(); composeKind = e.target.value; loadDraft(); };
   $('#chat-search').oninput = e => { chatQuery = e.target.value; timelineSignature = ''; renderTimeline(); };
-  $('#chat-refresh').onclick = async () => { const b = $('#chat-refresh'); b.disabled = true; try { await refreshDetail(); } finally { if (b.isConnected) b.disabled = false; } };
+  $('#chat-refresh').onclick = () => refreshDetail();
   $('#jump-latest').onclick = () => { $('#timeline').scrollTop = $('#timeline').scrollHeight; $('#jump-latest').hidden = true; };
   $('#images').onchange = e => {
     const files = [...e.target.files]; e.target.value = '';
@@ -473,10 +475,27 @@ async function performDelivery(record, session) {
     if (!record.needsFiles || !current()) { for (const item of deliveryFiles.get(id) || []) URL.revokeObjectURL(item.url); deliveryFiles.delete(id); }
   }
 }
+function syncDetailReadIndicator() {
+  const node = $('#chat-read-status'); if (!node || !openedWorker) return;
+  const key = JSON.stringify([me?.id, selected, openedWorker]), loading = detailReads.has(key), error = detailErrors.get(key);
+  const paused = !online || !device()?.online || Boolean(backendIssue);
+  const phase = loading ? 'loading' : error ? 'error' : paused ? 'paused' : lastDetailAt ? 'ready' : 'idle';
+  const label = loading ? (detail ? '正在同步最新对话，可继续阅读已有内容' : '正在读取对话')
+    : error ? `本次同步未完成${detail ? '，当前保留上次内容' : ''}：${error}`
+    : paused ? '连接暂不可用，当前内容尚未重新同步'
+    : lastDetailAt ? `对话读取完成，${UI.relative(lastDetailAt)}更新` : '尚未读取对话';
+  const html = UI.readIndicator(phase, label);
+  if (node.innerHTML !== html) node.innerHTML = html;
+  node.dataset.state = phase;
+  $('#timeline')?.setAttribute('aria-busy', String(loading));
+  const refreshButton = $('#chat-refresh');
+  if (refreshButton) { refreshButton.disabled = loading || paused; refreshButton.classList.toggle('spin', loading); }
+}
 async function refreshDetail() {
-  if (!openedWorker || !online || !device()?.online) return;
+  if (!openedWorker || !online || !device()?.online || backendIssue) { syncDetailReadIndicator(); return; }
   const current = openedWorker, currentDevice = selected, session = me, key = JSON.stringify([session?.id, currentDevice, current]);
-  if (detailReads.has(key)) return; detailReads.add(key);
+  if (detailReads.has(key)) { syncDetailReadIndicator(); return; }
+  detailReads.add(key); detailErrors.delete(key); syncDetailReadIndicator();
   try {
     const result = await runCommand('worker.detail', { worker: current }, { deviceId: currentDevice });
     if (session !== me) return;
@@ -485,13 +504,17 @@ async function refreshDetail() {
     if (openedWorker === current && selected === currentDevice) { detail = result; lastDetailAt = Date.now(); renderTimeline(); }
   }
   catch (error) {
+    if (session === me) {
+      if (detailErrors.size >= 20) detailErrors.delete(detailErrors.keys().next().value);
+      detailErrors.set(key, error.message);
+    }
     if (session === me && openedWorker === current && selected === currentDevice && !detail && $('#timeline')) {
       const hasOutgoing = outgoingForDevice().some(r => r.envelope.body.worker === current);
       if (hasOutgoing) { renderTimeline(); toast(`最近消息暂未读到：${error.message}；发送记录仍在动态页`); }
       else $('#timeline').innerHTML = empty('暂时无法读取', error.message);
     }
   }
-  finally { detailReads.delete(key); if ($('#chat-read-status') && openedWorker === current && selected === currentDevice) $('#chat-read-status').textContent = lastDetailAt ? `${UI.relative(lastDetailAt)}更新` : '尚未读取'; }
+  finally { detailReads.delete(key); if (session === me) syncDetailReadIndicator(); }
 }
 function remember(key, value) { copiedText.set(key, String(value || '')); if (copiedText.size > 250) copiedText.delete(copiedText.keys().next().value); return esc(key); }
 function renderTimeline({ prepend = false } = {}) {
@@ -538,14 +561,14 @@ function modal(html) { const token = ++modalEpoch; $('#dialog-body').innerHTML =
 function updateModal(token, html) { if (token !== modalEpoch || !$('#dialog').open) return false; $('#dialog-body').innerHTML = html; return true; }
 function closeModal() { modalEpoch++; if ($('#dialog')?.open) $('#dialog').close(); }
 async function openJob(jobId) {
-  const target = selected, token = modal(`<h2>执行结果</h2>${empty('正在读取完整结果', '从目标工厂获取，不使用页面中的过期快照。')}`);
+  const target = selected, token = modal(`<h2 class="read-title">执行结果${UI.readIndicator('loading', '正在读取完整执行结果')}</h2><div class="result-loading" aria-busy="true"></div>`);
   try {
     const r = await runCommand('job.detail', { jobId }, { deviceId: target });
     if (selected !== target) return;
     const text = `${r.job.worker} · ${r.job.project || '未分类'}\n${time(r.job.updatedAt)}\n\n任务\n${r.job.task || ''}\n\n回复\n${r.reply || r.job.error || '暂无结果'}`;
     const key = remember(`export:${jobId}:${token}`, text);
-    updateModal(token, `<h2>${esc(r.job.worker)} · 执行结果</h2>${status(r.job.status)}<p class="job-meta">${esc(r.job.project || '未分类')} · ${time(r.job.updatedAt)}</p><div class="actions"><button data-copy="${key}">${icon('copy')}复制结果</button><button data-export="${key}">${icon('download')}保存为文本</button><button data-reload-job="${esc(jobId)}">${icon('refresh')}刷新</button></div><hr><h3>任务</h3><pre class="prose">${esc(r.job.task)}</pre><hr><h3>回复</h3><div class="rich-text">${UI.markdown(r.reply || r.job.error || '尚无结果，员工可能仍在执行。')}</div>`);
-  } catch (e) { updateModal(token, `<h2>结果暂不可用</h2><p>${esc(e.message)}</p>`); }
+    updateModal(token, `<h2 class="read-title">${esc(r.job.worker)} · 执行结果${UI.readIndicator('ready', '执行结果读取完成')}</h2>${status(r.job.status)}<p class="job-meta">${esc(r.job.project || '未分类')} · ${time(r.job.updatedAt)}</p><div class="actions"><button data-copy="${key}">${icon('copy')}复制结果</button><button data-export="${key}">${icon('download')}保存为文本</button><button data-reload-job="${esc(jobId)}">${icon('refresh')}刷新</button></div><hr><h3>任务</h3><pre class="prose">${esc(r.job.task)}</pre><hr><h3>回复</h3><div class="rich-text">${UI.markdown(r.reply || r.job.error || '尚无结果，员工可能仍在执行。')}</div>`);
+  } catch (e) { updateModal(token, `<h2 class="read-title">结果暂不可用${UI.readIndicator('error', '结果读取失败')}</h2><p>${esc(e.message)}</p>`); }
 }
 function newTask(project = '') {
   if (!writable()) return toast('当前工厂离线或凭证只读，不能创建任务');
@@ -619,6 +642,15 @@ async function settings() {
   try {
     const access = await api('/api/access'); if (epoch !== settingsEpoch || tab !== 'settings' || openedWorker || !$('#access')) return;
     $('#access').innerHTML = `<div class="setting-row"><h3>添加另一台手机</h3><label>权限<select id="pair-role"><option value="viewer">只读</option><option value="operator">操作员：对话和派活</option><option value="owner">所有者：管理凭证</option></select></label><label>设备范围<select id="pair-scope">${me?.devices?.includes('*') ? '<option value="*">所有已授权设备</option>' : ''}${state.devices.map(d => `<option value="${esc(d.id)}">仅 ${esc(d.name)}</option>`).join('')}</select></label><button id="pair">生成一次性配对链接</button><div id="pair-result"></div></div><div class="setting-row"><h3>手机凭证</h3>${access.sessions.map(s => `<p>${esc(s.name)} · ${esc(UI.roles[s.role] || s.role)} ${s.revokedAt ? '（已撤销）' : s.id === me.id ? '（当前手机）' : `<button data-revoke-session="${esc(s.id)}" class="danger">撤销</button>`}</p>`).join('')}</div><div class="setting-row"><h3>工厂设备</h3>${access.devices.map(d => `<p>${esc(d.name)} <button data-revoke-device="${esc(d.id)}" class="danger">撤销设备连接</button></p>`).join('')}<p class="muted">撤销会阻止后续访问和未送达操作；已经被工厂接收的任务不会因此停止。</p></div>`;
+    const trusts = await api('/api/device-trusts').catch(() => ({ trusts: [] }));
+    if (epoch !== settingsEpoch || tab !== 'settings' || !$('#access')) return;
+    $('#access').insertAdjacentHTML('beforeend', `<div class="setting-row"><h3>可信工厂设备</h3><p class="muted">授权是单向的；需要互相调用时分别设置两个方向。不会授予任意文件或命令执行权限，员工派活仍检查目标工厂权限。</p><label>来源设备<select id="trust-source">${access.devices.map(d => option(d.id, d.name)).join('')}</select></label><label>目标设备<select id="trust-target">${access.devices.map(d => option(d.id, d.name)).join('')}</select></label><label>允许能力<select id="trust-level"><option value="read">查看员工和任务结果</option><option value="operate">查看、对话和派活</option><option value="revoke">撤销此方向</option></select></label><button id="save-trust">确认设备授权</button><div id="trust-list">${trusts.trusts.map(t => `<p>${esc(access.devices.find(d => d.id === t.sourceDeviceId)?.name || t.sourceDeviceId)} → ${esc(access.devices.find(d => d.id === t.targetDeviceId)?.name || t.targetDeviceId)}：${esc(t.revokedAt ? '已撤销' : t.actions.join('、'))}</p>`).join('')}</div></div>`);
+    $('#save-trust').onclick = async () => {
+      const sourceDeviceId = $('#trust-source').value, targetDeviceId = $('#trust-target').value, level = $('#trust-level').value;
+      if (sourceDeviceId === targetDeviceId) return toast('请选择两台不同的设备');
+      if (!confirm('确认更新此方向的设备信任？员工权限仍由目标工厂检查。')) return;
+      try { await api('/api/device-trusts', { sourceDeviceId, targetDeviceId, actions: level === 'revoke' ? [] : ['worker.detail', 'job.detail', ...(level === 'operate' ? ['talk.send', 'task.assign'] : [])] }); toast('设备授权已更新'); settings(); } catch (e) { toast(e.message); }
+    };
     if (access.audit?.length) $('#access').insertAdjacentHTML('beforeend', `<details class="setting-row"><summary>最近安全记录</summary><div class="audit-list">${access.audit.slice(-20).reverse().map(a => `<div class="audit-item">${time(a.time)} · ${esc(a.type)}</div>`).join('')}</div></details>`);
     $('#access').insertAdjacentHTML('beforeend', '<div class="setting-row"><h3>连接另一台工厂电脑</h3><button id="enroll-device">生成设备接入码</button><p class="muted">接入码 10 分钟有效。必须在目标电脑本地明确绑定工厂身份，手机不能直接授予员工权限。</p><div id="enroll-result"></div></div>');
     $('#enroll-device').onclick = async () => { try { const r = await api('/api/enrollments', {}); $('#enroll-result').innerHTML = `<label>设备接入码<textarea readonly>${esc(r.code)}</textarea></label><p class="muted">在目标电脑将接入码保存到私有文本文件，使用 mobile/cli.mjs enroll，并通过 --code-file 指定文件。不要把接入码放进命令行参数或日志。</p>`; } catch (e) { toast(e.message); } };
