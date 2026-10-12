@@ -77,3 +77,16 @@ test('display escaping, unknown status and relative timestamps have stable fallb
   assert.equal(UI.relative(0), '尚未同步'); assert.equal(UI.relative(100000, 105000), '刚刚'); assert.equal(UI.relative(100000, 220000), '2 分钟前');
   assert.equal(UI.relative('not-a-date'), '尚未同步');
 });
+
+test('desktop-compatible unread badges and viewport visibility are bounded and accessible', () => {
+  assert.match(UI.unreadBadge({ unreadCount: 120 }), /99\+/);
+  assert.equal(UI.unreadBadge({ unreadCount: 5, finishedUnreadJobs: 0 }), '');
+  assert.match(UI.unreadBadge({ finishedUnreadJobs: 2 }), /2 条未读/);
+  assert.match(UI.messageReadBadge({ unread: false }), /已读/);
+  assert.doesNotMatch(UI.messageReadBadge({ unread: true }), /<button/);
+  assert.match(UI.messageReadBadge({ unread: true, token: 'private', revision: 'safe' }, 'failed'), /重试同步/);
+  const root = { top: 0, bottom: 500, height: 500, left: 0, right: 320 };
+  assert.equal(UI.visiblyInside({ top: 450, bottom: 650, height: 200, left: 0, right: 320 }, root), false);
+  assert.equal(UI.visiblyInside({ top: -50, bottom: 900, height: 950, left: 0, right: 320 }, root), true);
+  assert.equal(UI.visiblyInside({ top: 10, bottom: 80, height: 70, left: 500, right: 550 }, root), false);
+});

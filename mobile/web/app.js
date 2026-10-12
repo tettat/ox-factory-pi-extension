@@ -19,6 +19,9 @@ let pending = UI.pendingState(UI.json(sessionStore, 'ox-pending', {}));
 let outgoing = UI.outgoingState(UI.json(sessionStore, 'ox-outgoing', {}));
 const deliveryTasks = new Map(), deliveryFiles = new Map(), detailCache = new Map(), detailReads = new Set(), usageCache = new Map(), usageReads = new Set();
 const detailErrors = new Map();
+const readDwell = new Map(), readFlights = new Set(), readFailures = new Map(), readAcknowledged = new Set(), readOverrides = new Map();
+let visibleReadItems = new Map(), modalReadItem = null;
+const readScope = (worker = openedWorker, deviceId = selected) => JSON.stringify([me?.id, deviceId, worker]);
 const projectCache = new Map(), projectReads = new Set(), projectErrors = new Map();
 let openedProject = '', projectQuery = '', projectFilter = '', projectSort = 'activity', projectPane = 'overview', taskScope = null;
 let favorites = UI.json(localStore, 'ox-favorites', []); if (!Array.isArray(favorites)) favorites = [];
@@ -28,7 +31,7 @@ let usageDate = '', usageDays = 7, usageError = '', chatLimit = 20, readingOnly 
 let activityFilter = 'all', activityQuery = '', chatFilter = '', chatQuery = '', viewSignature = '', viewDirty = false, timelineSignature = '';
 let lastStateAt = 0, lastDetailAt = 0, settingsEpoch = 0, modalEpoch = 0, attachmentItems = [], composeKind = 'talk.send';
 const copiedText = new Map(), notified = new Set(); let notificationBaseline = false;
-const ACTION_WRITE = action => !['worker.detail', 'job.detail', 'tasks.list', 'image.read', 'usage.read', 'project.detail'].includes(action);
+const ACTION_WRITE = action => !['worker.detail', 'job.detail', 'tasks.list', 'image.read', 'usage.read', 'project.detail', 'read.mark'].includes(action);
 const device = () => state.devices.find(d => d.id === selected);
 const writable = () => online && !backendIssue && (!lastStateAt || Date.now() - lastStateAt < 30000) && device()?.online && device()?.role !== 'viewer';
 const snap = () => device()?.snapshot || {};
@@ -51,6 +54,7 @@ function clearPrivateBrowserState() {
   UI.remove(localStore, 'ox-directory-cache'); pending = {}; state = { devices: [], commands: [] }; detail = null; openedWorker = ''; selected = ''; lastStateAt = 0;
   outgoing = {}; for (const items of deliveryFiles.values()) for (const item of items) URL.revokeObjectURL(item.url);
   deliveryFiles.clear(); detailCache.clear(); detailErrors.clear(); usageCache.clear();
+  readDwell.clear(); visibleReadItems.clear(); readFailures.clear(); readAcknowledged.clear(); readOverrides.clear();
   projectCache.clear(); projectErrors.clear(); openedProject = ''; taskScope = null;
   settingsEpoch++; copiedText.clear(); draftMemory.clear(); notified.clear(); notificationBaseline = false; cleanupAttachments(); closeModal();
 }
@@ -111,6 +115,12 @@ async function refresh({ force = false } = {}) {
   try {
     const next = await api('/api/state'); if (me !== session) return;
     if (!Array.isArray(next.devices) || !Array.isArray(next.commands)) throw Error('工厂目录格式异常');
+    for (const d of next.devices) for (const w of d.snapshot?.workers || []) {
+      const key = readScope(w.id, d.id), override = readOverrides.get(key);
+      if (!override) continue;
+      if (String(d.snapshot.observedAt || '') >= override.observedAt) readOverrides.delete(key);
+      else Object.assign(w, override.worker);
+    }
     for (const d of next.devices) for (const job of d.snapshot?.jobs || []) {
       const key = `${d.id}:${job.id}:${job.status}`;
       if (UI.terminal(job.status) && !notified.has(key)) { if (notificationBaseline) notify(job); notified.add(key); }
@@ -153,6 +163,7 @@ async function runCommand(action, body, { retry = null, deviceId = selected, onP
   onProgress('工厂已确认接收'); return command.result.data;
 }
 function route(nextTab, worker = '', assign = false, push = true, persistDraft = true, project = '') {
+  readDwell.clear(); visibleReadItems.clear();
   if (persistDraft) saveDraft(); cleanupAttachments(); closeModal(); settingsEpoch++; tab = nextTab; openedWorker = worker; detail = null; timelineSignature = ''; chatQuery = ''; chatFilter = ''; chatLimit = 20; readingOnly = false;
   const cached = worker && detailCache.get(JSON.stringify([me?.id, selected, worker]));
   if (cached) { detail = cached.detail; lastDetailAt = cached.at; } else lastDetailAt = 0;
@@ -174,12 +185,12 @@ function renderHome() {
   const nPending = new Set([...Object.values(pending).filter(p => p.envelope.deviceId === selected).map(p => p.envelope.id), ...outgoingForDevice().filter(r => !['confirmed', 'failed'].includes(r.phase)).map(r => r.envelope.id)]).size;
   const recentWorkers = UI.workerList(ws, { favorites, recent, deviceId: selected }).slice(0, 4), jobs = UI.newest(s.jobs).slice(0, 4);
   const hour = new Date().getHours(), greeting = hour < 6 ? '夜深了，辛苦了。' : hour < 12 ? '早上好，开个好头。' : hour < 18 ? '下午好，继续向前。' : '晚上好，看看进展。';
-  $('#content').innerHTML = `<section class="hero"><span class="eyebrow">FACTORY AT A GLANCE · ${esc(new Date().toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'short' }))}</span><h2>${greeting}</h2><p>${device()?.online ? `${ws.length} 位员工在这里，下一件事交给工厂。` : '工厂暂时离线。先查看最近状态，恢复后再安排任务。'}</p><span class="hero-deco" aria-hidden="true">牛</span></section><div class="stats"><button class="stat" data-tab="workers"><b>${ws.length}</b><span>工厂员工</span></button><button class="stat highlight" data-tab="activity" data-activity-filter="running"><b>${working}</b><span>正在执行</span></button><button class="stat" data-tab="tasks"><b>${counts.todo + counts.doing + counts.review + counts.other}</b><span>未完成任务</span></button><button class="stat" data-tab="activity" data-activity-filter="failed"><b>${(s.jobs || []).filter(j => j.status === 'failed').length}</b><span>失败待关注</span></button></div><div class="quick-actions"><button data-tab="workers">${icon('send')}找员工派活 ${icon('arrow')}</button><button data-new-task data-write>${icon('plus')}新建看板任务 ${icon('arrow')}</button></div>${nPending ? `<div class="notice-card"><div><b>${nPending} 个操作待确认</b><p>不要重复发送，先查看原请求。</p></div><button data-tab="activity" data-activity-filter="receipts">去查看</button></div>` : ''}<div class="overview-grid"><section><div class="section-head"><h3>常用与最近员工</h3><button class="text-button" data-tab="workers">全部员工 ${icon('arrow')}</button></div><div class="mini-list">${recentWorkers.map(w => `<button class="mini-row" data-worker="${esc(w.id)}"><span class="avatar small">${esc(w.name?.slice(0, 1))}</span><span class="grow"><span>${esc(w.name)} ${favorite(w.id) ? '★' : ''}</span><span class="muted">${esc(w.role || '员工')} · ${esc(w.backend)}</span></span>${status(device()?.online ? w.status : 'offline')}${icon('arrow')}</button>`).join('') || empty('还没有员工目录', '工厂电脑接入后，员工会自动出现。', 'workers')}</div></section><section><div class="section-head"><h3>最近进展</h3><button class="text-button" data-tab="activity">全部动态 ${icon('arrow')}</button></div><div class="mini-list">${jobs.map(j => `<button class="mini-row" data-job="${esc(j.id)}"><span class="grow"><span class="clamp">${esc(j.task || '员工对话')}</span><span class="muted">${esc(j.worker)} · ${UI.relative(j.updatedAt || j.createdAt)}</span></span>${status(j.status)}</button>`).join('') || empty('进展会出现在这里', '任务接管、执行和回传都以原工厂为准。')}</div></section></div>`;
+  $('#content').innerHTML = `<section class="hero"><span class="eyebrow">FACTORY AT A GLANCE · ${esc(new Date().toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'short' }))}</span><h2>${greeting}</h2><p>${device()?.online ? `${ws.length} 位员工在这里，下一件事交给工厂。` : '工厂暂时离线。先查看最近状态，恢复后再安排任务。'}</p><span class="hero-deco" aria-hidden="true">牛</span></section><div class="stats"><button class="stat" data-tab="workers"><b>${ws.length}</b><span>工厂员工</span></button><button class="stat highlight" data-tab="activity" data-activity-filter="running"><b>${working}</b><span>正在执行</span></button><button class="stat" data-tab="tasks"><b>${counts.todo + counts.doing + counts.review + counts.other}</b><span>未完成任务</span></button><button class="stat" data-tab="activity" data-activity-filter="failed"><b>${(s.jobs || []).filter(j => j.status === 'failed').length}</b><span>失败待关注</span></button></div><div class="quick-actions"><button data-tab="workers">${icon('send')}找员工派活 ${icon('arrow')}</button><button data-new-task data-write>${icon('plus')}新建看板任务 ${icon('arrow')}</button></div>${nPending ? `<div class="notice-card"><div><b>${nPending} 个操作待确认</b><p>不要重复发送，先查看原请求。</p></div><button data-tab="activity" data-activity-filter="receipts">去查看</button></div>` : ''}<div class="overview-grid"><section><div class="section-head"><h3>常用与最近员工</h3><button class="text-button" data-tab="workers">全部员工 ${icon('arrow')}</button></div><div class="mini-list">${recentWorkers.map(w => `<button class="mini-row" data-worker="${esc(w.id)}"><span class="avatar small">${esc(w.name?.slice(0, 1))}</span><span class="grow"><span>${esc(w.name)} ${favorite(w.id) ? '★' : ''} ${UI.unreadBadge(w)}</span><span class="muted">${esc(w.role || '员工')} · ${esc(w.backend)}</span></span>${status(device()?.online ? w.status : 'offline')}${icon('arrow')}</button>`).join('') || empty('还没有员工目录', '工厂电脑接入后，员工会自动出现。', 'workers')}</div></section><section><div class="section-head"><h3>最近进展</h3><button class="text-button" data-tab="activity">全部动态 ${icon('arrow')}</button></div><div class="mini-list">${jobs.map(j => `<button class="mini-row" data-job="${esc(j.id)}"><span class="grow"><span class="clamp">${esc(j.task || '员工对话')}</span><span class="muted">${esc(j.worker)} · ${UI.relative(j.updatedAt || j.createdAt)}</span></span>${status(j.status)}</button>`).join('') || empty('进展会出现在这里', '任务接管、执行和回传都以原工厂为准。')}</div></section></div>`;
 }
 function workerCard(w) {
   const latest = UI.newest(snap().jobs).find(j => j.worker === w.id);
   const activeAt = w.lastInteractionAt || latest?.updatedAt || latest?.createdAt;
-  return `<article class="card worker-card"><div class="card-top"><div class="avatar">${esc(w.name?.slice(0, 1) || '牛')}</div><div class="grow"><h3>${esc(w.name)}</h3><div class="muted">${esc(w.role || '员工')} · ${esc(w.backend)}</div></div><button class="favorite-button" data-favorite="${esc(w.id)}" aria-label="${favorite(w.id) ? '取消常用' : '设为常用'}：${esc(w.name)}" aria-pressed="${favorite(w.id)}">${icon('star')}</button></div><div class="worker-status">${status(device()?.online ? w.status : 'offline')}<span class="muted">${activeAt ? UI.relative(activeAt) + '有消息或进展' : '尚无运行记录'}</span></div><div class="actions"><button data-worker="${esc(w.id)}">查看对话</button><button class="primary" data-assign="${esc(w.id)}" data-write ${!writable() ? 'disabled' : ''}>${icon('plus')}派活</button></div></article>`;
+  return `<article class="card worker-card"><div class="card-top"><div class="avatar">${esc(w.name?.slice(0, 1) || '牛')}</div><div class="grow"><h3>${esc(w.name)} ${UI.unreadBadge(w)}</h3><div class="muted">${esc(w.role || '员工')} · ${esc(w.backend)}</div></div><button class="favorite-button" data-favorite="${esc(w.id)}" aria-label="${favorite(w.id) ? '取消常用' : '设为常用'}：${esc(w.name)}" aria-pressed="${favorite(w.id)}">${icon('star')}</button></div><div class="worker-status">${status(device()?.online ? w.status : 'offline')}<span class="muted">${activeAt ? UI.relative(activeAt) + '有消息或进展' : '尚无运行记录'}</span></div><div class="actions"><button data-worker="${esc(w.id)}">查看对话</button><button class="primary" data-assign="${esc(w.id)}" data-write ${!writable() ? 'disabled' : ''}>${icon('plus')}派活</button></div></article>`;
 }
 const currentProject = (key = openedProject) => UI.projectList(snap()).find(p => p.key === key);
 const projectCacheKey = () => JSON.stringify([me?.id, selected, openedProject]);
@@ -376,6 +387,7 @@ function renderWorker() {
   $('#send-kind').onchange = e => { saveDraft(); composeKind = e.target.value; loadDraft(); };
   $('#chat-search').oninput = e => { chatQuery = e.target.value; timelineSignature = ''; renderTimeline(); };
   $('#chat-refresh').onclick = () => refreshDetail();
+  $('#timeline').addEventListener('scroll', () => readDwell.clear(), { passive: true });
   $('#jump-latest').onclick = () => { $('#timeline').scrollTop = $('#timeline').scrollHeight; $('#jump-latest').hidden = true; };
   $('#images').onchange = e => {
     const files = [...e.target.files]; e.target.value = '';
@@ -500,6 +512,7 @@ async function refreshDetail() {
     const result = await runCommand('worker.detail', { worker: current }, { deviceId: currentDevice });
     if (session !== me) return;
     if (detailCache.size >= 6) detailCache.delete(detailCache.keys().next().value);
+    applyAcknowledgedReads(result, key);
     detailCache.set(key, { detail: result, at: Date.now() });
     if (openedWorker === current && selected === currentDevice) { detail = result; lastDetailAt = Date.now(); renderTimeline(); }
   }
@@ -517,6 +530,76 @@ async function refreshDetail() {
   finally { detailReads.delete(key); if (session === me) syncDetailReadIndicator(); }
 }
 function remember(key, value) { copiedText.set(key, String(value || '')); if (copiedText.size > 250) copiedText.delete(copiedText.keys().next().value); return esc(key); }
+function readPhaseFor(read, scope = readScope()) {
+  if (!read) return '';
+  return readFlights.has(scope) ? 'sending' : readFailures.has(`${scope}:${read.revision}`) ? 'failed' : '';
+}
+function applyAcknowledgedReads(value, scope) {
+  for (const entry of [...(value?.jobs || []), ...(value?.messages || [])]) {
+    if (entry.readState && readAcknowledged.has(`${scope}:${entry.readState.revision}`)) entry.readState.unread = false;
+  }
+}
+async function acknowledgeReads(items, worker) {
+  const session = me, target = selected, scope = readScope(worker, target);
+  if (!session || document.hidden || !writable() || !snap().capabilities?.includes('read-sync-v1') || readFlights.has(scope)) return;
+  const batch = items.filter(i => i.worker === worker && i.read.unread && i.read.token).slice(0, 40);
+  if (!batch.length) return;
+  readFlights.add(scope); paintReadBadges();
+  try {
+    const result = await runCommand('read.mark', { worker, tokens: batch.map(i => i.read.token) }, { deviceId: target });
+    if (me !== session) return;
+    const acknowledged = new Set(result.acknowledged || []);
+    for (const item of batch) if (acknowledged.has(item.read.revision)) {
+      readAcknowledged.add(`${scope}:${item.read.revision}`); readFailures.delete(`${scope}:${item.read.revision}`); item.read.unread = false;
+    }
+    while (readAcknowledged.size > 1000) readAcknowledged.delete(readAcknowledged.values().next().value);
+    applyAcknowledgedReads(detailCache.get(scope)?.detail, scope);
+    if (scope === readScope()) applyAcknowledgedReads(detail, scope);
+    if (modalReadItem && readScope(modalReadItem.worker, modalReadItem.deviceId) === scope && acknowledged.has(modalReadItem.read.revision)) modalReadItem.read.unread = false;
+    if (result.worker?.id === worker && result.observedAt) {
+      // A state poll started before the acknowledgement may arrive after it.
+      const d = state.devices.find(d => d.id === target);
+      if (String(d?.snapshot?.observedAt || '') < result.observedAt) {
+        const counts = { unreadCount: result.worker.unreadCount, ...(Number.isFinite(result.worker.finishedUnreadJobs) ? { finishedUnreadJobs: result.worker.finishedUnreadJobs } : {}) };
+        readOverrides.set(scope, { observedAt: result.observedAt, worker: counts });
+        const w = d?.snapshot?.workers?.find(w => w.id === worker); if (w) Object.assign(w, counts);
+      }
+    }
+  } catch {
+    if (me === session) for (const i of batch) readFailures.set(`${scope}:${i.read.revision}`, Date.now());
+    while (readFailures.size > 500) readFailures.delete(readFailures.keys().next().value);
+    // Keep the unread badge. Reading never blocks navigation or message sends.
+  } finally {
+    readFlights.delete(scope);
+    if (session === me) { paintReadBadges(); if (!openedWorker && ['home', 'workers'].includes(tab) && !$('#dialog').open) render(); }
+  }
+}
+function paintReadBadges() {
+  const items = $('#dialog')?.open ? (modalReadItem ? [modalReadItem] : []) : [...visibleReadItems.values()];
+  for (const i of items) {
+    const root = $('#dialog')?.open ? $('#job-read-badge') : document.querySelector(`[data-read-item="${i.read.revision}"] .message-read`);
+    if (!root) continue;
+    const html = UI.messageReadBadge(i.read, readPhaseFor(i.read, readScope(i.worker)));
+    if ($('#dialog')?.open) root.innerHTML = html; else root.outerHTML = html;
+  }
+}
+function syncVisibleReads() {
+  if (!me || document.hidden || !writable() || !snap().capabilities?.includes('read-sync-v1')) { readDwell.clear(); return; }
+  const inModal = $('#dialog')?.open, root = inModal ? $('#dialog') : $('#timeline');
+  const items = inModal ? (modalReadItem?.deviceId === selected ? [modalReadItem] : []) : [...visibleReadItems.values()];
+  if (!root || (!inModal && !openedWorker)) { readDwell.clear(); return; }
+  const rect = root.getBoundingClientRect(), visible = new Set(), ready = [];
+  for (const item of items) {
+    const r = item.read, key = `${readScope(item.worker)}:${r.revision}`;
+    if (!r.unread || !r.token || Date.now() - (readFailures.get(key) || 0) < 30000) continue;
+    const element = root.querySelector(`[data-read-item="${r.revision}"]`);
+    if (!element || !UI.visiblyInside(element.getBoundingClientRect(), rect)) continue;
+    visible.add(key); if (!readDwell.has(key)) readDwell.set(key, Date.now());
+    if (Date.now() - readDwell.get(key) >= 800) ready.push(item);
+  }
+  for (const key of readDwell.keys()) if (!visible.has(key)) readDwell.delete(key);
+  if (ready.length) void acknowledgeReads(ready, ready[0].worker);
+}
 function renderTimeline({ prepend = false } = {}) {
   const node = $('#timeline'); if (!node || !openedWorker) return;
   const entries = [], seen = new Set();
@@ -526,15 +609,16 @@ function renderTimeline({ prepend = false } = {}) {
   }
   for (const j of detail?.jobs || []) {
     if (j.status === 'running' && j.publicConversation?.length) {
-      for (const b of j.publicConversation) entries.push({ id: 'live:' + b.id, live: true, kind: b.type === 'steer' ? 'request' : 'reply', human: b.type === 'steer', name: b.type === 'steer' ? '你 · steer 已记录' : (detail.worker?.name || openedWorker) + ' · 实时交流', time: b.time || j.createdAt, text: b.text, jobId: j.id });
-    } else if (j.reply || j.error || UI.busy(j.status)) entries.push({ id: 'job:' + j.id, kind: 'reply', name: detail.worker?.name || openedWorker, time: j.updatedAt || j.createdAt, state: j.status, text: j.reply || j.error || '员工正在处理，稍后自动更新…', jobId: j.id });
+      for (const b of j.publicConversation) entries.push({ readState: b === j.publicConversation.at(-1) && b.type !== 'steer' ? j.readState : null, id: 'live:' + b.id, live: true, kind: b.type === 'steer' ? 'request' : 'reply', human: b.type === 'steer', name: b.type === 'steer' ? '你 · steer 已记录' : (detail.worker?.name || openedWorker) + ' · 实时交流', time: b.time || j.createdAt, text: b.text, jobId: j.id });
+    } else if (j.reply || j.error || UI.busy(j.status)) entries.push({ readState: j.readState, id: 'job:' + j.id, kind: 'reply', name: detail.worker?.name || openedWorker, time: j.updatedAt || j.createdAt, state: j.status, text: j.reply || j.error || '员工正在处理，稍后自动更新…', jobId: j.id });
   }
-  for (const m of (detail?.messages || []).slice(-50)) entries.push({ id: 'message:' + m.id, kind: 'message', name: `站内信 · ${m.from} → ${m.to}`, time: m.createdAt, text: m.content || '' });
+  for (const m of (detail?.messages || []).slice(-50)) entries.push({ readState: m.readState, id: 'message:' + m.id, kind: 'message', name: `站内信 · ${m.from} → ${m.to}`, time: m.createdAt, text: m.content || '' });
   for (const r of outgoingForDevice().filter(r => r.envelope.body.worker === openedWorker && (!r.requestId || !seen.has(r.requestId)))) entries.push({ id: 'outgoing:' + r.envelope.id, kind: 'request', human: true, name: r.envelope.action === 'talk.send' ? '我发出的对话' : '我发出的任务', time: r.createdAt, text: r.envelope.body.message, attachments: r.attachments?.map((a, i) => ({ ...a, id: r.envelope.body.attachmentIds?.[i] })), error: r.error, delivery: r, jobId: r.jobId });
   const matched = entries.filter(e => (!chatFilter || e.kind === chatFilter) && UI.match(chatQuery, [e.text, e.name])).sort((a, b) => UI.stamp(a.time) - UI.stamp(b.time));
   const recent = new Set(matched.slice(-(chatQuery ? 100 : chatLimit)).map(e => e.id));
   const filtered = matched.filter(e => e.live || recent.has(e.id));
-  const signature = JSON.stringify(filtered); if (signature === timelineSignature) return;
+  visibleReadItems = new Map(filtered.filter(e => e.readState?.unread && e.readState?.token).map(e => [e.readState.revision, { read: e.readState, worker: openedWorker }]));
+  const signature = JSON.stringify(filtered, (k, v) => k === 'token' ? undefined : v); if (signature === timelineSignature) return;
   const selection = window.getSelection?.(); if (selection?.toString() && node.contains(selection.anchorNode)) { $('#jump-latest').hidden = false; return; }
   const atBottom = !prepend && (!timelineSignature || node.scrollHeight - node.scrollTop - node.clientHeight < 70);
   const oldTop = node.scrollTop, oldHeight = node.scrollHeight, expanded = new Set([...node.querySelectorAll('details[open]')].map(n => n.closest('[data-entry]')?.dataset.entry));
@@ -542,7 +626,7 @@ function renderTimeline({ prepend = false } = {}) {
   const html = filtered.map(e => {
     const key = remember(e.id, e.text), long = !e.live && (e.text.length > 700 || e.text.split('\n').length > 12);
     const content = long ? `<div class="rich-text message-preview">${UI.markdown(e.text.slice(0, 500))}</div><details class="long-message" data-rich="${key}" ${expanded.has(e.id) ? 'open' : ''}><summary>展开完整内容 · ${e.text.length.toLocaleString()} 字</summary><div class="rich-text full-text">${expanded.has(e.id) ? UI.markdown(e.text) : ''}</div></details>` : `<div class="rich-text">${UI.markdown(e.text)}</div>`;
-    return `<article class="bubble ${e.human ? 'human' : e.kind === 'message' ? 'system' : ''}" data-entry="${esc(e.id)}"><div class="meta"><span>${esc(e.name)} · ${time(e.time)}</span>${e.delivery ? deliveryBadge(e.delivery) : e.state ? status(e.state) : ''}</div>${content}${e.error ? `<p class="receipt-note">${esc(e.error)}</p>` : ''}${e.attachments?.length ? `<div class="attachments">${e.attachments.map(a => a.id ? `<button data-image="${esc(a.id)}">${icon('image')}${esc(a.name)}</button>` : `<span class="attachment-name">${esc(a.name)}</span>`).join('')}</div>` : ''}<div class="message-actions">${e.delivery ? deliveryRetry(e.delivery) : ''}<button data-copy="${key}" aria-label="复制这条内容">${icon('copy')}复制</button>${e.jobId ? `<button data-job="${esc(e.jobId)}">完整结果 ${icon('arrow')}</button>` : ''}</div></article>`;
+    return `<article class="bubble ${e.human ? 'human' : e.kind === 'message' ? 'system' : ''}" data-entry="${esc(e.id)}" ${e.readState ? `data-read-item="${esc(e.readState.revision)}"` : ''}><div class="meta"><span>${esc(e.name)} · ${time(e.time)}</span>${e.delivery ? deliveryBadge(e.delivery) : e.state ? status(e.state) : ''}</div>${content}${e.error ? `<p class="receipt-note">${esc(e.error)}</p>` : ''}${e.attachments?.length ? `<div class="attachments">${e.attachments.map(a => a.id ? `<button data-image="${esc(a.id)}">${icon('image')}${esc(a.name)}</button>` : `<span class="attachment-name">${esc(a.name)}</span>`).join('')}</div>` : ''}<div class="message-actions">${UI.messageReadBadge(e.readState, readPhaseFor(e.readState))}${e.delivery ? deliveryRetry(e.delivery) : ''}<button data-copy="${key}" aria-label="复制这条内容">${icon('copy')}复制</button>${e.jobId ? `<button data-job="${esc(e.jobId)}">完整结果 ${icon('arrow')}</button>` : ''}</div></article>`;
   }).join('');
   const nextHtml = (matched.length > filtered.length ? `<button class="load-earlier" data-earlier>查看更早消息 · 已显示 ${filtered.length} / ${matched.length}</button>` : '') + (html || empty(detail ? '没有匹配的对话' : '正在读取最近消息', chatQuery || chatFilter ? '试试其他关键词或切回“全部”。' : detail ? '可以从下方发送第一条消息。' : '返回已看过的会话会先显示本页缓存。'));
   const template = document.createElement('template'); template.innerHTML = nextHtml;
@@ -557,9 +641,9 @@ function renderTimeline({ prepend = false } = {}) {
   for (const child of [...node.children]) if (!kept.has(child)) child.remove();
   if (atBottom) { node.scrollTop = node.scrollHeight; $('#jump-latest').hidden = true; } else { node.scrollTop = prepend ? oldTop + node.scrollHeight - oldHeight : oldTop; $('#jump-latest').hidden = prepend; }
 }
-function modal(html) { const token = ++modalEpoch; $('#dialog-body').innerHTML = html; if (!$('#dialog').open) $('#dialog').showModal(); return token; }
+function modal(html) { readDwell.clear(); modalReadItem = null; const token = ++modalEpoch; $('#dialog-body').innerHTML = html; if (!$('#dialog').open) $('#dialog').showModal(); return token; }
 function updateModal(token, html) { if (token !== modalEpoch || !$('#dialog').open) return false; $('#dialog-body').innerHTML = html; return true; }
-function closeModal() { modalEpoch++; if ($('#dialog')?.open) $('#dialog').close(); }
+function closeModal() { modalEpoch++; modalReadItem = null; readDwell.clear(); if ($('#dialog')?.open) $('#dialog').close(); }
 async function openJob(jobId) {
   const target = selected, token = modal(`<h2 class="read-title">执行结果${UI.readIndicator('loading', '正在读取完整执行结果')}</h2><div class="result-loading" aria-busy="true"></div>`);
   try {
@@ -567,7 +651,8 @@ async function openJob(jobId) {
     if (selected !== target) return;
     const text = `${r.job.worker} · ${r.job.project || '未分类'}\n${time(r.job.updatedAt)}\n\n任务\n${r.job.task || ''}\n\n回复\n${r.reply || r.job.error || '暂无结果'}`;
     const key = remember(`export:${jobId}:${token}`, text);
-    updateModal(token, `<h2 class="read-title">${esc(r.job.worker)} · 执行结果${UI.readIndicator('ready', '执行结果读取完成')}</h2>${status(r.job.status)}<p class="job-meta">${esc(r.job.project || '未分类')} · ${time(r.job.updatedAt)}</p><div class="actions"><button data-copy="${key}">${icon('copy')}复制结果</button><button data-export="${key}">${icon('download')}保存为文本</button><button data-reload-job="${esc(jobId)}">${icon('refresh')}刷新</button></div><hr><h3>任务</h3><pre class="prose">${esc(r.job.task)}</pre><hr><h3>回复</h3><div class="rich-text">${UI.markdown(r.reply || r.job.error || '尚无结果，员工可能仍在执行。')}</div>`);
+    const shown = updateModal(token, `<h2 class="read-title">${esc(r.job.worker)} · 执行结果${UI.readIndicator('ready', '执行结果读取完成')}</h2>${status(r.job.status)}<span id="job-read-badge">${UI.messageReadBadge(r.job.readState)}</span><p class="job-meta">${esc(r.job.project || '未分类')} · ${time(r.job.updatedAt)}</p><div class="actions"><button data-copy="${key}">${icon('copy')}复制结果</button><button data-export="${key}">${icon('download')}保存为文本</button><button data-reload-job="${esc(jobId)}">${icon('refresh')}刷新</button></div><hr><h3>任务</h3><pre class="prose">${esc(r.job.task)}</pre><hr><h3>回复</h3><div class="rich-text" data-read-item="${esc(r.job.readState?.revision || '')}">${UI.markdown(r.reply || r.job.error || '尚无结果，员工可能仍在执行。')}</div>`);
+    if (shown && r.job.readState) modalReadItem = { read: r.job.readState, worker: r.job.worker, token, deviceId: target };
   } catch (e) { updateModal(token, `<h2 class="read-title">结果暂不可用${UI.readIndicator('error', '结果读取失败')}</h2><p>${esc(e.message)}</p>`); }
 }
 function newTask(project = '') {
@@ -693,6 +778,7 @@ document.addEventListener('click', async event => {
     if (node.dataset.projectNewTask) { const p = currentProject(node.dataset.projectNewTask); if (p) return newTask(p.id); return; }
     if (node.dataset.project) return route('projects', '', false, true, true, node.dataset.project);
     if (node.dataset.usageDays) { usageDays = Number(node.dataset.usageDays) === 30 ? 30 : 7; usageError = ''; return renderUsage(); }
+    if (Object.hasOwn(node.dataset, 'readRevision')) { const item = $('#dialog').open ? modalReadItem : visibleReadItems.get(node.dataset.readRevision); if (item?.read.revision === node.dataset.readRevision) return void acknowledgeReads([item], item.worker); }
     if (Object.hasOwn(node.dataset, 'earlier')) { chatLimit = Math.min(100, chatLimit + 20); return renderTimeline({ prepend: true }); }
     if (node.dataset.outgoingRetry) { const record = outgoing[node.dataset.outgoingRetry]; if (record) startDelivery(record); return; }
     if (node.dataset.worker) return openWorker(node.dataset.worker);
@@ -731,7 +817,7 @@ document.addEventListener('toggle', event => {
   if (node.matches?.('details[data-rich]') && node.open && !node.querySelector('.full-text').innerHTML) node.querySelector('.full-text').innerHTML = UI.markdown(copiedText.get(node.dataset.rich) || '本页内容已释放，请刷新对话再查看。');
 }, true);
 $('#close-dialog').onclick = closeModal;
-$('#dialog').addEventListener('cancel', () => { modalEpoch++; });
+$('#dialog').addEventListener('cancel', () => { modalEpoch++; modalReadItem = null; readDwell.clear(); });
 $('.brand').onclick = event => { if (me || !$('#workspace').hidden) { event.preventDefault(); route('home'); } };
 $('#refresh').innerHTML = icon('refresh');
 $('#refresh').onclick = async () => { const b = $('#refresh'); b.disabled = true; b.classList.add('spin'); try { await refresh({ force: true }); if (openedWorker) await refreshDetail(); } finally { b.disabled = false; b.classList.remove('spin'); } };
@@ -750,7 +836,7 @@ window.addEventListener('online', async () => { online = true; if (!me) { try { 
 window.addEventListener('beforeinstallprompt', event => { event.preventDefault(); installPrompt = event; if ($('#install')) $('#install').hidden = false; });
 window.addEventListener('popstate', event => { if (!me) return; const target = event.state; if (!target?.ox) return route('home', '', false, false); saveDraft(); if (state.devices.some(d => d.id === target.deviceId)) selected = target.deviceId; route(['home', 'projects', 'workers', 'tasks', 'activity', 'usage', 'settings'].includes(target.tab) ? target.tab : 'home', target.worker || '', !!target.assign, false, false, target.project || ''); renderDevicePicker(); });
 window.addEventListener('beforeunload', event => { if (Object.values(outgoing).some(r => ['preparing', 'submitting'].includes(r.phase))) { event.preventDefault(); event.returnValue = ''; } });
-document.addEventListener('visibilitychange', () => { if (!document.hidden) { refresh(); refreshDetail(); } });
+document.addEventListener('visibilitychange', () => { readDwell.clear(); if (!document.hidden) { refresh(); refreshDetail(); } });
 for (const node of document.querySelectorAll('[data-icon]')) node.innerHTML = icon(node.dataset.icon);
 applyPreferences();
 if ('ResizeObserver' in window) new ResizeObserver(() => document.documentElement.style.setProperty('--header-offset', $('.app-header').getBoundingClientRect().height + 'px')).observe($('.app-header'));
@@ -774,6 +860,7 @@ history.replaceState({ ox: true, tab, deviceId: selected }, '', location.pathnam
 let lastPollAttempt = 0, lastDetailAttempt = 0;
 setInterval(() => {
   if (document.hidden) return;
+  syncVisibleReads();
   const now = Date.now(), saving = pref('ox-refresh') === 'saving';
   if (now - lastPollAttempt >= (saving ? 15000 : 3000)) { lastPollAttempt = now; void refresh(); }
   if (now - lastDetailAttempt >= (saving ? 30000 : 4000)) { lastDetailAttempt = now; void refreshDetail(); }

@@ -1,6 +1,6 @@
 {
   "name": "ox-factory-mobile",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "private": true,
   "type": "module",
   "engines": {
@@ -8,7 +8,7 @@
   },
   "scripts": {
     "test": "node --test *.test.mjs",
-    "check": "node --check hub.mjs && node --check connector.mjs && node --check cli.mjs && node --check doctor.mjs && node --check runtime-health.mjs && node --check netlify-runtime.mjs && node --check netlify-hub.mjs && node --check web/app.js && node --check web/ui.js"
+    "check": "node --check hub.mjs && node --check connector.mjs && node --check cli.mjs && node --check doctor.mjs && node --check runtime-health.mjs && node --check netlify-runtime.mjs && node --check netlify-hub.mjs && node --check web/app.js && node --check web/ui.js && node --check factory-adapter.mjs && node --check read-state.mjs && node --check protocol.mjs"
   },
   "dependencies": {
     "@netlify/blobs": "11.1.0",

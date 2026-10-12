@@ -15,6 +15,7 @@ import { listWebTalkRequests, createWebTalkRequest } from '../web-talk.mjs';
 import { listWorkerTaskRequests } from '../task-requests.mjs';
 import { listFactoryTasks, getFactoryTask } from '../task-board.mjs';
 import { createJob, updateJob, appendJobEvent } from '../jobs.mjs';
+import { buildWorkerJobUnreadSummary, markWebJobRead } from '../web-job-read.mjs';
 
 async function freePort() { const s = createServer(); await new Promise(r => s.listen(0, '127.0.0.1', r)); const p = s.address().port; await new Promise(r => s.close(r)); return p; }
 async function fixture(t, hubOptions = {}) {
@@ -320,4 +321,23 @@ test('revoking an enrollment issuer invalidates their outstanding device enrollm
   const enrollment = await f.request('/api/enrollments', {}, other); assert.equal(enrollment.status, 201);
   await f.request('/api/revoke', { kind: 'session', id: other.id }, f.owner);
   assert.equal((await f.request('/connector/enroll', { code: enrollment.data.code, name: 'late device' })).status, 401);
+});
+
+test('phone read receipts synchronize desktop unread through Hub without creating activity tasks', async t => {
+  const f = await fixture(t), job = createJob(f.workersDir, { worker: '测试员工', task: 'read sync', cwd: f.root });
+  appendJobEvent(job, { type: 'text', text: '第一条' }); updateJob(job, { status: 'done', summary: '第一条' });
+  const view = await f.complete(f.envelope('worker.detail', { worker: '测试员工' }));
+  const r = view.result.data.jobs.find(j => j.id === job.id).readState; assert.equal(r.unread, true);
+  const mark = await f.complete(f.envelope('read.mark', { worker: '测试员工', tokens: [r.token] }));
+  assert.equal(mark.result.ok, true); assert.deepEqual(mark.result.data.acknowledged, [r.revision]);
+  assert.equal(buildWorkerJobUnreadSummary(f.workersDir, [job]).byJob.get(job.id).unread, false);
+  assert.equal((await f.request('/api/state', undefined, f.owner)).data.commands.some(c => c.action === 'read.mark'), false);
+  const invitation = await f.request('/api/pairings', { role: 'viewer', devices: [f.deviceId] }, f.owner), viewer = await f.login(invitation.data.code);
+  const viewerDetail = await f.complete(f.envelope('job.detail', { jobId: job.id }), viewer);
+  assert.equal(viewerDetail.result.data.job.readState.token, undefined);
+  assert.equal((await f.request('/api/commands', f.envelope('read.mark', { worker: '测试员工', tokens: [r.token] }), viewer)).status, 403);
+  appendJobEvent(job, { type: 'text', text: 'PC 已读' }); updateJob(job, { status: 'done' }); markWebJobRead(f.workersDir, job);
+  const pcRead = await f.complete(f.envelope('job.detail', { jobId: job.id })); assert.equal(pcRead.result.data.job.readState.unread, false);
+  f.grants[f.principalId].role = 'viewer';
+  await assert.rejects(f.adapter.execute({ id: randomUUID(), action: 'read.mark', body: { worker: '测试员工', tokens: [r.token] }, role: 'owner', principalId: f.principalId, digest: commandDigest('read.mark', { worker: '测试员工', tokens: [r.token] }), expiresAt: Date.now() + 10000 }), /LOCAL_GRANT_DENIED/);
 });

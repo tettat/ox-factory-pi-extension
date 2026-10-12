@@ -9,6 +9,7 @@ export const ACTIONS = {
   'tasks.list': { fields: [], role: 'viewer' },
   'usage.read': { fields: ['date', 'days'], role: 'viewer' },
   'project.detail': { fields: ['projectId'], role: 'viewer' },
+  'read.mark': { fields: ['worker', 'tokens'], role: 'operator', transient: true },
   'talk.send': { fields: ['worker', 'message', 'mode', 'attachmentIds'], role: 'operator' },
   'task.assign': { fields: ['worker', 'message', 'project', 'mode'], role: 'operator' },
   'task.create': { fields: ['title', 'description', 'project', 'worker'], role: 'operator' },
@@ -47,7 +48,11 @@ export function validateAction(action, body) {
   for (const key of ['message', 'description', 'context']) if (Object.hasOwn(body, key)) out[key] = string(body[key], 16000, true);
   for (const key of ['project', 'title', 'status', 'name']) if (Object.hasOwn(body, key)) out[key] = string(body[key], key === 'title' ? 300 : 160, true);
   if (out.worker?.startsWith('remote:') || out.worker === '*' || /[/\\]/.test(out.worker || '')) throw new Fault('INVALID_WORKER');
-  if (['worker.detail', 'talk.send', 'task.assign', 'image.upload', 'image.read'].includes(action) && !out.worker) throw new Fault('WORKER_REQUIRED');
+  if (['worker.detail', 'talk.send', 'task.assign', 'image.upload', 'image.read', 'read.mark'].includes(action) && !out.worker) throw new Fault('WORKER_REQUIRED');
+  if (action === 'read.mark') {
+    if (!Array.isArray(body.tokens) || !body.tokens.length || body.tokens.length > 40 || new Set(body.tokens).size !== body.tokens.length) throw new Fault('INVALID_READ_RECEIPTS');
+    out.tokens = body.tokens.map(value => string(value, 2048));
+  }
   if (action === 'image.read' && !out.attachmentId) throw new Fault('ATTACHMENT_REQUIRED');
   if (action === 'job.detail' && !out.jobId) throw new Fault('JOB_REQUIRED');
   if (action === 'project.detail') {

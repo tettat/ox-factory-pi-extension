@@ -100,3 +100,7 @@ nav#nav{gap:1px;padding-left:3px;padding-right:3px}nav#nav button{padding-left:2
 .chat-title h2{min-width:0}.read-status-slot,.read-indicator{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;flex:0 0 18px}
 .read-indicator{color:var(--accent);vertical-align:middle}.read-indicator .icon{width:15px;height:15px;stroke-width:2}.read-indicator[data-state=idle]{visibility:hidden}.read-indicator[data-state=ready]{opacity:.7}.read-indicator[data-state=error]{color:var(--bad)}.read-indicator[data-state=paused]{color:var(--muted)}
 .read-spinner{display:block;width:14px;height:14px;border:2px solid var(--line);border-top-color:currentColor;border-right-color:currentColor;border-radius:50%;animation:spin .8s linear infinite}.result-loading{min-height:96px}
+.unread-badge{display:inline-flex;align-items:center;justify-content:center;min-width:20px;height:20px;padding:0 6px;border-radius:999px;background:#df513e;color:#fff;font-size:11px;font-weight:700;vertical-align:middle;line-height:1}
+.message-actions .message-read,.message-read{display:inline-flex;align-items:center;gap:4px;font-size:11px;color:var(--muted);white-space:nowrap}
+.message-read .icon{width:13px;height:13px}.message-read.unread{color:var(--bad)}.message-read.unread i{width:5px;height:5px;background:currentColor;border-radius:50%}
+#job-read-badge{margin-left:10px}.worker-card h3{display:flex;align-items:center;gap:6px;flex-wrap:wrap}

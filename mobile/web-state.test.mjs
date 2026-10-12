@@ -23,6 +23,61 @@ function readingContext() {
   vm.runInContext("me = { id: 'session-read' }; selected = 'device-a'; openedWorker = 'worker-a'; renderTimeline = () => {};", c);
   return c;
 }
+function readSyncContext() {
+  const c = readingContext();
+  vm.runInContext(`state.devices[0].role = 'owner'; state.devices[0].snapshot = { observedAt: '2026-10-12T01:00:00.000Z', capabilities: ['read-sync-v1'], workers: [{ id: 'worker-a', unreadCount: 2 }] };
+    detail = { jobs: [{ id: 'job-a', readState: { unread: true, revision: 'revision-a', token: 'proof-a' } }] };
+    visibleReadItems.set('revision-a', { worker: 'worker-a', read: detail.jobs[0].readState });`, c);
+  return c;
+}
+test('read acknowledgement is background metadata, never clears a newer reply and stays scoped to its factory', async () => {
+  const c = readSyncContext(); let resolve;
+  c.result = new Promise(r => { resolve = r; });
+  vm.runInContext('runCommand = () => result;', c);
+  assert.equal(vm.runInContext("ACTION_WRITE('read.mark')", c), false);
+  const ack = vm.runInContext("acknowledgeReads([...visibleReadItems.values()], 'worker-a')", c);
+  vm.runInContext("detail.jobs[0].readState = { unread: true, revision: 'revision-new', token: 'proof-new' };", c);
+  resolve({ acknowledged: ['revision-a'], observedAt: '2026-10-12T01:01:00.000Z', worker: { id: 'worker-a', unreadCount: 1 } }); await ack;
+  assert.equal(vm.runInContext('detail.jobs[0].readState.unread', c), true);
+  assert.equal(vm.runInContext('state.devices[0].snapshot.workers[0].unreadCount', c), 1);
+  vm.runInContext("const late = { jobs: [{ readState: { unread: true, revision: 'revision-a' } }] }; applyAcknowledgedReads(late, readScope());", c);
+  assert.equal(vm.runInContext('late.jobs[0].readState.unread', c), false);
+  vm.runInContext("late.jobs[0].readState.unread = true; applyAcknowledgedReads(late, readScope('worker-a', 'device-b'));", c);
+  assert.equal(vm.runInContext('late.jobs[0].readState.unread', c), true);
+});
+test('read sync failure retains unread and exposes retry; hidden and viewer pages never acknowledge', async () => {
+  const c = readSyncContext(); c.calls = 0;
+  vm.runInContext("runCommand = async () => { calls++; throw Error('offline'); };", c);
+  await vm.runInContext("acknowledgeReads([...visibleReadItems.values()], 'worker-a')", c);
+  assert.equal(vm.runInContext('detail.jobs[0].readState.unread', c), true);
+  assert.equal(vm.runInContext('readPhaseFor(detail.jobs[0].readState)', c), 'failed');
+  vm.runInContext('document.hidden = true;', c);
+  await vm.runInContext("acknowledgeReads([...visibleReadItems.values()], 'worker-a')", c);
+  vm.runInContext("document.hidden = false; state.devices[0].role = 'viewer';", c);
+  await vm.runInContext("acknowledgeReads([...visibleReadItems.values()], 'worker-a')", c);
+  assert.equal(c.calls, 1);
+});
+test('automatic read requires viewport dwell and does not acknowledge offscreen or obscured conversation', () => {
+  const c = readSyncContext(); c.acks = 0;
+  vm.runInContext(`acknowledgeReads = () => { acks++; };
+    $('#timeline').getBoundingClientRect = () => ({ top: 0, bottom: 500, height: 500, left: 0, right: 320 });
+    let top = 600;
+    $('#timeline').querySelector = () => ({ getBoundingClientRect: () => ({ top, bottom: top + 100, height: 100, left: 0, right: 320 }) });
+    syncVisibleReads();`, c);
+  assert.equal(c.acks, 0); assert.equal(vm.runInContext('readDwell.size', c), 0);
+  vm.runInContext("top = 50; syncVisibleReads();", c); assert.equal(c.acks, 0);
+  vm.runInContext("for (const key of readDwell.keys()) readDwell.set(key, Date.now() - 1000); syncVisibleReads();", c); assert.equal(c.acks, 1);
+  vm.runInContext("$('#dialog').open = true; $('#dialog').getBoundingClientRect = $('#timeline').getBoundingClientRect; syncVisibleReads();", c);
+  assert.equal(c.acks, 1); assert.equal(vm.runInContext('readDwell.size', c), 0);
+});
+test('logout invalidates a pending read acknowledgement and cannot restore counters or private cache', async () => {
+  const c = readSyncContext(); let resolve; c.result = new Promise(r => { resolve = r; });
+  vm.runInContext('runCommand = () => result;', c);
+  const ack = vm.runInContext("acknowledgeReads([...visibleReadItems.values()], 'worker-a')", c);
+  vm.runInContext('clearPrivateBrowserState(); me = null;', c);
+  resolve({ acknowledged: ['revision-a'], worker: { id: 'worker-a', unreadCount: 0 }, observedAt: new Date().toISOString() }); await ack;
+  assert.equal(vm.runInContext('readAcknowledged.size + readOverrides.size + detailCache.size', c), 0);
+});
 const readPhase = c => vm.runInContext("$('#chat-read-status').dataset.state", c);
 
 test('cached conversation keeps a real loading indicator until its full read completes', async () => {

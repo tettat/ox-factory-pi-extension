@@ -50,11 +50,20 @@ Open the existing Hub HTTPS URL and use its configured login or a fresh owner in
 ## Features and limits
 
 - Device/employee directories, conversations, steering/queued messages, assignments and receipts.
+- Shared desktop/mobile read state: employee unread badges and message read indicators, using the selected factory's existing read ledger.
 - Shared project views and task boards, token summaries, attachments, reading mode and in-page nonblocking submission.
 - Scoped roles, one-time enrollment, revocation, reconnect and deduplication; optional Web Push.
 - No arbitrary shell, file browser, workspace switching or direct model app-server access.
 
 A receipt is not a completed job. In-page navigation can preserve a submission; a closed or OS-suspended browser cannot be guaranteed to finish an unaccepted request. Polling is not a latency guarantee. Business API responses are not cached by the PWA.
+
+### Read-state synchronization
+
+Update both the Hub and each factory's Connector to enable `read-sync-v1`; existing logins and device identities remain unchanged. No desktop core migration is required. Counters follow the connected desktop version (newer desktops emphasize finished unread jobs).
+
+An owner/operator viewing a message in the foreground acknowledges that displayed version after a short dwell; tapping its unread indicator also acknowledges it. Hidden history, filtered messages and background prefetches are not marked read. A delayed cached acknowledgement never clears a later reply. Desktop reads appear on the next phone refresh; phone reads appear on the next desktop refresh. These are shared factory read markers, not sender delivery receipts or per-phone private read histories.
+
+Read synchronization runs in the background, does not create tasks/activity receipts, and does not block navigation or message submission. Failed acknowledgements retain the unread indicator with a retry action. Read-only viewers see the shared state but cannot change it. Offline or suspended pages do not acknowledge automatically.
 
 ## Run a separate Hub
 

@@ -11,7 +11,7 @@ test('mobile keeps long live speech and steer visible, retains stable bubbles an
     $:s=>dom.window.document.querySelector(s),esc:UI.escape||((x)=>String(x).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('"','&quot;')),
     time:x=>x||'',status:x=>x||'',icon:()=>'',empty:x=>x,outgoingForDevice:()=>[],remember:x=>x,
     detail:{worker:{name:'员工'},jobs:[{id:'j',status:'running',publicConversation:[{id:'j:0',type:'text',text:'公开文字'.repeat(300),time:'1'},{id:'j:1',type:'steer',text:'不要重启',time:'2'}]}]},
-    openedWorker:'员工',chatFilter:'',chatQuery:'',chatLimit:1,timelineSignature:''});
+    openedWorker:'员工',chatFilter:'',chatQuery:'',chatLimit:1,timelineSignature:'',visibleReadItems:new Map(),readPhaseFor:()=>''});
   vm.runInContext(source.slice(source.indexOf('function renderTimeline('),source.indexOf('function modal(')),ctx);
   vm.runInContext('renderTimeline()',ctx);
   const node=dom.window.document.querySelector('#timeline'),old=node.firstChild;

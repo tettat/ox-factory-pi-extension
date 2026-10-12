@@ -11,6 +11,7 @@ import { listProjects as listStoredProjects } from '../projects.mjs';
 import { createTalkAttachment, resolveTalkAttachmentIds, assertTalkImageBackendSupported, bindTalkAttachments, talkAttachmentContentPath } from '../talk-attachments.mjs';
 import { ACTIONS, Fault, at, hash, id, roleAllows, validateAction, commandDigest } from './protocol.mjs';
 import { readJson, writeJson } from './store.mjs';
+import { createReadState } from './read-state.mjs';
 
 const text = (value, max = 16000) => String(value || '').slice(0, max);
 const pick = (value, keys) => Object.fromEntries(keys.map(key => [key, value[key] ?? null]));
@@ -46,6 +47,7 @@ export function createFactoryAdapter({ workersDir, stateDir, factoryUrl = 'http:
   const save = () => writeJson(file, ledger);
   const currentGrants = () => typeof grants === 'function' ? grants() : grants;
   const usageCache = new Map();
+  const readState = createReadState({ workersDir, now });
   async function factoryRead(path) {
     const response = await factoryFetch(new URL(path, base), { signal: AbortSignal.timeout(15000), redirect: 'error' });
     if (!response.ok) throw new Fault('FACTORY_UNAVAILABLE', 503);
@@ -71,6 +73,7 @@ export function createFactoryAdapter({ workersDir, stateDir, factoryUrl = 'http:
       lastInteractionAt: text(w.lastInteractionAt || w.lastJob?.updatedAt, 80),
       lastTalkReply: w.lastTalkReply ? { contentPreview: text(w.lastTalkReply.contentPreview, 180), updatedAt: text(w.lastTalkReply.updatedAt, 80) } : null,
       unreadCount: count(w.unreadCount), model: text(w.model, 120),
+      ...(Number.isFinite(w.finishedUnreadJobs) ? { finishedUnreadJobs: count(w.finishedUnreadJobs) } : {}),
       tokenToday: w.tokenToday ? { input: count(w.tokenToday.input), cachedInput: count(w.tokenToday.cachedInput), uncachedInput: count(w.tokenToday.uncachedInput), output: count(w.tokenToday.output), total: count(w.tokenToday.total), source: tokenSource(w.tokenToday.source) } : null,
     }));
   }
@@ -83,12 +86,13 @@ export function createFactoryAdapter({ workersDir, stateDir, factoryUrl = 'http:
     if (!hasPermission(workersDir, { subject: grant.actor, action, target: worker })) throw new Fault('FACTORY_PERMISSION_DENIED', 403);
   }
   async function snapshot() {
+    const observedAt = at();
     const ws = await workers();
     const allowed = new Set(ws.map(w => w.id));
     let projects = [], projectsAvailable = true, projectsTruncated = false;
     try { const all = listStoredProjects(workersDir); projects = all.slice(0, 200).map(p => projectView(p)); projectsTruncated = all.length > 200; }
     catch { projectsAvailable = false; } // A broken project index must not take employee messaging offline.
-    return { protocolVersion: 1, observedAt: at(), reachable: true, workers: ws, usageDate: localDate(now()), capabilities: ['usage.read', 'worker-activity-v1', 'project.detail'], projects, projectsAvailable, projectsTruncated,
+    return { protocolVersion: 1, observedAt, reachable: true, workers: ws, usageDate: localDate(now()), capabilities: ['usage.read', 'worker-activity-v1', 'project.detail', 'read-sync-v1'], projects, projectsAvailable, projectsTruncated,
       jobs: listJobs(workersDir, { limit: 100 }).filter(j => allowed.has(j.worker)).map(jobView),
       tasks: listFactoryTasks(workersDir, { limit: 200 }).map(taskView),
       requests: listWorkerTaskRequests(workersDir, { limit: 100 }).map(requestView),
@@ -127,16 +131,27 @@ export function createFactoryAdapter({ workersDir, stateDir, factoryUrl = 'http:
       const events = tailJobEvents(job, 1000);
       return text(latestReplyFromEvents(events) || job.summary || events.filter(e => e.type === 'text').map(e => e.text || '').join(''), 64000);
     };
-    if (command.action === 'worker.detail') return {
-      worker, jobs: jobs().filter(j => j.worker === worker.id).slice(-30).map((j, i, all) => ({ ...jobView(j), ...(['running', 'queued'].includes(j.status) ? { publicConversation: readPublicConversation(j) } : {}), reply: i >= all.length - 10 ? reply(j) : text(j.summary) })),
-      talkRequests: listWebTalkRequests(workersDir, { worker: worker.id, limit: 100 }).map(requestView),
-      requests: listWorkerTaskRequests(workersDir, { to: worker.id, limit: 100 }).map(requestView),
-      messages: listMessages(workersDir, { worker: worker.id, includeSent: true, limit: 100 }).map(m => ({ ...pick(m, ['id', 'from', 'to', 'createdAt', 'read']), content: text(m.content) })),
-    };
+    const capture = (js, ms, workerId) => readState.capture(js, ms, { worker: workerId, principalId: command.principalId, canMark: roleAllows(grant.role, 'operator') && roleAllows(command.role, 'operator') });
+    if (command.action === 'read.mark') {
+      const acknowledged = readState.mark(body.tokens, { worker: worker.id, principalId: command.principalId, jobs: jobs() });
+      const observedAt = at();
+      return { acknowledged, observedAt, worker: (await workers()).find(w => w.id === worker.id) };
+    }
+    if (command.action === 'worker.detail') {
+      const js = jobs().filter(j => j.worker === worker.id).slice(-30), ms = listMessages(workersDir, { worker: worker.id, includeSent: true, limit: 100 });
+      const reads = capture(js, ms, worker.id);
+      return {
+        worker, jobs: js.map((j, i, all) => ({ ...jobView(j), readState: reads.jobStates.get(j.id), ...(['running', 'queued'].includes(j.status) ? { publicConversation: readPublicConversation(j) } : {}), reply: i >= all.length - 10 ? reply(j) : text(j.summary) })),
+        talkRequests: listWebTalkRequests(workersDir, { worker: worker.id, limit: 100 }).map(requestView),
+        requests: listWorkerTaskRequests(workersDir, { to: worker.id, limit: 100 }).map(requestView),
+        messages: ms.map(m => ({ ...pick(m, ['id', 'from', 'to', 'createdAt', 'read']), readState: reads.messageStates.get(m.id), content: text(m.content) })),
+      };
+    }
     if (command.action === 'job.detail') {
       const job = jobs().find(j => j.id === body.jobId);
       if (!job || !ws.some(w => w.id === job.worker)) throw new Fault('JOB_NOT_FOUND', 404);
-      return { job: jobView(job), reply: reply(job), publicConversation: readPublicConversation(job) };
+      const reads = capture([job], [], job.worker);
+      return { job: { ...jobView(job), readState: reads.jobStates.get(job.id) }, reply: reply(job), publicConversation: readPublicConversation(job) };
     }
     if (command.action === 'tasks.list') return { tasks: listFactoryTasks(workersDir, { limit: 500 }).map(taskView) };
     if (command.action === 'image.read') {

@@ -1,5 +1,5 @@
 // Pure presentation helpers. No network, credentials, DOM writes or raw HTML input.
-export const VERSION = '0.4.2';
+export const VERSION = '0.4.3';
 export const labels = { idle: '空闲', busy: '忙碌', running: '执行中', queued: '排队中', pending: '等待接管', processing: '接管中', accepted: '已接管', reported: '已回传', done: '完成', completed: '完成', succeeded: '完成', failed: '失败', cancelled: '已取消', offline: '离线', vacation: '休假', TODO: '待开始' };
 export const roles = { owner: '所有者', operator: '操作员', viewer: '只读' };
 export const actions = { 'talk.send': '员工对话', 'task.assign': '派发任务', 'task.create': '创建看板任务', 'task.update': '更新看板任务', 'image.upload': '上传图片' };
@@ -154,4 +154,19 @@ export function readIndicator(phase, label) {
   const state = ['loading', 'ready', 'error', 'paused'].includes(phase) ? phase : 'idle';
   const glyph = state === 'loading' ? '<i class="read-spinner" aria-hidden="true"></i>' : state === 'ready' ? icon('check') : state === 'idle' ? '' : icon('warning');
   return `<span class="read-indicator" data-state="${state}" role="img" aria-label="${esc(label)}" title="${esc(label)}">${glyph}</span>`;
+}
+export function unreadBadge(worker) {
+  const count = Math.max(0, Math.trunc(Number(worker.finishedUnreadJobs ?? worker.unreadCount) || 0));
+  return count ? `<span class="unread-badge" aria-label="${count} 条未读" title="与电脑同步的未读状态">${count > 99 ? '99+' : count}</span>` : '';
+}
+export function messageReadBadge(read, phase = '') {
+  if (!read) return '';
+  const label = !read.unread ? '已读' : phase === 'sending' ? '同步中' : phase === 'failed' ? '未读 · 重试同步' : '未读';
+  const content = `${!read.unread ? icon('check') : '<i aria-hidden="true"></i>'}${label}`;
+  return read.unread && read.token ? `<button class="message-read unread" data-read-revision="${esc(read.revision)}" title="标为已读并同步到电脑" ${phase === 'sending' ? 'disabled' : ''}>${content}</button>` : `<span class="message-read ${read.unread ? 'unread' : ''}" title="与电脑共用已读状态">${content}</span>`;
+}
+export function visiblyInside(rect, root) {
+  const height = Math.max(0, Math.min(rect.bottom, root.bottom) - Math.max(rect.top, root.top));
+  const width = Math.max(0, Math.min(rect.right, root.right) - Math.max(rect.left, root.left));
+  return rect.height > 0 && root.height > 0 && width > 0 && height >= Math.min(rect.height, root.height) * .6;
 }

@@ -67,7 +67,7 @@ export function createMobileHub({ stateFile, stateStore = null, origin, browserO
     for (const c of Object.values(state.commands)) {
       if (['done', 'failed'].includes(c.state) && c.finishedAt) {
         const age = now() - Date.parse(c.finishedAt);
-        if ((ACTIONS[c.action].role === 'viewer' && age > 120000) || age > 30 * DAY) { delete state.commands[c.id]; dirty = true; continue; }
+        if (((ACTIONS[c.action].role === 'viewer' || ACTIONS[c.action].transient) && age > 120000) || age > 30 * DAY) { delete state.commands[c.id]; dirty = true; continue; }
       }
       if (!['queued', 'delivering'].includes(c.state)) continue;
       if (!activeCommand(c, state.devices[c.deviceId])) {
@@ -223,7 +223,7 @@ export function createMobileHub({ stateFile, stateStore = null, origin, browserO
           snapshot: { ...d.snapshot, grants: undefined }, role: ROLES[Math.min(ROLES.indexOf(s.role), ROLES.indexOf(d.snapshot.grants[s.principalId]))] }));
         // Read results (especially images/history) are fetched only by command ID,
         // not retransmitted in every background snapshot poll.
-        return send(res, 200, { generatedAt: at(), devices, commands: Object.values(state.commands).filter(c => c.sessionId === s.id && ACTIONS[c.action].role !== 'viewer' && canSee(s, state.devices[c.deviceId])).slice(-80).map(publicCommand) });
+        return send(res, 200, { generatedAt: at(), devices, commands: Object.values(state.commands).filter(c => c.sessionId === s.id && ACTIONS[c.action].role !== 'viewer' && !ACTIONS[c.action].transient && canSee(s, state.devices[c.deviceId])).slice(-80).map(publicCommand) });
       }
       if (req.method === 'POST' && path === '/api/commands') {
         const b = await body(req); fields(b, ['id', 'deviceId', 'action', 'body', 'createdAt']);
