@@ -1,5 +1,6 @@
+import { renderMarkdown } from './markdown.js';
 // Pure presentation helpers. No network, credentials, DOM writes or raw HTML input.
-export const VERSION = '0.5.0';
+export const VERSION = '0.5.1';
 export const labels = { idle: '空闲', busy: '忙碌', running: '执行中', queued: '排队中', pending: '等待接管', processing: '接管中', accepted: '已接管', reported: '已回传', done: '完成', completed: '完成', succeeded: '完成', failed: '失败', cancelled: '已取消', offline: '离线', vacation: '休假', TODO: '待开始' };
 export const roles = { owner: '所有者', operator: '操作员', viewer: '只读' };
 export const actions = { 'talk.send': '员工对话', 'task.assign': '派发任务', 'task.create': '创建看板任务', 'task.update': '更新看板任务', 'image.upload': '上传图片' };
@@ -92,38 +93,8 @@ export function taskStats(tasks) { const counts = { todo: 0, doing: 0, review: 0
 export function safeLink(value) {
   try { const u = new URL(value); return ['https:', 'http:'].includes(u.protocol) && !u.username && !u.password ? u.href : null; } catch { return null; }
 }
-function inline(value) {
-  const token = /(`[^`\n]{1,2000}`|\*\*[^*\n]{1,2000}\*\*|\[[^\]\n]{1,300}\]\([^\s)]{1,2000}\))/g;
-  let result = '', from = 0;
-  for (const m of String(value).matchAll(token)) {
-    result += esc(value.slice(from, m.index)); const text = m[0];
-    if (text.startsWith('`')) result += `<code>${esc(text.slice(1, -1))}</code>`;
-    else if (text.startsWith('**')) result += `<strong>${esc(text.slice(2, -2))}</strong>`;
-    else { const parts = /^\[([^\]]+)\]\((.+)\)$/.exec(text), href = safeLink(parts[2]); result += href ? `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer">${esc(parts[1])} ↗</a>` : esc(text); }
-    from = m.index + text.length;
-  }
-  return result + esc(value.slice(from));
-}
-export function markdown(input) {
-  // Deliberately small Markdown subset: never pass through HTML, images or scripts.
-  const lines = String(input || '').slice(0, 128000).replace(/\r\n/g, '\n').split('\n');
-  let html = '', code = null, language = '', list = '';
-  const endList = () => { if (list) { html += `</${list}>`; list = ''; } };
-  for (const line of lines) {
-    if (/^\s*```/.test(line)) {
-      endList();
-      if (code !== null) { html += `<div class="code-block"><span>${esc(language || '代码')}</span><pre><code>${esc(code.join('\n'))}</code></pre></div>`; code = null; }
-      else { code = []; language = line.trim().slice(3, 40); } continue;
-    }
-    if (code !== null) { code.push(line); continue; }
-    const item = /^\s*(?:([-*])|\d+\.)\s+(.+)$/.exec(line);
-    if (item) { const tag = item[1] ? 'ul' : 'ol'; if (list !== tag) { endList(); html += `<${tag}>`; list = tag; } html += `<li>${inline(item[2])}</li>`; continue; }
-    endList(); const heading = /^(#{1,4})\s+(.+)$/.exec(line);
-    html += heading ? `<h4>${inline(heading[2])}</h4>` : /^>\s?/.test(line) ? `<blockquote>${inline(line.replace(/^>\s?/, ''))}</blockquote>` : line.trim() ? `<p>${inline(line)}</p>` : '<div class="paragraph-gap"></div>';
-  }
-  endList(); if (code !== null) html += `<div class="code-block"><pre><code>${esc(code.join('\n'))}</code></pre></div>`;
-  return html;
-}
+export const markdown = input => renderMarkdown(input);
+export const markdownPreview = input => renderMarkdown(input, true);
 const paths = {
   home: '<path d="m3 10 9-7 9 7v10a1 1 0 0 1-1 1h-6v-7h-4v7H4a1 1 0 0 1-1-1z"/>',
   workers: '<circle cx="9" cy="7" r="3"/><path d="M3 21v-3a6 6 0 0 1 12 0v3M16 4a3 3 0 0 1 0 6m2 4a5 5 0 0 1 3 4v3"/>',

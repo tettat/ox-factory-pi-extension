@@ -4,9 +4,10 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, writeF
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { httpsOrigin } from './netlify-proxy.mjs';
+import { WEB_ASSETS } from './web-assets.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url)), root = resolve(here, '..');
-const assets = ['index.html', 'app.js', 'ui.js', 'cache.js', 'style.css', 'sw.js', 'manifest.webmanifest', 'icon.svg'];
+const assets = WEB_ASSETS;
 export function netlifyConfig(hubOrigin = '') {
   if (hubOrigin) httpsOrigin(hubOrigin);
   return `[build]
@@ -27,7 +28,7 @@ ${hubOrigin ? '  signed = "OX_PROXY_SIGNING_KEY"\n' : ''}
     X-Frame-Options = "DENY"
     X-Robots-Tag = "noindex, nofollow"
     Permissions-Policy = "camera=(), microphone=(), geolocation=()"
-    Content-Security-Policy = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+    Content-Security-Policy = "default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; font-src 'self'; img-src 'self' blob: data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
 
 [[headers]]
   for = "/sw.js"
@@ -51,7 +52,7 @@ export function prepareNetlify({ output, hubOrigin = '' }) {
   const parent = realpathSync(dirname(destination));
   if (parent !== allowed && !parent.startsWith(allowed + '/') && !parent.startsWith(allowed + '\\')) throw new Error('Deployment parent escapes workspace/output');
   mkdirSync(join(destination, 'public'), { recursive: true });
-  for (const asset of assets) copyFileSync(join(here, 'web', asset), join(destination, 'public', asset));
+  for (const asset of assets) { const target = join(destination, 'public', asset); mkdirSync(dirname(target), { recursive: true }); copyFileSync(join(here, 'web', asset), target); }
   writeFileSync(join(destination, 'netlify.toml'), config);
   // Netlify Drop processes public files, not netlify.toml: keep static headers
   // in the publish directory too. Neither file contains a secret.
@@ -62,7 +63,7 @@ export function prepareNetlify({ output, hubOrigin = '' }) {
   X-Frame-Options: DENY
   X-Robots-Tag: noindex, nofollow
   Permissions-Policy: camera=(), microphone=(), geolocation=()
-  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'
+  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; font-src 'self'; img-src 'self' blob: data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'
 /sw.js
   Service-Worker-Allowed: /
   Cache-Control: no-cache, no-store, must-revalidate

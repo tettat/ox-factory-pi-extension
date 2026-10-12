@@ -627,7 +627,7 @@ function renderTimeline({ prepend = false } = {}) {
   timelineSignature = signature;
   const html = filtered.map(e => {
     const key = remember(e.id, e.text), long = !e.live && (e.text.length > 700 || e.text.split('\n').length > 12);
-    const content = long ? `<div class="rich-text message-preview">${UI.markdown(e.text.slice(0, 500))}</div><details class="long-message" data-rich="${key}" ${expanded.has(e.id) ? 'open' : ''}><summary>展开完整内容 · ${e.text.length.toLocaleString()} 字</summary><div class="rich-text full-text">${expanded.has(e.id) ? UI.markdown(e.text) : ''}</div></details>` : `<div class="rich-text">${UI.markdown(e.text)}</div>`;
+    const content = long ? `<div class="rich-text message-preview">${UI.markdownPreview(e.text)}</div><details class="long-message" data-rich="${key}" ${expanded.has(e.id) ? 'open' : ''}><summary>展开完整内容 · ${e.text.length.toLocaleString()} 字</summary><div class="rich-text full-text">${expanded.has(e.id) ? UI.markdown(e.text) : ''}</div></details>` : `<div class="rich-text">${UI.markdown(e.text)}</div>`;
     return `<article class="bubble ${e.human ? 'human' : e.kind === 'message' ? 'system' : ''}" data-entry="${esc(e.id)}"><div class="meta"><span>${esc(e.name)} · ${time(e.time)}</span>${e.delivery ? deliveryBadge(e.delivery) : e.state ? status(e.state) : ''}</div>${content}${e.error ? `<p class="receipt-note">${esc(e.error)}</p>` : ''}${e.attachments?.length ? `<div class="attachments">${e.attachments.map(a => a.id ? `<button data-image="${esc(a.id)}">${icon('image')}${esc(a.name)}</button>` : `<span class="attachment-name">${esc(a.name)}</span>`).join('')}</div>` : ''}<div class="message-actions">${e.delivery ? deliveryRetry(e.delivery) : ''}<button data-copy="${key}" aria-label="复制这条内容">${icon('copy')}复制</button>${e.jobId ? `<button data-job="${esc(e.jobId)}">完整结果 ${icon('arrow')}</button>` : ''}</div></article>`;
   }).join('');
   const nextHtml = (matched.length > filtered.length ? `<button class="load-earlier" data-earlier>查看更早消息 · 已显示 ${filtered.length} / ${matched.length}</button>` : '') + (html || empty(detail ? '没有匹配的对话' : '正在读取最近消息', chatQuery || chatFilter ? '试试其他关键词或切回“全部”。' : detail ? '可以从下方发送第一条消息。' : '返回已看过的会话会先显示本机缓存。'));
@@ -796,6 +796,7 @@ document.addEventListener('click', async event => {
     if (node.dataset.task) return openTask(node.dataset.task);
     if (Object.hasOwn(node.dataset, 'newTask')) return newTask(tab === 'tasks' ? taskScope?.id || taskProject : '');
     if (node.dataset.setTaskStatus && $('#edit-task-status')) { $('#edit-task-status').value = node.dataset.setTaskStatus; return; }
+    if (Object.hasOwn(node.dataset, 'copyCode')) { const code = node.closest('.code-block')?.querySelector('pre code')?.textContent; if (code != null) { await navigator.clipboard.writeText(code); toast('代码已复制'); } return; }
     if (node.dataset.copy) return copyText(node.dataset.copy);
     if (node.dataset.export) return exportText(node.dataset.export);
     if (node.dataset.removeImage) { const i = attachmentItems.findIndex(x => x.id === node.dataset.removeImage); if (i >= 0) { URL.revokeObjectURL(attachmentItems[i].url); attachmentItems.splice(i, 1); renderAttachments(); } return; }

@@ -37,7 +37,7 @@ test('restored outgoing entries require a valid identity, envelope and known pha
 
 test('message rendering supports headings, code, lists, links and never passes through HTML', () => {
   const html = UI.markdown('# 标题\n**粗体** 与 `code`\n- 甲\n- 乙\n[官网](https://example.com/test?q=1)\n```js\n<img src=x onerror=alert(1)>\n```\n<script>alert(1)</script>');
-  assert.match(html, /<h4>标题<\/h4>/); assert.match(html, /<strong>粗体<\/strong>/); assert.match(html, /<ul><li>甲<\/li>/);
+  assert.match(html, /<h1>标题<\/h1>/); assert.match(html, /<strong>粗体<\/strong>/); assert.match(html, /<ul>\s*<li>甲<\/li>/);
   assert.match(html, /rel="noopener noreferrer"/); assert.match(html, /&lt;img/); assert.match(html, /&lt;script&gt;/);
   assert.doesNotMatch(html, /<img|<script/);
 });

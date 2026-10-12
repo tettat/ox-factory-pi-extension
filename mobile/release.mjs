@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 // Code-only Hub/Connector bundle; the full factory is installed separately.
-import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync, realpathSync, readdirSync, lstatSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync, realpathSync, lstatSync } from 'node:fs';
 import { resolve, dirname, relative, join, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
+import { WEB_ASSETS } from './web-assets.mjs';
 const root = realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), '..'));
 const outputBase = join(root, 'output'), output = resolve(root, process.argv[2] || 'output/mobile-release');
 const inside = (child, parent) => { const r = relative(parent, child); return r && r !== '..' && !r.startsWith('../') && !r.startsWith('..\\') && !isAbsolute(r); };
@@ -25,10 +26,7 @@ function add(name) {
   }
 }
 for (const name of ['cli.mjs', 'factory-adapter.mjs', 'release.mjs', 'netlify.mjs', 'netlify-hub.mjs', 'netlify-runtime.mjs', 'package.json', 'package-lock.json', 'README.md', 'SECURITY.md', 'NETLIFY.md']) add('mobile/' + name);
-for (const entry of readdirSync(join(root, 'mobile/web'), { withFileTypes: true })) {
-  if (!entry.isFile()) throw new Error('Unexpected asset directory or symlink');
-  add('mobile/web/' + entry.name);
-}
+for (const asset of WEB_ASSETS) add('mobile/web/' + asset);
 for (const name of ['Caddyfile.example', 'ox-mobile-hub.service', 'WINDOWS-SERVICE.md']) add('mobile/deploy/' + name);
 const manifest = [];
 for (const name of [...files].sort()) {

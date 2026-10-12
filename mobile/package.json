@@ -1,6 +1,6 @@
 {
   "name": "ox-factory-mobile",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "private": true,
   "type": "module",
   "engines": {
@@ -8,10 +8,16 @@
   },
   "scripts": {
     "test": "node --test *.test.mjs",
-    "check": "node --check hub.mjs && node --check connector.mjs && node --check cli.mjs && node --check doctor.mjs && node --check runtime-health.mjs && node --check netlify-runtime.mjs && node --check netlify-hub.mjs && node --check web/app.js && node --check web/ui.js && node --check factory-adapter.mjs && node --check read-state.mjs && node --check protocol.mjs && node --check web/cache.js"
+    "check": "node --check hub.mjs && node --check connector.mjs && node --check cli.mjs && node --check doctor.mjs && node --check runtime-health.mjs && node --check netlify-runtime.mjs && node --check netlify-hub.mjs && node --check web/app.js && node --check web/ui.js && node --check factory-adapter.mjs && node --check read-state.mjs && node --check protocol.mjs && node --check web/cache.js && node --check web/markdown.js && node --check web-assets.mjs",
+    "build:markup": "node build-markup.mjs"
   },
   "dependencies": {
     "@netlify/blobs": "11.1.0",
     "web-push": "3.6.7"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "katex": "0.19.0",
+    "markdown-it": "15.0.2"
   }
 }

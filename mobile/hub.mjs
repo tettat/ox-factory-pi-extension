@@ -1,3 +1,4 @@
+import { WEB_ASSETS } from './web-assets.mjs';
 import { createServer } from 'node:http';
 import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -10,7 +11,8 @@ import { verifyPassword } from './password.mjs';
 
 const DAY = 86400000;
 const webDir = join(dirname(fileURLToPath(import.meta.url)), 'web');
-const assets = { '/': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/ui.js': ['ui.js', 'text/javascript'], '/cache.js': ['cache.js', 'text/javascript'], '/style.css': ['style.css', 'text/css'], '/sw.js': ['sw.js', 'text/javascript'], '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json'], '/icon.svg': ['icon.svg', 'image/svg+xml'] };
+const assetTypes = { html: 'text/html', js: 'text/javascript', css: 'text/css', webmanifest: 'application/manifest+json', svg: 'image/svg+xml', txt: 'text/plain', woff2: 'font/woff2' };
+const assets = Object.fromEntries(WEB_ASSETS.map(file => [file === 'index.html' ? '/' : '/' + file, [file, assetTypes[file.split('.').at(-1)]]]));
 export function initialState({ principalId, deviceId, deviceName, deviceSecret, pairingCode, adminSecret, now = Date.now() }) {
   id(principalId); id(deviceId);
   return { version: VERSION, ownerPrincipalId: principalId, adminHash: adminSecret ? hash(adminSecret) : null, devices: { [deviceId]: { id: deviceId, ownerPrincipalId: principalId, name: deviceName, credentialHash: hash(deviceSecret), createdAt: at(), lastSeenAt: 0, snapshot: null, revokedAt: null } },
@@ -40,7 +42,7 @@ export function createMobileHub({ stateFile, stateStore = null, origin, browserO
   const audit = (type, data = {}) => { state.audit.push({ time: at(), type, ...data }); state.audit = state.audit.slice(-1000); };
   const cookie = raw => `${cookieName}=${raw}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${raw ? 30 * 86400 : 0}${secure ? '; Secure' : ''}`;
   const headers = { 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer', 'x-frame-options': 'DENY', 'permissions-policy': 'camera=(), microphone=(), geolocation=()',
-    'content-security-policy': "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'", ...(secure ? { 'strict-transport-security': 'max-age=31536000' } : {}) };
+    'content-security-policy': "default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; font-src 'self'; img-src 'self' blob: data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'", ...(secure ? { 'strict-transport-security': 'max-age=31536000' } : {}) };
   const send = (res, status, data, extra = {}) => { const buf = Buffer.from(JSON.stringify(data)); res.writeHead(status, { ...headers, 'content-type': 'application/json; charset=utf-8', 'content-length': buf.length, ...extra }); res.end(buf); };
   function session(req) {
     const raw = String(req.headers.cookie || '').split(';').map(x => x.trim()).find(x => x.startsWith(cookieName + '='))?.slice(cookieName.length + 1) || '';

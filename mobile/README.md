@@ -76,6 +76,14 @@ The app applies no time-based expiry. **Settings → Local data → Clear chat c
 
 The project overview and **Documents and links** tab expose registered resources prominently. HTTP(S) links open normally; registered Markdown references can be read through the existing desktop `/api/project-doc` allowlist when the Connector advertises `project.doc`. Arbitrary file paths and unregistered references are rejected. Other document formats still require the desktop or their registered web link. Project metadata and documents remain read-only.
 
+### Markdown and formulas
+
+Conversations, full results and project documents share Markdown rendering: headings, nested lists, read-only task lists, tables, quotes, emphasis, links and fenced code. Wide tables, code and formulas scroll within the message instead of widening the screen. Code blocks have a copy button; copying the whole message preserves its original Markdown/LaTeX text. Long-message previews end at a complete block rather than cutting a formula or fence in half.
+
+Use `$...$` or `\(...\)` for inline math, and `$$...$$`, `\[...\]` or a fenced `math` block for display math. KaTeX supports common fractions, integrals, matrices and aligned equations, not arbitrary LaTeX documents/packages. Unsupported, excessive or unfinished expressions remain readable source text; code blocks and escaped dollar signs stay literal. Formula rendering and fonts are bundled on the same origin and precached with the public app shell, without a CDN. No Connector upgrade is needed for this presentation-only feature.
+
+Browser assets are committed, so ordinary installs need no frontend build. To rebuild after an intentional dependency update, use `npm ci --ignore-scripts --prefix mobile` and `npm run build:markup --prefix mobile`; commit the generated assets, font allowlist and preserved dependency licenses together. Run `npm run check --prefix mobile` and `npm test --prefix mobile` before publishing.
+
 ## Run a separate Hub
 
 Skip this when joining an existing Hub. For a new self-hosted Hub behind trusted HTTPS:
