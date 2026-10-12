@@ -27,16 +27,19 @@ const rows = value => Array.isArray(value) ? value.filter(v => v && typeof v ===
 const projectStrings = (value, limit = 40) => Array.isArray(value) ? value.filter(v => typeof v === 'string').slice(0, limit).map(v => text(v, 160)) : [];
 function projectView(p, full = false) {
   const todos = rows(p.todos), members = rows(p.members);
+  const link = l => ({ type: text(l.type, 80), label: text(l.label, 160), ref: text(l.ref, 2048), note: text(l.note, 1000) });
+  const http = l => { try { const u = new URL(l?.ref); return ['https:', 'http:'].includes(u.protocol) && !u.username && !u.password; } catch { return false; } };
   const value = { id: text(p.id, 160), name: text(p.name, 200), summary: text(p.summary, full ? 4000 : 600), status: text(p.status, 40), priority: text(p.priority, 40),
     aliases: projectStrings(p.aliases), createdAt: text(p.createdAt, 80), updatedAt: text(p.updatedAt, 80),
     members: members.slice(0, full ? 100 : 30).map(m => ({ worker: text(m.worker, 160), relation: text(m.relation, 80), status: text(m.status, 40), ...(full ? { note: text(m.note, 1000) } : {}) })),
-    todoCounts: { total: todos.length, done: todos.filter(t => t.status === 'done').length, blocked: todos.filter(t => t.status === 'blocked').length, open: todos.filter(t => !['done', 'dropped'].includes(t.status)).length } };
+    todoCounts: { total: todos.length, done: todos.filter(t => t.status === 'done').length, blocked: todos.filter(t => t.status === 'blocked').length, open: todos.filter(t => !['done', 'dropped'].includes(t.status)).length },
+    resourceCount: rows(p.links).length + (p.truth?.ref ? 1 : 0),
+    truth: http(p.truth) ? link(p.truth) : null, links: rows(p.links).filter(http).slice(0, 3).map(link) };
   if (!full) return value;
-  const link = l => ({ type: text(l.type, 80), label: text(l.label, 160), ref: text(l.ref, 2048), note: text(l.note, 1000) });
-  return { ...value, truth: p.truth && typeof p.truth === 'object' ? link(p.truth) : null, links: rows(p.links).slice(0, 30).map(link),
+  return { ...value, truth: p.truth && typeof p.truth === 'object' ? link(p.truth) : null, links: rows(p.links).slice(0, 200).map(link),
     todos: todos.slice(0, 100).map(t => ({ id: text(t.id, 160), title: text(t.title, 300), status: text(t.status, 40), owner: text(t.owner, 160), note: text(t.note, 2000), evidence: text(t.evidence, 2048), updatedAt: text(t.updatedAt, 80) })),
     progress: rows(p.progress).slice(0, 30).map(t => ({ id: text(t.id, 160), text: text(t.text, 4000), status: text(t.status, 40), owner: text(t.owner, 160), evidence: text(t.evidence, 2048), updatedAt: text(t.updatedAt, 80) })),
-    truncated: todos.length > 100 || members.length > 100 || rows(p.progress).length > 30 || rows(p.links).length > 30 };
+    truncated: todos.length > 100 || members.length > 100 || rows(p.progress).length > 30 || rows(p.links).length > 200 };
 }
 
 export function createFactoryAdapter({ workersDir, stateDir, factoryUrl = 'http://127.0.0.1:8787', grants, registry, now = Date.now, factoryFetch = fetch }) {
@@ -92,7 +95,7 @@ export function createFactoryAdapter({ workersDir, stateDir, factoryUrl = 'http:
     let projects = [], projectsAvailable = true, projectsTruncated = false;
     try { const all = listStoredProjects(workersDir); projects = all.slice(0, 200).map(p => projectView(p)); projectsTruncated = all.length > 200; }
     catch { projectsAvailable = false; } // A broken project index must not take employee messaging offline.
-    return { protocolVersion: 1, observedAt, reachable: true, workers: ws, usageDate: localDate(now()), capabilities: ['usage.read', 'worker-activity-v1', 'project.detail', 'read-sync-v1'], projects, projectsAvailable, projectsTruncated,
+    return { protocolVersion: 1, observedAt, reachable: true, workers: ws, usageDate: localDate(now()), capabilities: ['usage.read', 'worker-activity-v1', 'project.detail', 'project.doc', 'read-sync-v1', 'read-history-v1'], projects, projectsAvailable, projectsTruncated,
       jobs: listJobs(workersDir, { limit: 100 }).filter(j => allowed.has(j.worker)).map(jobView),
       tasks: listFactoryTasks(workersDir, { limit: 200 }).map(taskView),
       requests: listWorkerTaskRequests(workersDir, { limit: 100 }).map(requestView),
@@ -111,6 +114,16 @@ export function createFactoryAdapter({ workersDir, stateDir, factoryUrl = 'http:
     if (previous?.complete) return previous.result;
     if (!Number.isFinite(command.expiresAt) || command.expiresAt <= now()) throw new Fault('COMMAND_EXPIRED', 409);
     if (command.action === 'usage.read') return usage(body);
+    if (command.action === 'project.doc') {
+      const p = listStoredProjects(workersDir).find(p => p.id === body.projectId);
+      if (!p) throw new Fault('PROJECT_NOT_FOUND', 404);
+      if (![p.truth, ...rows(p.links)].some(l => l?.ref === body.ref) || /^https?:/i.test(body.ref) || !/\.md$/i.test(body.ref)) throw new Fault('PROJECT_DOCUMENT_NOT_REGISTERED', 403);
+      // Reuse the desktop's registered-document/root allowlist; never open a
+      // phone-supplied path here or proxy an external document URL.
+      const result = await factoryRead(`/api/project-doc?project=${encodeURIComponent(p.id)}&ref=${encodeURIComponent(body.ref)}`);
+      if (result.project?.id !== p.id || result.ref !== body.ref || typeof result.content !== 'string') throw new Fault('FACTORY_UNAVAILABLE', 503);
+      return { projectId: p.id, ref: body.ref, content: result.content.slice(0, 200000), truncated: Boolean(result.truncated || result.content.length > 200000) };
+    }
     if (command.action === 'project.detail') {
       // Resolve only registered, visible IDs; never accept a path, URL or document ref.
       const p = listStoredProjects(workersDir).find(p => p.id === body.projectId);
@@ -124,7 +137,7 @@ export function createFactoryAdapter({ workersDir, stateDir, factoryUrl = 'http:
     const ws = await workers();
     const worker = body.worker ? ws.find(w => w.id === body.worker) : null;
     if (body.worker && !worker) throw new Fault('WORKER_NOT_FOUND', 404);
-    const jobs = () => listJobs(workersDir, { limit: 10000 });
+    const jobs = () => listJobs(workersDir, { limit: 100000 });
     const reply = job => {
       if (job.fullOutput) return text(job.fullOutput, 64000);
       if (job.status === 'running') return text(readPublicConversation(job).filter(b => b.type === 'text').map(b => b.text).join('\n\n'), 64000);
@@ -132,26 +145,29 @@ export function createFactoryAdapter({ workersDir, stateDir, factoryUrl = 'http:
       return text(latestReplyFromEvents(events) || job.summary || events.filter(e => e.type === 'text').map(e => e.text || '').join(''), 64000);
     };
     const capture = (js, ms, workerId) => readState.capture(js, ms, { worker: workerId, principalId: command.principalId, canMark: roleAllows(grant.role, 'operator') && roleAllows(command.role, 'operator') });
+    const history = (js, ms, workerId) => body.readHistory ? readState.captureHistory(js, ms, { worker: workerId, principalId: command.principalId, canMark: roleAllows(grant.role, 'operator') && roleAllows(command.role, 'operator') }) : null;
     if (command.action === 'read.mark') {
       const acknowledged = readState.mark(body.tokens, { worker: worker.id, principalId: command.principalId, jobs: jobs() });
       const observedAt = at();
       return { acknowledged, observedAt, worker: (await workers()).find(w => w.id === worker.id) };
     }
     if (command.action === 'worker.detail') {
-      const js = jobs().filter(j => j.worker === worker.id).slice(-30), ms = listMessages(workersDir, { worker: worker.id, includeSent: true, limit: 100 });
+      const allJobs = jobs().filter(j => j.worker === worker.id), allMessages = listMessages(workersDir, { worker: worker.id, includeSent: true, limit: body.readHistory ? 100000 : 100 });
+      const historyRead = history(allJobs, allMessages, worker.id), js = allJobs.slice(-30), ms = allMessages.slice(-100);
       const reads = capture(js, ms, worker.id);
       return {
-        worker, jobs: js.map((j, i, all) => ({ ...jobView(j), readState: reads.jobStates.get(j.id), ...(['running', 'queued'].includes(j.status) ? { publicConversation: readPublicConversation(j) } : {}), reply: i >= all.length - 10 ? reply(j) : text(j.summary) })),
+        worker, historyRead, jobs: js.map((j, i, all) => ({ ...jobView(j), readState: reads.jobStates.get(j.id), ...(['running', 'queued'].includes(j.status) ? { publicConversation: readPublicConversation(j) } : {}), reply: i >= all.length - 10 ? reply(j) : text(j.summary) })),
         talkRequests: listWebTalkRequests(workersDir, { worker: worker.id, limit: 100 }).map(requestView),
         requests: listWorkerTaskRequests(workersDir, { to: worker.id, limit: 100 }).map(requestView),
         messages: ms.map(m => ({ ...pick(m, ['id', 'from', 'to', 'createdAt', 'read']), readState: reads.messageStates.get(m.id), content: text(m.content) })),
       };
     }
     if (command.action === 'job.detail') {
-      const job = jobs().find(j => j.id === body.jobId);
+      const allJobs = jobs(), job = allJobs.find(j => j.id === body.jobId);
       if (!job || !ws.some(w => w.id === job.worker)) throw new Fault('JOB_NOT_FOUND', 404);
       const reads = capture([job], [], job.worker);
-      return { job: { ...jobView(job), readState: reads.jobStates.get(job.id) }, reply: reply(job), publicConversation: readPublicConversation(job) };
+      const historyRead = history(allJobs.filter(j => j.worker === job.worker), body.readHistory ? listMessages(workersDir, { worker: job.worker, limit: 100000 }) : [], job.worker);
+      return { job: { ...jobView(job), readState: reads.jobStates.get(job.id) }, historyRead, reply: reply(job), publicConversation: readPublicConversation(job) };
     }
     if (command.action === 'tasks.list') return { tasks: listFactoryTasks(workersDir, { limit: 500 }).map(taskView) };
     if (command.action === 'image.read') {

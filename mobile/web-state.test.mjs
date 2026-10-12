@@ -5,13 +5,14 @@ import vm from 'node:vm';
 import { readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import * as UI from './web/ui.js';
+import * as Cache from './web/cache.js';
 const fullSource = readFileSync(new URL('./web/app.js', import.meta.url), 'utf8');
-const source = fullSource.slice(0, fullSource.indexOf("\ndocument.addEventListener('click'")).replace("import * as UI from './ui.js';", '');
+const source = fullSource.slice(0, fullSource.indexOf("\ndocument.addEventListener('click'")).replace("import * as UI from './ui.js';", '').replace("import * as Cache from './cache.js';", '');
 function context({ deploymentPending = false, storageDenied = false } = {}) {
   const nodes = new Map(), values = new Map();
   const storage = { getItem: k => values.get(k) || null, setItem: (k, v) => values.set(k, v), removeItem: k => values.delete(k) };
   const node = () => ({ innerHTML: '', value: '', dataset: {}, open: false, setAttribute() {}, contains: () => false, querySelectorAll: () => [], classList: { toggle() {}, add() {}, remove() {} }, showModal() { this.open = true; }, close() { this.open = false; } });
-  const context = vm.createContext({ UI, URL, window: {}, navigator: { onLine: true }, document: { querySelectorAll: () => [], querySelector: s => { if (!nodes.has(s)) nodes.set(s, s === 'meta[name="ox-backend"]' && deploymentPending ? { content: 'pending' } : node()); return nodes.get(s); } }, sessionStorage: storage, localStorage: storage, crypto: { randomUUID }, AbortSignal, setTimeout, clearTimeout, fetch: async () => { throw Error('unexpected fetch'); } });
+  const context = vm.createContext({ UI, Cache, URL, window: {}, navigator: { onLine: true }, document: { querySelectorAll: () => [], querySelector: s => { if (!nodes.has(s)) nodes.set(s, s === 'meta[name="ox-backend"]' && deploymentPending ? { content: 'pending' } : node()); return nodes.get(s); } }, sessionStorage: storage, localStorage: storage, crypto: { randomUUID }, AbortSignal, setTimeout, clearTimeout, fetch: async () => { throw Error('unexpected fetch'); } });
   if (storageDenied) vm.runInContext("Object.defineProperty(globalThis, 'sessionStorage', { get() { throw Error('denied'); } }); Object.defineProperty(globalThis, 'localStorage', { get() { throw Error('denied'); } });", context);
   vm.runInContext(source, context);
   vm.runInContext("state = { devices: [{ id: 'device-a', online: true }, { id: 'device-b', online: true }], commands: [] }; selected = 'device-b';", context);
@@ -23,63 +24,69 @@ function readingContext() {
   vm.runInContext("me = { id: 'session-read' }; selected = 'device-a'; openedWorker = 'worker-a'; renderTimeline = () => {};", c);
   return c;
 }
-function readSyncContext() {
-  const c = readingContext();
-  vm.runInContext(`state.devices[0].role = 'owner'; state.devices[0].snapshot = { observedAt: '2026-10-12T01:00:00.000Z', capabilities: ['read-sync-v1'], workers: [{ id: 'worker-a', unreadCount: 2 }] };
-    detail = { jobs: [{ id: 'job-a', readState: { unread: true, revision: 'revision-a', token: 'proof-a' } }] };
-    visibleReadItems.set('revision-a', { worker: 'worker-a', read: detail.jobs[0].readState });`, c);
-  return c;
-}
-test('read acknowledgement is background metadata, never clears a newer reply and stays scoped to its factory', async () => {
-  const c = readSyncContext(); let resolve;
-  c.result = new Promise(r => { resolve = r; });
-  vm.runInContext('runCommand = () => result;', c);
-  assert.equal(vm.runInContext("ACTION_WRITE('read.mark')", c), false);
-  const ack = vm.runInContext("acknowledgeReads([...visibleReadItems.values()], 'worker-a')", c);
-  vm.runInContext("detail.jobs[0].readState = { unread: true, revision: 'revision-new', token: 'proof-new' };", c);
-  resolve({ acknowledged: ['revision-a'], observedAt: '2026-10-12T01:01:00.000Z', worker: { id: 'worker-a', unreadCount: 1 } }); await ack;
-  assert.equal(vm.runInContext('detail.jobs[0].readState.unread', c), true);
-  assert.equal(vm.runInContext('state.devices[0].snapshot.workers[0].unreadCount', c), 1);
-  vm.runInContext("const late = { jobs: [{ readState: { unread: true, revision: 'revision-a' } }] }; applyAcknowledgedReads(late, readScope());", c);
-  assert.equal(vm.runInContext('late.jobs[0].readState.unread', c), false);
-  vm.runInContext("late.jobs[0].readState.unread = true; applyAcknowledgedReads(late, readScope('worker-a', 'device-b'));", c);
-  assert.equal(vm.runInContext('late.jobs[0].readState.unread', c), true);
-});
-test('read sync failure retains unread and exposes retry; hidden and viewer pages never acknowledge', async () => {
-  const c = readSyncContext(); c.calls = 0;
-  vm.runInContext("runCommand = async () => { calls++; throw Error('offline'); };", c);
-  await vm.runInContext("acknowledgeReads([...visibleReadItems.values()], 'worker-a')", c);
-  assert.equal(vm.runInContext('detail.jobs[0].readState.unread', c), true);
-  assert.equal(vm.runInContext('readPhaseFor(detail.jobs[0].readState)', c), 'failed');
-  vm.runInContext('document.hidden = true;', c);
-  await vm.runInContext("acknowledgeReads([...visibleReadItems.values()], 'worker-a')", c);
-  vm.runInContext("document.hidden = false; state.devices[0].role = 'viewer';", c);
-  await vm.runInContext("acknowledgeReads([...visibleReadItems.values()], 'worker-a')", c);
-  assert.equal(c.calls, 1);
-});
-test('automatic read requires viewport dwell and does not acknowledge offscreen or obscured conversation', () => {
-  const c = readSyncContext(); c.acks = 0;
-  vm.runInContext(`acknowledgeReads = () => { acks++; };
-    $('#timeline').getBoundingClientRect = () => ({ top: 0, bottom: 500, height: 500, left: 0, right: 320 });
-    let top = 600;
-    $('#timeline').querySelector = () => ({ getBoundingClientRect: () => ({ top, bottom: top + 100, height: 100, left: 0, right: 320 }) });
-    syncVisibleReads();`, c);
-  assert.equal(c.acks, 0); assert.equal(vm.runInContext('readDwell.size', c), 0);
-  vm.runInContext("top = 50; syncVisibleReads();", c); assert.equal(c.acks, 0);
-  vm.runInContext("for (const key of readDwell.keys()) readDwell.set(key, Date.now() - 1000); syncVisibleReads();", c); assert.equal(c.acks, 1);
-  vm.runInContext("$('#dialog').open = true; $('#dialog').getBoundingClientRect = $('#timeline').getBoundingClientRect; syncVisibleReads();", c);
-  assert.equal(c.acks, 1); assert.equal(vm.runInContext('readDwell.size', c), 0);
-});
-test('logout invalidates a pending read acknowledgement and cannot restore counters or private cache', async () => {
-  const c = readSyncContext(); let resolve; c.result = new Promise(r => { resolve = r; });
-  vm.runInContext('runCommand = () => result;', c);
-  const ack = vm.runInContext("acknowledgeReads([...visibleReadItems.values()], 'worker-a')", c);
-  vm.runInContext('clearPrivateBrowserState(); me = null;', c);
-  resolve({ acknowledged: ['revision-a'], worker: { id: 'worker-a', unreadCount: 0 }, observedAt: new Date().toISOString() }); await ack;
-  assert.equal(vm.runInContext('readAcknowledged.size + readOverrides.size + detailCache.size', c), 0);
-});
 const readPhase = c => vm.runInContext("$('#chat-read-status').dataset.state", c);
 
+function historyContext() {
+  const c = readingContext();
+  vm.runInContext("me.principalId = 'owner'; state.devices[0].role = 'owner'; state.devices[0].snapshot = { observedAt: '2020', workers: [{ id: 'worker-a', unreadCount: 120 }], capabilities: ['read-history-v1'] }; historyReadItem = { worker: openedWorker, deviceId: selected, read: { unread: true, revision: 'history-1', token: 'one-proof-for-all-history' } };", c);
+  return c;
+}
+
+test('opening a conversation acknowledges one history proof and settles an in-flight identical refresh', async () => {
+  const c = historyContext(), calls = []; let finish;
+  c.send = (action, body) => { calls.push({ action, body }); return new Promise(r => { finish = r; }); };
+  vm.runInContext('runCommand = send; syncHistoryRead(); syncHistoryRead(); historyReadItem = { ...historyReadItem, read: { ...historyReadItem.read } };', c);
+  assert.equal(calls.length, 1); assert.equal(calls[0].action, 'read.mark'); assert.equal(calls[0].body.tokens.length, 1);
+  finish({ acknowledged: ['history-1'], observedAt: '2026', worker: { id: 'worker-a', unreadCount: 0 } });
+  await new Promise(r => setImmediate(r));
+  vm.runInContext('syncHistoryRead()', c);
+  assert.equal(calls.length, 1); assert.equal(vm.runInContext('snap().workers[0].unreadCount', c), 0);
+  assert.equal(vm.runInContext('historyReadItem.read.unread', c), false);
+});
+
+test('history acknowledgements do not target a hidden page, another device, or a viewer', () => {
+  const c = historyContext();
+  c.send = () => { throw Error('must not acknowledge'); }; vm.runInContext('runCommand = send;', c);
+  vm.runInContext('document.hidden = true; syncHistoryRead(); document.hidden = false;', c);
+  vm.runInContext("selected = 'device-b'; syncHistoryRead(); selected = 'device-a'; state.devices[0].role = 'viewer'; syncHistoryRead();", c);
+  assert.equal(vm.runInContext('readFlights.size', c), 0);
+});
+
+test('an old history receipt cannot mark a newer snapshot read or overwrite newer desktop counters', async () => {
+  const c = historyContext(); let finish;
+  c.send = () => new Promise(r => { finish = r; }); vm.runInContext('runCommand = send; syncHistoryRead();', c);
+  vm.runInContext("historyReadItem = { ...historyReadItem, read: { unread: true, revision: 'history-2', token: 'new-proof' } }; state.devices[0].snapshot.observedAt = '2028';", c);
+  finish({ acknowledged: ['history-1'], observedAt: '2026', worker: { id: 'worker-a', unreadCount: 0 } }); await new Promise(r => setImmediate(r));
+  assert.equal(vm.runInContext('historyReadItem.read.unread', c), true); assert.equal(vm.runInContext('snap().workers[0].unreadCount', c), 120);
+});
+
+test('read-sync errors are quiet and retry only after backoff', async () => {
+  const c = historyContext(); let calls = 0;
+  c.send = async () => { calls++; throw Error('offline'); }; vm.runInContext('runCommand = send; syncHistoryRead();', c); await new Promise(r => setImmediate(r));
+  vm.runInContext('syncHistoryRead()', c); assert.equal(calls, 1);
+  assert.equal(vm.runInContext('historyReadItem.read.unread', c), true);
+  assert.equal(vm.runInContext("$('#toast').textContent", c), undefined);
+});
+
+test('a delayed local cache read merges older history without replacing fresher network content', async () => {
+  const c = historyContext(); let finish;
+  c.readCache = () => new Promise(r => { finish = r; }); vm.runInContext('conversationCache.load = readCache;', c);
+  const loading = vm.runInContext('restoreConversation()', c);
+  vm.runInContext("detailCache.set(JSON.stringify([me.id, selected, openedWorker]), { at: 500, detail: { messages: [{ id: 'same', content: 'newer network' }] } });", c);
+  finish({ updatedAt: 1, data: { messages: [{ id: 'old', content: 'old retained' }, { id: 'same', content: 'stale disk' }] } }); await loading;
+  assert.equal(vm.runInContext("detail.messages.find(m => m.id === 'same').content", c), 'newer network');
+  assert.equal(vm.runInContext('detail.messages.length', c), 2); assert.equal(vm.runInContext('lastDetailAt', c), 500);
+});
+
+test('clearing or logging out while disk reads are pending prevents private cache resurrection', async () => {
+  for (const action of ['cacheEpoch++; detailCache.clear();', 'clearPrivateBrowserState(); me = null;']) {
+    const c = historyContext(); let finish;
+    c.readCache = () => new Promise(r => { finish = r; }); vm.runInContext('conversationCache.load = readCache;', c);
+    const loading = vm.runInContext('restoreConversation()', c); vm.runInContext(action, c);
+    finish({ updatedAt: 1, data: { messages: [{ id: 'm', content: 'private' }] } }); await loading;
+    assert.equal(vm.runInContext('detailCache.size', c), 0); assert.equal(vm.runInContext('detail', c), null);
+  }
+});
 test('cached conversation keeps a real loading indicator until its full read completes', async () => {
   const c = readingContext(); let finish, calls = 0;
   c.read = () => { calls++; return new Promise(resolve => { finish = resolve; }); };

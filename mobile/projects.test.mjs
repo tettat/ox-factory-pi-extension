@@ -56,3 +56,20 @@ test('project index does not merge data from a different factory snapshot or cor
  const a=UI.projectList({projects:[{id:'same',name:'A'}],tasks:[{project:'same'}]});const b=UI.projectList({projects:[{id:'same',name:'B'}],tasks:[{project:'__proto__'}]});
  assert.equal(a[0].tasks.length,1);assert.equal(b.find(p=>p.id==='same').tasks.length,0);assert.equal(b.find(p=>p.id==='__proto__').source,'activity');
 });
+
+test('registered document reads reuse the desktop allowlist and strip server paths', async t => {
+ const root=mkdtempSync(join(tmpdir(),'mobile-doc-')),workersDir=join(root,'workers');mkdirSync(workersDir);t.after(()=>rmSync(root,{recursive:true,force:true}));
+ const p=upsertProject(workersDir,{id:'docs',name:'Documents',truthRef:'docs/guide.md',links:Array.from({length:35},(_,i)=>({type:'doc',ref:`https://example.com/${i}`,label:`Document ${i}`}))});
+ const calls=[];let mismatch=false;
+ const adapter=createFactoryAdapter({workersDir,stateDir:join(root,'state'),grants:{owner:{role:'owner',actor:'用户'}},registry:async()=>[],factoryFetch:async url=>{
+   calls.push(url);return {ok:true,json:async()=>url.pathname==='/api/project-doc'?{project:{id:mismatch?'other':p.id},ref:'docs/guide.md',content:'# Registered document\n'+'内容'.repeat(100000),path:'PRIVATE_ABSOLUTE_PATH'}:{project:p}};
+ }});
+ const execute=(action,body)=>adapter.execute({id:randomUUID(),action,body:validateAction(action,body),digest:commandDigest(action,validateAction(action,body)),principalId:'owner',role:'viewer',expiresAt:Date.now()+60000});
+ const snapshot=await adapter.snapshot(); assert.equal(snapshot.projects[0].resourceCount,36);assert.equal(snapshot.projects[0].links.length,3);assert.equal(snapshot.projects[0].truth,null);
+ const details=await execute('project.detail',{projectId:'docs'});assert.equal(details.project.links.length,35);
+ const r=await execute('project.doc',{projectId:'docs',ref:'docs/guide.md'});
+ assert.equal(calls.at(-1).origin,'http://127.0.0.1:8787');assert.equal(calls.at(-1).pathname,'/api/project-doc');assert.equal(calls.at(-1).searchParams.get('ref'),'docs/guide.md');
+ assert.equal(r.content.length,200000);assert.equal(r.truncated,true);assert.doesNotMatch(JSON.stringify(r),/PRIVATE_ABSOLUTE_PATH/);
+ const before=calls.length;for(const ref of ['../secret.md','https://example.com/0','file:///secret.md'])await assert.rejects(execute('project.doc',{projectId:'docs',ref}),/PROJECT_DOCUMENT_NOT_REGISTERED/);assert.equal(calls.length,before);
+ mismatch=true;await assert.rejects(execute('project.doc',{projectId:'docs',ref:'docs/guide.md'}),/FACTORY_UNAVAILABLE/);
+});

@@ -146,7 +146,7 @@ test('cloud bundle keeps runtime code outside public and contains no local Hub s
   t.after(() => rmSync(parent, { recursive: true, force: true }));
   const report = prepareNetlifyHub({ output, origin, siteId });
   assert.equal(report.stateIncluded, false); assert.equal(report.mode, 'persistent-netlify-hub');
-  assert.deepEqual(readdirSync(join(output, 'public')).sort(), ['_headers', 'app.js', 'icon.svg', 'index.html', 'manifest.webmanifest', 'style.css', 'sw.js', 'ui.js']);
+  assert.deepEqual(readdirSync(join(output, 'public')).sort(), ['_headers', 'app.js', 'cache.js', 'icon.svg', 'index.html', 'manifest.webmanifest', 'style.css', 'sw.js', 'ui.js']);
   const config = readFileSync(join(output, 'netlify.toml'), 'utf8');
   assert.ok(!config.includes('[[redirects]]')); assert.ok(config.includes('directory = "functions"'));
   const html = readFileSync(join(output, 'public', 'index.html'), 'utf8');

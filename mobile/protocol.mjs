@@ -3,12 +3,13 @@ import { createHash, randomBytes } from 'node:crypto';
 export const VERSION = 1;
 export const ROLES = ['viewer', 'operator', 'owner'];
 export const ACTIONS = {
-  'worker.detail': { fields: ['worker'], role: 'viewer' },
-  'job.detail': { fields: ['jobId'], role: 'viewer' },
+  'worker.detail': { fields: ['worker', 'readHistory'], role: 'viewer' },
+  'job.detail': { fields: ['jobId', 'readHistory'], role: 'viewer' },
   'image.read': { fields: ['worker', 'attachmentId'], role: 'viewer' },
   'tasks.list': { fields: [], role: 'viewer' },
   'usage.read': { fields: ['date', 'days'], role: 'viewer' },
   'project.detail': { fields: ['projectId'], role: 'viewer' },
+  'project.doc': { fields: ['projectId', 'ref'], role: 'viewer' },
   'read.mark': { fields: ['worker', 'tokens'], role: 'operator', transient: true },
   'talk.send': { fields: ['worker', 'message', 'mode', 'attachmentIds'], role: 'operator' },
   'task.assign': { fields: ['worker', 'message', 'project', 'mode'], role: 'operator' },
@@ -44,6 +45,10 @@ export function validateAction(action, body) {
   if (!Object.hasOwn(ACTIONS, action)) throw new Fault('UNKNOWN_ACTION');
   fields(body, ACTIONS[action].fields);
   const out = {};
+  if (Object.hasOwn(body, 'readHistory')) {
+    if (typeof body.readHistory !== 'boolean') throw new Fault('INVALID_READ_HISTORY');
+    out.readHistory = body.readHistory;
+  }
   for (const key of ['worker', 'jobId', 'taskId', 'attachmentId']) if (Object.hasOwn(body, key)) out[key] = string(body[key], 160);
   for (const key of ['message', 'description', 'context']) if (Object.hasOwn(body, key)) out[key] = string(body[key], 16000, true);
   for (const key of ['project', 'title', 'status', 'name']) if (Object.hasOwn(body, key)) out[key] = string(body[key], key === 'title' ? 300 : 160, true);
@@ -55,10 +60,11 @@ export function validateAction(action, body) {
   }
   if (action === 'image.read' && !out.attachmentId) throw new Fault('ATTACHMENT_REQUIRED');
   if (action === 'job.detail' && !out.jobId) throw new Fault('JOB_REQUIRED');
-  if (action === 'project.detail') {
+  if (['project.detail', 'project.doc'].includes(action)) {
     out.projectId = string(body.projectId, 160);
     if (!/^[\p{L}\p{N}_-]+$/u.test(out.projectId) || ['__proto__', 'constructor', 'prototype'].includes(out.projectId)) throw new Fault('INVALID_PROJECT');
   }
+  if (action === 'project.doc') out.ref = string(body.ref, 2048);
   if (action === 'usage.read') {
     out.days = body.days ?? 7;
     if (![7, 30].includes(out.days)) throw new Fault('INVALID_USAGE_RANGE');

@@ -104,3 +104,10 @@ nav#nav{gap:1px;padding-left:3px;padding-right:3px}nav#nav button{padding-left:2
 .message-actions .message-read,.message-read{display:inline-flex;align-items:center;gap:4px;font-size:11px;color:var(--muted);white-space:nowrap}
 .message-read .icon{width:13px;height:13px}.message-read.unread{color:var(--bad)}.message-read.unread i{width:5px;height:5px;background:currentColor;border-radius:50%}
 #job-read-badge{margin-left:10px}.worker-card h3{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.mini-row .unread-badge{display:none}
+.unread-badge{flex:0 0 auto;align-self:center}
+.project-resource.resource-link{display:flex;align-items:center;gap:12px;width:100%;text-align:left;text-decoration:none;color:var(--ink);padding:13px;margin:9px 0;border:1px solid var(--line);border-radius:14px;background:var(--surface);font-weight:400}
+.resource-icon{flex:0 0 auto;display:grid;place-items:center;width:34px;height:34px;border-radius:10px;color:var(--accent);background:var(--tint)}
+.resource-info{min-width:0;flex:1;display:flex;flex-direction:column;gap:4px}.resource-info b{font-size:13px}.resource-info small{font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.resource-info>span{font-size:12px;color:var(--muted)}
+.resource-link>.icon{flex:0 0 auto;color:var(--accent)}.project-documents{margin-top:8px}
+#compose-toggle .icon{transition:transform 190ms ease}#compose-toggle[aria-expanded=true] .icon{transform:rotate(45deg)}

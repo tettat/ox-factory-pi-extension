@@ -10,7 +10,7 @@ import { verifyPassword } from './password.mjs';
 
 const DAY = 86400000;
 const webDir = join(dirname(fileURLToPath(import.meta.url)), 'web');
-const assets = { '/': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/ui.js': ['ui.js', 'text/javascript'], '/style.css': ['style.css', 'text/css'], '/sw.js': ['sw.js', 'text/javascript'], '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json'], '/icon.svg': ['icon.svg', 'image/svg+xml'] };
+const assets = { '/': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/ui.js': ['ui.js', 'text/javascript'], '/cache.js': ['cache.js', 'text/javascript'], '/style.css': ['style.css', 'text/css'], '/sw.js': ['sw.js', 'text/javascript'], '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json'], '/icon.svg': ['icon.svg', 'image/svg+xml'] };
 export function initialState({ principalId, deviceId, deviceName, deviceSecret, pairingCode, adminSecret, now = Date.now() }) {
   id(principalId); id(deviceId);
   return { version: VERSION, ownerPrincipalId: principalId, adminHash: adminSecret ? hash(adminSecret) : null, devices: { [deviceId]: { id: deviceId, ownerPrincipalId: principalId, name: deviceName, credentialHash: hash(deviceSecret), createdAt: at(), lastSeenAt: 0, snapshot: null, revokedAt: null } },

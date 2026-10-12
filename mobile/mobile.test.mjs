@@ -1,3 +1,4 @@
+import { sendAuthorizedMessage, listMessages } from '../comm.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
@@ -340,4 +341,21 @@ test('phone read receipts synchronize desktop unread through Hub without creatin
   const pcRead = await f.complete(f.envelope('job.detail', { jobId: job.id })); assert.equal(pcRead.result.data.job.readState.unread, false);
   f.grants[f.principalId].role = 'viewer';
   await assert.rejects(f.adapter.execute({ id: randomUUID(), action: 'read.mark', body: { worker: '测试员工', tokens: [r.token] }, role: 'owner', principalId: f.principalId, digest: commandDigest('read.mark', { worker: '测试员工', tokens: [r.token] }), expiresAt: Date.now() + 10000 }), /LOCAL_GRANT_DENIED/);
+});
+
+test('opening phone details returns one batch for all history, including messages outside the visible window', async t => {
+  const f = await fixture(t), jobs = [];
+  for (let i = 0; i < 33; i++) {
+    const j = createJob(f.workersDir, { worker: '测试员工', task: 'history ' + i, cwd: f.root });
+    appendJobEvent(j, { type: 'text', text: 'historical reply' }); jobs.push(updateJob(j, { status: 'done' }));
+  }
+  for (let i = 0; i < 103; i++) sendAuthorizedMessage(f.workersDir, { from: '用户', to: '测试员工', content: 'older message ' + i });
+  const view = await f.complete(f.envelope('worker.detail', { worker: '测试员工', readHistory: true }));
+  assert.equal(view.result.ok, true); assert.equal(view.result.data.jobs.length, 30); assert.equal(view.result.data.messages.length, 100);
+  const r = view.result.data.historyRead; assert.equal(r.unread, true);
+  const result = await f.complete(f.envelope('read.mark', { worker: '测试员工', tokens: [r.token] }));
+  assert.deepEqual(result.result.data.acknowledged, [r.revision]);
+  assert.ok([...buildWorkerJobUnreadSummary(f.workersDir, jobs).byJob.values()].every(j => !j.unread));
+  assert.ok(listMessages(f.workersDir, { worker: '测试员工', limit: 100000 }).every(m => m.read));
+  assert.equal((await f.request('/api/state', undefined, f.owner)).data.commands.some(c => c.action === 'read.mark'), false);
 });

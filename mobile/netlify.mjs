@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { httpsOrigin } from './netlify-proxy.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url)), root = resolve(here, '..');
-const assets = ['index.html', 'app.js', 'ui.js', 'style.css', 'sw.js', 'manifest.webmanifest', 'icon.svg'];
+const assets = ['index.html', 'app.js', 'ui.js', 'cache.js', 'style.css', 'sw.js', 'manifest.webmanifest', 'icon.svg'];
 export function netlifyConfig(hubOrigin = '') {
   if (hubOrigin) httpsOrigin(hubOrigin);
   return `[build]

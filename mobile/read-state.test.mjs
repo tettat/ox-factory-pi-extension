@@ -81,3 +81,42 @@ test('read protocol limits batches and never accepts a path or arbitrary cursor'
   for (const tokens of [[], ['x', 'x'], ['x'.repeat(2049)], Array.from({ length: 41 }, (_, i) => String(i))]) assert.throws(() => validateAction('read.mark', { worker: '员工', tokens }));
   assert.throws(() => validateAction('read.mark', { worker: '员工', tokens: ['x'], eventOffset: 999 }));
 });
+
+test('one history receipt covers rows outside the phone window without acknowledging later arrivals', t => {
+  const f = fixture(t), jobs = [f.job];
+  for (let i = 0; i < 34; i++) {
+    const j = createJob(f.workersDir, { worker: f.scope.worker, task: 'history ' + i, cwd: f.workersDir });
+    appendJobEvent(j, { type: 'text', text: '历史回复' }); jobs.push(updateJob(j, { status: 'done' }));
+  }
+  for (let i = 0; i < 105; i++) sendAuthorizedMessage(f.workersDir, { from: '用户', to: f.scope.worker, content: '历史信件 ' + i });
+  const ms = listMessages(f.workersDir, { worker: f.scope.worker, limit: 100000 });
+  const r = f.state.captureHistory(jobs, ms, f.scope);
+  assert.equal(r.unread, true); assert.ok(r.token.length < 2048);
+  assert.equal(buildWorkerJobUnreadSummary(f.workersDir, jobs).byWorker.get(f.scope.worker).unreadJobs, 35);
+  const late = sendAuthorizedMessage(f.workersDir, { from: '用户', to: f.scope.worker, content: '打开之后才到达' });
+  appendJobEvent(jobs[0], { type: 'text', text: '后来追加的回复' });
+  assert.deepEqual(f.state.mark([r.token], { ...f.scope, jobs }), [r.revision]);
+  assert.equal(buildWorkerJobUnreadSummary(f.workersDir, jobs).byWorker.get(f.scope.worker).unreadJobs, 1);
+  assert.deepEqual(listMessages(f.workersDir, { worker: f.scope.worker, limit: 100000 }).filter(m => !m.read).map(m => m.id), [late.id]);
+  const fresh = f.state.captureHistory(jobs, listMessages(f.workersDir, { worker: f.scope.worker, limit: 100000 }), f.scope);
+  f.state.mark([fresh.token], { ...f.scope, jobs });
+  assert.deepEqual(f.state.captureHistory(jobs, listMessages(f.workersDir, { worker: f.scope.worker, limit: 100000 }), f.scope), { unread: false });
+});
+
+test('history capture is read-only, scoped, bounded and expires after ten minutes', t => {
+  const f = fixture(t), r = f.state.captureHistory([f.job], [], f.scope);
+  assert.equal(f.unread(), true);
+  assert.equal(f.state.captureHistory([f.job], [], { ...f.scope, canMark: false }), null);
+  assert.throws(() => f.state.mark([r.token], { ...f.scope, principalId: 'different', jobs: [f.job] }), /SCOPE/);
+  assert.throws(() => f.state.mark([r.token], { ...f.scope, worker: '别的员工', jobs: [f.job] }), /SCOPE/);
+  for (let i = 0; i < 9; i++) { appendJobEvent(f.job, { type: 'text', text: 'revision ' + i }); f.state.captureHistory([f.job], [], f.scope); }
+  assert.throws(() => f.mark([r.token]), /EXPIRED/);
+  const latest = f.state.captureHistory([f.job], [], f.scope); f.advance(600001);
+  assert.throws(() => f.mark([latest.token]), /EXPIRED/); assert.equal(f.unread(), true);
+});
+
+test('read-history is explicit and boolean; legacy read-only views remain compatible', () => {
+  assert.deepEqual(validateAction('worker.detail', { worker: '员工' }), { worker: '员工' });
+  assert.deepEqual(validateAction('worker.detail', { worker: '员工', readHistory: true }), { worker: '员工', readHistory: true });
+  for (const value of ['true', 1, null, {}]) assert.throws(() => validateAction('job.detail', { jobId: 'a-job', readHistory: value }), /INVALID_READ_HISTORY/);
+});

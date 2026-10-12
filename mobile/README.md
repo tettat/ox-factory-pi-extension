@@ -50,20 +50,31 @@ Open the existing Hub HTTPS URL and use its configured login or a fresh owner in
 ## Features and limits
 
 - Device/employee directories, conversations, steering/queued messages, assignments and receipts.
-- Shared desktop/mobile read state: employee unread badges and message read indicators, using the selected factory's existing read ledger.
+- Shared desktop/mobile read state: employee unread badges and a single history acknowledgement when opening a conversation, using the selected factory's existing read ledger. No read-state labels inside messages or unread counters on the overview.
+- Persistent local conversation text, cache-first reopening and an explicit clear-cache control; animated compose options with reduced-motion support.
 - Shared project views and task boards, token summaries, attachments, reading mode and in-page nonblocking submission.
 - Scoped roles, one-time enrollment, revocation, reconnect and deduplication; optional Web Push.
 - No arbitrary shell, file browser, workspace switching or direct model app-server access.
 
-A receipt is not a completed job. In-page navigation can preserve a submission; a closed or OS-suspended browser cannot be guaranteed to finish an unaccepted request. Polling is not a latency guarantee. Business API responses are not cached by the PWA.
+A receipt is not a completed job. In-page navigation can preserve a submission; a closed or OS-suspended browser cannot be guaranteed to finish an unaccepted request. Polling is not a latency guarantee. The service worker caches only the public app shell; conversation text uses a separate local database as described below.
 
 ### Read-state synchronization
 
-Update both the Hub and each factory's Connector to enable `read-sync-v1`; existing logins and device identities remain unchanged. No desktop core migration is required. Counters follow the connected desktop version (newer desktops emphasize finished unread jobs).
+Update both the Hub and each factory's Connector to enable `read-history-v1`; existing logins and device identities remain unchanged. No desktop core migration is required. Counters follow the connected desktop version (newer desktops emphasize finished unread jobs). Older Connectors continue to serve conversations but need updating for history acknowledgement.
 
-An owner/operator viewing a message in the foreground acknowledges that displayed version after a short dwell; tapping its unread indicator also acknowledges it. Hidden history, filtered messages and background prefetches are not marked read. A delayed cached acknowledgement never clears a later reply. Desktop reads appear on the next phone refresh; phone reads appear on the next desktop refresh. These are shared factory read markers, not sender delivery receipts or per-phone private read histories.
+Opening an employee conversation or its full result in the foreground as an owner/operator acknowledges all history captured for that employee, including older rows outside the display window. One small signed receipt covers the batch, not one request per message. Later arrivals remain unread until a fresh active view; background prefetches and cached text alone do not mark unseen newer versions. Desktop reads appear on the next phone refresh; phone reads appear on the next desktop refresh. These are shared factory read markers, not sender delivery receipts or per-phone private read histories.
 
-Read synchronization runs in the background, does not create tasks/activity receipts, and does not block navigation or message submission. Failed acknowledgements retain the unread indicator with a retry action. Read-only viewers see the shared state but cannot change it. Offline or suspended pages do not acknowledge automatically.
+Read synchronization runs quietly in the background, does not create tasks/activity receipts, and does not block navigation or message submission. Errors retry with backoff without adding read/sync labels to message details. Read-only viewers see the employee counters but cannot change them. Offline or suspended pages do not acknowledge automatically.
+
+### Local conversation storage
+
+Already loaded conversation text accumulates in IndexedDB, scoped by Hub principal, device and employee. Reopening first displays the saved text while fetching fresh content; a smaller recent server window does not delete older saved rows. The UI shows recent messages first and pages through older local rows. This is not a full download of all server archives or tool logs; images and authentication/read tokens are excluded.
+
+The app applies no time-based expiry. **Settings → Local data → Clear chat cache** removes this browser's stored text without deleting factory messages or changing read markers. Logging out retains this text for the same account; clear it before leaving a shared device. Browser storage can still be evicted by the OS, private mode or the user's browser cleanup. Restricted/full storage reports a warning rather than claiming persistence.
+
+### Project documents
+
+The project overview and **Documents and links** tab expose registered resources prominently. HTTP(S) links open normally; registered Markdown references can be read through the existing desktop `/api/project-doc` allowlist when the Connector advertises `project.doc`. Arbitrary file paths and unregistered references are rejected. Other document formats still require the desktop or their registered web link. Project metadata and documents remain read-only.
 
 ## Run a separate Hub
 
