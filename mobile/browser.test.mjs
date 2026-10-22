@@ -9,6 +9,7 @@ import { BrowserRoom, ticketFromProtocols } from './browser-relay-core.mjs';
 import { requestMessage, webPage } from './browser-protocol.mjs';
 import { localEndpoint, createBrowserDriver } from './browser-cdp.mjs';
 import { fitView, zoomView, remotePoint, clampView } from './web/browser-geometry.js';
+import { browserUrl } from './web/browser.js';
 const initial = () => initialState({ principalId: 'owner_browser', deviceId: 'device_browser', deviceName: 'fixture', deviceSecret: 'fixture-only', pairingCode: 'fixture-pairing' });
 function tickets() {
   const state = initial(); let now = Date.now(), writes = 0;
@@ -119,4 +120,75 @@ test('relay renewal preserves concurrent requests in hibernating socket attachme
 test('shared authorizer never follows redirects, including on Cloudflare', async()=>{
   const {authorizeChannel}=await import('./browser-relay-core.mjs');
   await assert.rejects(authorizeChannel('https://hub.example.com','ticket',randomUUID(),async(url,init)=>{assert.equal(init.redirect,'manual');return new Response('',{status:302,headers:{location:'https://untrusted.example.com'}});}),/BROWSER_AUTH_HTTP_302/);
+});
+
+test('address entry accepts bare domains but never turns scripts, files or credentials into navigation', () => {
+  assert.equal(browserUrl(' example.com/path?q=1 '), 'https://example.com/path?q=1');
+  assert.equal(browserUrl('http://127.0.0.1:9222/test'), 'http://127.0.0.1:9222/test');
+  assert.equal(browserUrl('example.com:8443/test'), 'https://example.com:8443/test');
+  assert.equal(browserUrl('about:blank'), 'about:blank');
+  for (const value of ['', 'javascript:alert(1)', 'data:text/html,test', 'file:///secret', 'chrome://settings', 'https://user:secret@example.com', 'foo bar', 'https://example.com\\@bad.test']) assert.equal(browserUrl(value), null, value);
+});
+
+test('explicit navigation does not need a frame; coordinate and focused input always do', () => {
+  const req = action => ({ type: 'request', id: 'one', action, instance: 'chrome_one', target: 'page_one', view: 'view_one', url: 'https://example.com' });
+  for (const action of ['navigate', 'newTab', 'back', 'forward', 'reload', 'activate']) assert.doesNotThrow(() => requestMessage(req(action)));
+  for (const action of ['click', 'scroll', 'text', 'key']) assert.throws(() => requestMessage(req(action)), /STALE_BROWSER_FRAME/);
+  for (const action of ['navigate', 'newTab']) {
+    for (const url of ['javascript:alert(1)', 'file:///secret', 'chrome://settings', 'https://a:b@example.com']) assert.throws(() => requestMessage({ ...req(action), url }), /INVALID_BROWSER_URL/);
+    assert.throws(() => requestMessage({ ...req(action), target: '' }), /INVALID_BROWSER_TARGET/);
+  }
+});
+
+test('toolbar navigation recovers without screenshots and follows only newly opened related tabs', async t => {
+  let origin, socket, now = Date.now(), failed = false;
+  const calls = [], targets = [{ targetId: 'page_one', type: 'page', url: 'https://example.com', title: 'Demo' }];
+  const server = createServer((req, res) => res.end(JSON.stringify({ webSocketDebuggerUrl: origin.replace('http:', 'ws:') + '/devtools/browser/fixture' })));
+  const wss = new WebSocketServer({ server });
+  wss.on('connection', ws => { socket = ws; ws.on('message', raw => {
+    const r = JSON.parse(raw); calls.push(r); let result = {};
+    if (r.method === 'Target.getTargets') result = { targetInfos: targets };
+    if (r.method === 'Target.attachToTarget') result = { sessionId: 'session_one' };
+    if (r.method === 'Page.getFrameTree') result = { frameTree: { frame: { url: targets[0].url } } };
+    if (r.method === 'Page.getLayoutMetrics') result = { cssVisualViewport: { pageX: 0, pageY: 0, clientWidth: 1280, clientHeight: 800, scale: 1 } };
+    if (r.method === 'Page.captureScreenshot') result = { data: 'fixture-jpeg' };
+    if (r.method === 'Target.createTarget') result = { targetId: 'created_page' };
+    if (r.method === 'Page.navigate' && failed) result = { errorText: 'net::ERR_NAME_NOT_RESOLVED' };
+    ws.send(JSON.stringify({ id: r.id, result }));
+  }); });
+  await new Promise(r => server.listen(0, '127.0.0.1', r)); origin = 'http://127.0.0.1:' + server.address().port;
+  const driver = createBrowserDriver({ instances: () => [{ id: 'chrome_one', name: 'Fixture', endpoint: origin, browserId: 'fixture' }], grant: p => p === 'owner' ? 'control' : null, now: () => now });
+  t.after(async () => { await driver.close(); for (const ws of wss.clients) ws.terminate(); await new Promise(r => server.close(r)); });
+  const req = (action, extra = {}) => ({ type: 'request', id: randomUUID(), action, instance: 'chrome_one', target: 'page_one', view: 'view_one', ...extra });
+  const run = (action, extra) => driver.execute('peer', 'owner', 'owner', req(action, extra));
+  await assert.rejects(run('navigate', { url: 'https://example.org' }), /BROWSER_VIEW_CHANGED/);
+  await run('watch');
+  for (const action of ['navigate', 'newTab']) {
+    await assert.rejects(driver.execute('peer', 'owner', 'viewer', req(action, { url: 'https://example.org' })), /READ_ONLY/);
+    await assert.rejects(driver.execute('peer', 'stranger', 'owner', req(action, { url: 'https://example.org' })), /GRANT_DENIED/);
+  }
+  assert.equal((await run('navigate', { url: 'https://example.org' })).accepted, true);
+  assert.equal(calls.some(c => c.method === 'Page.captureScreenshot'), false);
+  assert.equal((await run('newTab', { url: 'https://example.org/new' })).openedTab.id, 'created_page');
+  await assert.rejects(run('navigate', { view: 'old_view', url: 'https://example.org' }), /VIEW_CHANGED/);
+  failed = true; await assert.rejects(run('navigate', { url: 'https://example.org' }), /NAVIGATION_FAILED/); failed = false;
+  // Even a failed/interstitial screenshot cannot strand the address controls.
+  targets[0].url = 'chrome-error://chromewebdata/';
+  assert.equal((await run('navigate', { url: 'https://example.org' })).accepted, true);
+  targets[0].url = 'https://example.com';
+  targets.push({ targetId: 'old_popup', type: 'page', openerId: 'page_one', url: 'https://example.org/old' });
+  const f = await run('frame'); await run('click', { frame: f.frame, x: 20, y: 30 }); now += 1000;
+  targets.push({ targetId: 'unrelated', type: 'page', url: 'https://example.org/unrelated' });
+  assert.ok((await run('frame')).jpeg, 'old popups and unrelated desktop tabs must not steal selection');
+  targets.push({ targetId: 'new_popup', type: 'page', openerId: 'page_one', url: 'https://example.org/new' });
+  assert.equal((await run('frame')).openedTab.id, 'new_popup');
+  now += 1000; const f2 = await run('frame'); await run('click', { frame: f2.frame, x: 20, y: 30 });
+  socket.send(JSON.stringify({ sessionId: 'session_one', method: 'Page.windowOpen', params: { url: 'https://example.org/noopener', userGesture: true } }));
+  targets.push({ targetId: 'no_opener', type: 'page', url: 'https://example.org/noopener' });
+  assert.equal((await run('frame')).openedTab.id, 'no_opener');
+  now += 1000; const f3 = await run('frame'); await run('click', { frame: f3.frame, x: 20, y: 30 }); now += 6001;
+  targets.push({ targetId: 'late_popup', type: 'page', openerId: 'page_one', url: 'https://example.org/late' });
+  assert.ok((await run('frame')).jpeg, 'expired click intent must not follow new tabs');
+  while (targets.length < 100) targets.push({ targetId: 'tab_' + targets.length, type: 'page', url: 'https://example.org' });
+  await assert.rejects(run('newTab', { url: 'https://example.org' }), /TAB_LIMIT/);
 });

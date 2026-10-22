@@ -91,6 +91,7 @@ export function createBrowserDriver({ instances, grant, now = Date.now }) {
       w.listener = e => {
         if (e.sessionId !== session) return;
         if (['Page.frameStartedLoading', 'Page.frameNavigated', 'Page.navigatedWithinDocument', 'Page.frameResized'].includes(e.method)) w.frames = [];
+        if (e.method === 'Page.windowOpen' && w.popup && e.params?.userGesture && webPage(e.params.url)) w.popup.urls.add(e.params.url);
         // A tiny, local-only screencast keeps background tabs rendering without
         // activating the desktop tab. Its images are discarded, never relayed.
         if (e.method === 'Page.screencastFrame') void cdp.call('Page.screencastFrameAck', { sessionId: e.params.sessionId }, session).catch(() => {});
@@ -101,6 +102,39 @@ export function createBrowserDriver({ instances, grant, now = Date.now }) {
     const w = watches.get(peer);
     if (!w || w.instance !== r.instance || w.target !== r.target || w.view !== r.view) throw Error('BROWSER_VIEW_CHANGED');
     const call = (method, params) => w.cdp.call(method, params, w.session);
+    if (['navigate', 'newTab', 'back', 'forward', 'reload', 'activate'].includes(r.action)) {
+      // These explicit commands remain usable when a screenshot is slow, paused,
+      // or an HTTP navigation failed. Role, instance and watch checks still apply.
+      if (await chrome(r.instance) !== w.cdp) throw Error('BROWSER_VIEW_CHANGED');
+      w.frames = []; w.popup = null;
+      if (r.action === 'newTab') {
+        const targets = (await w.cdp.call('Target.getTargets')).targetInfos;
+        if (targets.filter(t => t.type === 'page').length >= 100) throw Error('BROWSER_TAB_LIMIT');
+        const { targetId } = await w.cdp.call('Target.createTarget', { url: r.url, background: true });
+        return { accepted: true, openedTab: { id: targetId, url: r.url, title: r.url } };
+      }
+      if (r.action === 'navigate') {
+        const result = await call('Page.navigate', { url: r.url });
+        if (result.errorText || result.isDownload) throw Error('BROWSER_NAVIGATION_FAILED');
+      } else if (r.action === 'reload') await call('Page.reload');
+      else if (r.action === 'activate') await w.cdp.call('Target.activateTarget', { targetId: w.target });
+      else {
+        const h = await call('Page.getNavigationHistory'), target = h.entries[h.currentIndex + (r.action === 'back' ? -1 : 1)];
+        if (target && webPage(target.url)) await call('Page.navigateToHistoryEntry', { entryId: target.id });
+      }
+      return { accepted: true };
+    }
+    if (r.action === 'frame' && w.popup) {
+      if (now() > w.popup.until) w.popup = null;
+      else {
+        const targets = (await w.cdp.call('Target.getTargets')).targetInfos;
+        const opened = targets.find(t => t.type === 'page' && !w.popup.before.has(t.targetId) && webPage(t.url) && (t.openerId === w.target || w.popup.urls.has(t.url)));
+        if (opened) {
+          w.popup = null;
+          return { view: w.view, access, openedTab: { id: opened.targetId, url: String(opened.url).slice(0, 4096), title: String(opened.title || '').slice(0, 200) } };
+        }
+      }
+    }
     const tree = await call('Page.getFrameTree');
     if (!webPage(tree.frameTree.frame.url)) { w.frames = []; throw Error('BROWSER_PAGE_UNSUPPORTED'); }
     if (r.action === 'frame') {
@@ -120,7 +154,8 @@ export function createBrowserDriver({ instances, grant, now = Date.now }) {
       if (data.length > 520000) throw Error('BROWSER_FRAME_TOO_LARGE');
       const frame = { id: randomUUID(), at: now(), width: v.clientWidth, height: v.clientHeight, scale: v.scale, pageX: v.pageX, pageY: v.pageY, url: tree.frameTree.frame.url };
       w.frames.push(frame); w.frames = w.frames.slice(-4);
-      return { frame: frame.id, view: w.view, at: frame.at, width: frame.width, height: frame.height, jpeg: data, url: frame.url.slice(0, 4096), access };
+      const info = await w.cdp.call('Target.getTargetInfo', { targetId: w.target });
+      return { frame: frame.id, view: w.view, at: frame.at, width: frame.width, height: frame.height, jpeg: data, url: frame.url.slice(0, 4096), title: String(info.targetInfo?.title || '').slice(0, 200), access };
       } finally {
         w.idle = setTimeout(() => { w.casting = false; void call('Page.stopScreencast').catch(() => {}); }, 5000); w.idle.unref?.();
       }
@@ -130,6 +165,12 @@ export function createBrowserDriver({ instances, grant, now = Date.now }) {
     const metrics = (await call('Page.getLayoutMetrics')).cssVisualViewport;
     if (metrics.clientWidth !== f.width || metrics.clientHeight !== f.height || metrics.scale !== f.scale || metrics.pageX !== f.pageX || metrics.pageY !== f.pageY) throw Error('STALE_BROWSER_FRAME');
     if (['click', 'scroll'].includes(r.action) && (r.x >= f.width || r.y >= f.height)) throw Error('INVALID_BROWSER_POINT');
+    // Follow only a new page related to this explicit remote gesture. Do not
+    // switch to unrelated tabs opened by desktop users or old pop-ups.
+    if (r.action === 'click' || (r.action === 'key' && r.key === 'Enter')) {
+      w.popup = { before: new Set((await w.cdp.call('Target.getTargets')).targetInfos.map(t => t.targetId)), urls: new Set(), until: now() + 6000 };
+    }
+    w.frames = [];
     const point = { x: r.x, y: r.y };
     if (r.action === 'click') {
       await call('Input.dispatchMouseEvent', { type: 'mousePressed', button: 'left', clickCount: 1, ...point });
@@ -140,12 +181,6 @@ export function createBrowserDriver({ instances, grant, now = Date.now }) {
       const [key, code] = keys[r.key], modifiers = r.key === 'SelectAll' ? (process.platform === 'darwin' ? 4 : 2) : 0;
       await call('Input.dispatchKeyEvent', { type: r.key === 'Enter' ? 'keyDown' : 'rawKeyDown', key, windowsVirtualKeyCode: code, modifiers, ...(r.key === 'Enter' ? { text: '\r', unmodifiedText: '\r' } : {}) });
       await call('Input.dispatchKeyEvent', { type: 'keyUp', key, windowsVirtualKeyCode: code, modifiers });
-    } else if (r.action === 'navigate') await call('Page.navigate', { url: r.url });
-    else if (r.action === 'reload') await call('Page.reload');
-    else if (r.action === 'activate') await w.cdp.call('Target.activateTarget', { targetId: w.target });
-    else if (['back', 'forward'].includes(r.action)) {
-      const h = await call('Page.getNavigationHistory'), target = h.entries[h.currentIndex + (r.action === 'back' ? -1 : 1)];
-      if (target && webPage(target.url)) await call('Page.navigateToHistoryEntry', { entryId: target.id });
     }
     // Never replay an accepted input; the next interaction needs a fresh frame.
     w.frames = []; return { accepted: true, frame: r.frame };

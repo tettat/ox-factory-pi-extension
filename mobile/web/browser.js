@@ -1,24 +1,37 @@
 import { esc } from './ui.js';
 import { fitView, clampView, zoomView, remotePoint } from './browser-geometry.js';
+export function browserUrl(value) {
+  const text = String(value || '').trim();
+  if (!text || text.length > 4096 || /[\s\\\u0000-\u001f]/.test(text)) return null;
+  let address = text;
+  if (!/^https?:\/\//i.test(address) && address !== 'about:blank') {
+    if (/^[a-z][a-z0-9+.-]*:/i.test(address) && !/^[^/:]+:\d+(?:[/?#]|$)/.test(address)) return null;
+    address = 'https://' + address.replace(/^\/\//, '');
+  }
+  try { const url = new URL(address); return !url.username && !url.password && (['http:', 'https:'].includes(url.protocol) || address === 'about:blank') ? url.href : null; } catch { return null; }
+}
 const labels = {
   BROWSER_RELAY_UNAVAILABLE: '此站点还未配置浏览器中继', BROWSER_AGENT_OFFLINE: '电脑的浏览器连接程序未在线', BROWSER_LOCAL_GRANT_DENIED: '这台电脑尚未授权当前账号查看 Chrome',
   BROWSER_READ_ONLY: '当前连接只能查看', BROWSER_PAGE_UNSUPPORTED: '此标签页不能共享，请选择普通网页', CHROME_OFFLINE: '这个 Chrome 已关闭或未开启调试', CHROME_DISCONNECTED: 'Chrome 连接已断开',
   STALE_BROWSER_FRAME: '画面位置已变化，已取消这次操作，正在刷新', BROWSER_VIEW_CHANGED: '标签页已切换，请重新选择', BROWSER_FRAME_TOO_LARGE: '画面较大，请改用省流画质', BROWSER_BUSY: '已有操作在处理，请稍候', BROWSER_SLOW_DOWN: '操作较快，稍后再试',
   CHROME_TIMEOUT: 'Chrome 暂未返回画面，正在重试', BROWSER_INSTANCE_CHANGED: 'Chrome 已重新启动，请在电脑重新登记', BROWSER_OPERATION_FAILED: '本次操作未确认，请查看新画面后再决定是否重试',
+  BROWSER_NAVIGATION_FAILED: '网页未能打开，请检查网址或电脑网络后重试', BROWSER_TAB_LIMIT: '这个浏览器的标签页太多，请先在电脑关闭一些', INVALID_BROWSER_URL: '请输入有效的网页地址',
 };
 export function mountBrowser({ host, api, device, back, toast }) {
   const root = document.createElement('section'); root.className = 'browser-root'; host.replaceChildren(root);
   root.innerHTML = `<div class="browser-list"><div class="section-head"><div><h2>电脑 Chrome</h2><p class="muted">${esc(device.name)} · 仅共享已登记的调试实例</p></div><button data-b="refresh">刷新</button></div><p class="browser-state" role="status">正在连接…</p><div class="browser-catalog"></div><div class="browser-help"><b>让员工打开可接管的 Chrome</b><p>在工厂目录执行下面的命令。它会使用独立、可保留登录的浏览器资料，不影响普通 Chrome。</p><code>node mobile/browser-cli.mjs launch --name "工作浏览器" --url https://example.com</code><p>首次使用需在电脑启用浏览器连接程序；普通 Chrome、系统窗口和文件选择框不在共享范围内。</p></div></div>
-    <section class="browser-stage" hidden aria-label="电脑网页画面"><header class="browser-top"><button data-b="tabs" aria-label="返回标签页列表">‹</button><div class="browser-heading"><strong></strong><small></small></div><button data-b="mode" aria-pressed="false">查看</button><button data-b="more" aria-label="更多浏览器选项">•••</button></header>
+    <section class="browser-stage" hidden aria-label="电脑网页画面"><header class="browser-top"><button data-b="tabs" aria-label="返回标签页列表">‹</button><button class="browser-heading" data-b="address" aria-label="打开网址"><strong></strong><small></small></button><button data-b="mode" aria-pressed="false">开始操作</button><button data-b="more" aria-label="更多浏览器选项">•••</button></header>
+    <div class="browser-address" hidden><form data-address novalidate><label for="remote-browser-address">在电脑浏览器打开网址</label><div><input id="remote-browser-address" type="text" inputmode="url" enterkeyhint="go" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="4096" placeholder="example.com 或完整网址"><button class="primary" data-command type="submit">打开</button></div><label class="browser-new-tab"><input type="checkbox" data-new-tab>在新标签页打开</label><p data-address-error role="status" hidden></p></form></div>
+    <button class="browser-mode-hint" data-b="mode">当前仅查看 · 点此开始操作网页</button>
     <div class="browser-surface" tabindex="0" aria-label="网页画面，查看模式拖动平移，双指缩放"><canvas></canvas><div class="browser-overlay" role="status">正在读取画面…</div></div>
     <div class="browser-telemetry"><span>尚无画面</span><button data-b="reconnect" hidden>重新连接</button></div>
-    <div class="browser-options" hidden><label>画质<select data-quality><option value="saving">省流</option><option value="normal" selected>均衡</option><option value="clear">清晰</option></select></label><button data-b="activate" data-input>在电脑上激活</button><form data-address data-input><input type="url" placeholder="https://…" aria-label="电脑浏览器的网址"><button>打开</button></form><p>查看：拖动画面。操作：轻点点击、滑动滚动网页。双指始终只缩放和平移画面。</p></div>
+    <div class="browser-options" hidden><label>画质<select data-quality><option value="saving">省流</option><option value="normal" selected>均衡</option><option value="clear">清晰</option></select></label><button data-b="zoom" aria-label="放大画面">放大画面</button><button data-b="activate" data-input data-command>在电脑上激活</button><p>查看：拖动画面。操作：轻点点击、滑动滚动网页。双指始终只缩放和平移画面。打开网址、前进和后退无需先切操作模式。</p></div>
     <form class="browser-keyboard" hidden><label>输入到电脑当前光标处<textarea rows="2" maxlength="4000" placeholder="先在画面中点选输入框，再输入文字…" aria-label="输入到电脑的文字"></textarea></label><div><button type="button" data-key="SelectAll">全选</button><button type="button" data-key="Backspace">退格</button><button type="button" data-key="Tab">Tab</button><button type="button" data-key="Enter">回车</button><button class="primary" type="submit">输入文字</button></div></form>
-    <footer class="browser-controls"><button data-b="back" data-input aria-label="网页后退">←</button><button data-b="forward" data-input aria-label="网页前进">→</button><button data-b="reload" data-input aria-label="刷新电脑网页">↻</button><button data-b="fit">适配</button><button data-b="zoom" aria-label="放大画面">＋</button><button data-b="keyboard" data-input>键盘</button><button data-b="pause">暂停</button></footer></section>`;
+    <footer class="browser-controls"><button data-b="back" data-input data-command aria-label="网页后退">←</button><button data-b="forward" data-input data-command aria-label="网页前进">→</button><button data-b="reload" data-input data-command aria-label="刷新电脑网页">↻</button><button data-b="address" data-input>网址</button><button data-b="fit">适配</button><button data-b="keyboard" data-input>键盘</button><button data-b="pause">暂停</button></footer></section>`;
   const $ = s => root.querySelector(s), stage = $('.browser-stage'), surface = $('.browser-surface'), canvas = $('canvas'), overlay = $('.browser-overlay');
   let destroyed = false, socket = null, attempt = 0, connected = false, agentOnline = false, busy = false, frameBusy = false, selected = null, frame = null, image = null;
   let mode = 'view', access = 'view', paused = false, quality = 'normal', view = { scale: 1, x: 0, y: 0 }, lastFrameAt = 0, lastRtt = 0, fail = '', lastFitSize = '', pending = new Map(), seq = 0;
-  let timer, reconnectTimer, connecting = false, reconnectDelay = 1000, listBusy = false, instances = [], frameEpoch = 0, lastMessage = Date.now();
+  let timer, reconnectTimer, connecting = false, reconnectDelay = 1000, listBusy = false, instances = [], frameEpoch = 0, lastMessage = Date.now(), watchedView = null, currentAction = '';
   const request = (action, extra = {}) => new Promise((resolve, reject) => {
     if (!connected || !agentOnline || socket?.readyState !== 1) return reject(Error('BROWSER_AGENT_OFFLINE'));
     const id = String(++seq), message = { type: 'request', id, action, ...(action === 'list' ? {} : { instance: selected?.instance, target: selected?.target, view: selected?.view }), ...extra };
@@ -27,6 +40,7 @@ export function mountBrowser({ host, api, device, back, toast }) {
   });
   function rejectPending() { for (const p of pending.values()) { clearTimeout(p.timeout); p.reject(Error('连接已断开，未确认的操作不会重发')); } pending.clear(); }
   function setState(text) { $('.browser-state').textContent = text; }
+  function commandReady() { return access === 'control' && connected && agentOnline && selected && watchedView === selected.view && !busy && !document.hidden; }
   function editable() { return mode === 'control' && access === 'control' && connected && agentOnline && !paused && !document.hidden && frame && Date.now() - lastFrameAt < 5000 && !busy && !fail; }
   function status() {
     if (destroyed) return;
@@ -36,11 +50,16 @@ export function mountBrowser({ host, api, device, back, toast }) {
     const age = frame ? Math.max(0, Math.floor((Date.now() - lastFrameAt) / 1000)) : 0;
     $('.browser-telemetry span').textContent = frame ? `${age < 1 ? '刚刚更新' : age + ' 秒前的画面'} · 往返 ${lastRtt} ms · ${Math.round(view.scale * 100)}%` : '尚无画面';
     $('[data-b="reconnect"]').hidden = connected;
-    $('[data-b="mode"]').textContent = access !== 'control' ? '只读' : mode === 'control' ? '操作' : '查看';
+    $('[data-b="mode"]').textContent = access !== 'control' ? '只读' : mode === 'control' ? '退出操作' : '开始操作';
     $('[data-b="mode"]').disabled = access !== 'control'; $('[data-b="mode"]').setAttribute('aria-pressed', String(mode === 'control'));
     stage.dataset.mode = mode; surface.setAttribute('aria-label', mode === 'control' ? '操作模式：轻点点击，单指滑动滚动网页，双指移动和缩放画面' : '查看模式：拖动平移画面，双指缩放，不操作电脑');
     root.querySelectorAll('[data-input]').forEach(n => { n.hidden = access !== 'control'; });
-    root.querySelectorAll('[data-input] button,button[data-input],.browser-keyboard button').forEach(n => { n.disabled = !editable(); });
+    root.querySelectorAll('[data-command]').forEach(n => { n.disabled = !commandReady(); });
+    $('[data-address] button').textContent = busy && ['navigate', 'newTab'].includes(currentAction) ? '打开中…' : '打开';
+    root.querySelectorAll('.browser-keyboard button').forEach(n => { n.disabled = !editable(); });
+    $('.browser-mode-hint').hidden = access !== 'control' || mode === 'control';
+    $('.browser-heading').disabled = access !== 'control';
+    if (access !== 'control') { $('.browser-address').hidden = true; $('.browser-keyboard').hidden = true; }
     $('[data-b="keyboard"]').disabled = access !== 'control' || !connected;
     $('[data-b="pause"]').textContent = paused ? '继续' : '暂停';
   }
@@ -60,11 +79,16 @@ export function mountBrowser({ host, api, device, back, toast }) {
     frameBusy = true; const target = selected, epoch = frameEpoch, started = performance.now();
     try {
       const data = await request('frame', { quality });
+      if (!destroyed && selected === target && epoch === frameEpoch && data.view === selected.view && data.openedTab) {
+        choose(target.instance, data.openedTab.id, { tab: { ...data.openedTab, controllable: true }, keepMode: true });
+        toast('已跟随链接切换到新标签页'); void refreshList(); return;
+      }
       if (destroyed || selected !== target || data.view !== selected.view || !data.jpeg || !Number.isFinite(data.width) || data.width < 1 || data.width > 20000 || data.height < 1 || data.height > 20000 || data.jpeg.length > 520000) return;
       const next = new Image(); next.src = 'data:image/jpeg;base64,' + data.jpeg; await next.decode();
       if (destroyed || selected !== target || epoch !== frameEpoch || points.size || paused || document.hidden) return;
       frame = data; image = next; lastRtt = Math.round(performance.now() - started); lastFrameAt = Date.now() - lastRtt; fail = ''; access = data.access; draw();
-      $('.browser-heading small').textContent = data.url || selected.url;
+      selected.url = data.url || selected.url; if (data.title) selected.title = data.title;
+      $('.browser-heading small').textContent = selected.url; $('.browser-heading strong').textContent = selected.title || selected.url;
     } catch (e) { if (selected === target && epoch === frameEpoch) fail = labels[e.message] || e.message; if (e.message === 'BROWSER_FRAME_TOO_LARGE' && quality !== 'saving') { quality = 'saving'; $('[data-quality]').value = quality; } }
     finally { frameBusy = false; status(); schedule(fail ? 1500 : quality === 'saving' ? 1000 : 350); }
   }
@@ -85,27 +109,32 @@ export function mountBrowser({ host, api, device, back, toast }) {
   async function watch() {
     if (!selected) return;
     const target = selected;
-    try { const result = await request('watch'); if (target !== selected) return; access = result.access; fail = ''; schedule(0); }
+    try { const result = await request('watch'); if (target !== selected) return; access = result.access; watchedView = target.view; fail = ''; status(); schedule(0); }
     catch (e) { fail = labels[e.message] || e.message; status(); }
   }
-  function choose(instance, target) {
-    const i = instances.find(i => i.id === instance), t = i?.tabs.find(t => t.id === target); if (!t?.controllable) return;
-    frameEpoch++; selected = { instance, target, title: t.title, url: t.url, view: crypto.randomUUID() }; frame = image = null; lastFrameAt = 0; fail = ''; mode = 'view'; paused = false;
+  function choose(instance, target, { tab, keepMode = false } = {}) {
+    const i = instances.find(i => i.id === instance), t = tab || i?.tabs.find(t => t.id === target); if (!t?.controllable) return;
+    frameEpoch++; points.clear(); gesture = null; selected = { instance, target, title: t.title, url: t.url, view: crypto.randomUUID() }; frame = image = null; lastFrameAt = 0; lastFitSize = ''; watchedView = null; fail = ''; if (!keepMode) mode = 'view'; paused = false;
     $('.browser-heading strong').textContent = t.title || i.name; $('.browser-heading small').textContent = t.url; stage.hidden = false; document.documentElement.classList.add('browser-open');
-    $('.browser-keyboard').hidden = true; $('.browser-options').hidden = true; status(); void watch();
+    $('.browser-keyboard').hidden = true; $('.browser-options').hidden = true; $('.browser-address').hidden = true; status(); void watch();
   }
   async function input(action, extra = {}) {
-    if (!editable()) { toast('请等待新画面，并先切到操作模式'); return false; }
-    const target = selected, sourceFrame = frame.frame; frameEpoch++; busy = true; clearTimeout(timer); status();
-    try { await request(action, { frame: sourceFrame, ...extra }); return true; }
+    const spatial = ['click', 'scroll', 'text', 'key'].includes(action);
+    if (spatial ? !editable() : !commandReady()) { toast(spatial ? '请先点“开始操作”，并等待新画面' : '浏览器尚未就绪，请稍候'); return false; }
+    const target = selected, sourceFrame = frame?.frame; frameEpoch++; busy = true; currentAction = action; clearTimeout(timer); if (!spatial) paused = false; status();
+    try {
+      const result = await request(action, { ...(spatial ? { frame: sourceFrame } : {}), ...extra });
+      if (!destroyed && selected === target && result.openedTab) { choose(target.instance, result.openedTab.id, { tab: { ...result.openedTab, controllable: true }, keepMode: true }); void refreshList(); }
+      return true;
+    }
     catch (e) { toast(labels[e.message] || e.message); return false; }
-    finally { if (target === selected) { frame = null; lastFrameAt = 0; } busy = false; status(); schedule(0); }
+    finally { if (target === selected) { frame = null; lastFrameAt = 0; } busy = false; currentAction = ''; status(); schedule(0); }
   }
   async function connect() {
     if (destroyed || connecting) return;
     connecting = true; const generation = ++attempt; clearTimeout(reconnectTimer); frameEpoch++; rejectPending();
     const old = socket; socket = null; old?.close();
-    connected = agentOnline = false; mode = 'view'; status(); setState('正在连接浏览器通道…');
+    connected = agentOnline = false; watchedView = null; mode = 'view'; status(); setState('正在连接浏览器通道…');
     try {
       const ticket = await api('/api/browser-ticket', { deviceId: device.id });
       if (destroyed || generation !== attempt) return;
@@ -140,7 +169,11 @@ export function mountBrowser({ host, api, device, back, toast }) {
     else if (action === 'refresh') connected ? void refreshList() : void connect();
     else if (action === 'reconnect') { if (!connecting) void connect(); }
     else if (action === 'more') $('.browser-options').hidden = !$('.browser-options').hidden;
-    else if (action === 'keyboard') { $('.browser-keyboard').hidden = !$('.browser-keyboard').hidden; if (!$('.browser-keyboard').hidden) $('.browser-keyboard textarea').focus(); }
+    else if (action === 'address') {
+      $('.browser-address').hidden = !$('.browser-address').hidden;
+      if (!$('.browser-address').hidden) { $('.browser-options').hidden = $('.browser-keyboard').hidden = true; const node = $('[data-address] input'); node.value = frame?.url || selected?.url || ''; $('[data-address-error]').hidden = true; node.focus(); node.select(); }
+    }
+    else if (action === 'keyboard') { $('.browser-keyboard').hidden = !$('.browser-keyboard').hidden; if (!$('.browser-keyboard').hidden) { mode = 'control'; $('.browser-address').hidden = true; status(); $('.browser-keyboard textarea').focus(); } }
     else if (action === 'pause') { paused = !paused; if (paused) clearTimeout(timer); else schedule(0); status(); }
     else if (action === 'fit') { draw(true); }
     else if (action === 'zoom' && frame) { const { w, h, pw, ph } = dimensions(); view = zoomView(view, 1.3, w / 2, h / 2, w, h, pw, ph); draw(); }
@@ -151,7 +184,12 @@ export function mountBrowser({ host, api, device, back, toast }) {
   $('.browser-keyboard textarea').oncompositionstart = () => { composing = true; };
   $('.browser-keyboard textarea').oncompositionend = () => { composing = false; };
   $('.browser-keyboard').onsubmit = async e => { e.preventDefault(); if (composing || !editable()) return; const node = $('.browser-keyboard textarea'), value = node.value; if (!value) return; const confirmed = await input('text', { text: value }); if (confirmed && node.value === value) node.value = ''; /* Preserve the draft when delivery is uncertain. */ };
-  $('[data-address]').onsubmit = e => { e.preventDefault(); const url = $('[data-address] input').value.trim(); if (/^https?:\/\//i.test(url)) void input('navigate', { url }); else toast('请输入 http:// 或 https:// 网址'); };
+  $('[data-address]').onsubmit = async e => {
+    e.preventDefault(); const node = $('[data-address] input'), url = browserUrl(node.value), error = $('[data-address-error]');
+    error.hidden = !!url; error.textContent = url ? '' : '请输入有效网址，例如 example.com；仅支持网页地址'; if (!url) { node.focus(); return; }
+    const original = selected, value = node.value, confirmed = await input($('[data-new-tab]').checked ? 'newTab' : 'navigate', { url });
+    if (confirmed && !destroyed && (selected !== original || node.value === value)) { node.blur(); $('.browser-address').hidden = true; }
+  };
   const points = new Map(); let gesture;
   const coords = e => { const r = surface.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; };
   const pinch = () => { const [a,b] = [...points.values()]; return { x: (a.x + b.x)/2, y: (a.y+b.y)/2, distance: Math.hypot(a.x-b.x,a.y-b.y) || 1 }; };
@@ -175,6 +213,7 @@ export function mountBrowser({ host, api, device, back, toast }) {
         else void input('scroll',{...point,dx:Math.max(-2000,Math.min(2000,dx)),dy:Math.max(-2000,Math.min(2000,dy))}); }
     }
     if (!points.size) gesture=null;
+    if (!cancelled && g && !g.multi && mode === 'view' && Math.hypot(p.x-g.start.x,p.y-g.start.y)<8 && access === 'control') toast('当前仅查看，点右上角“开始操作”后即可点击网页');
   }
   surface.onpointerup = e => finish(e,false); surface.onpointercancel = e => finish(e,true);
   surface.addEventListener('wheel', e => { if (!frame) return; e.preventDefault(); const p=coords(e), {w,h,pw,ph}=dimensions();
