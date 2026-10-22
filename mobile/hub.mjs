@@ -1,4 +1,5 @@
 import { WEB_ASSETS } from './web-assets.mjs';
+import { createBrowserTickets, relayOrigin } from './browser-auth.mjs';
 import { createServer } from 'node:http';
 import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -29,7 +30,7 @@ async function body(req, max = 15 * 1024 * 1024) {
   try { return chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {}; }
   catch { throw new Fault('INVALID_JSON'); }
 }
-export function createMobileHub({ stateFile, stateStore = null, origin, browserOrigin = origin, netlifyProxy = null, allowInsecureLoopback = false, now = Date.now, pushDriver = null, nextPollMs = 1000, maxLeasedCommands = 3 }) {
+export function createMobileHub({ stateFile, stateStore = null, origin, browserOrigin = origin, netlifyProxy = null, allowInsecureLoopback = false, now = Date.now, pushDriver = null, nextPollMs = 1000, maxLeasedCommands = 3, browserRelay = '' }) {
   const configured = new URL(origin);
   if (configured.origin !== origin || configured.username || configured.password || (configured.protocol !== 'https:' && !(allowInsecureLoopback && configured.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(configured.hostname)))) throw new Error('Use HTTPS, or explicitly allow loopback-only development');
   const secure = configured.protocol === 'https:';
@@ -39,10 +40,12 @@ export function createMobileHub({ stateFile, stateStore = null, origin, browserO
   if (!state || state.version !== VERSION) throw new Error('Initialize a separate mobile Hub state first');
   state.enrollments ||= {};
   const persist = () => stateStore ? stateStore.write(state) : writeJson(stateFile, state);
+  const relay = relayOrigin(browserRelay, allowInsecureLoopback);
+  const browserTickets = createBrowserTickets({ state, persist, now, relay });
   const audit = (type, data = {}) => { state.audit.push({ time: at(), type, ...data }); state.audit = state.audit.slice(-1000); };
   const cookie = raw => `${cookieName}=${raw}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${raw ? 30 * 86400 : 0}${secure ? '; Secure' : ''}`;
   const headers = { 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer', 'x-frame-options': 'DENY', 'permissions-policy': 'camera=(), microphone=(), geolocation=()',
-    'content-security-policy': "default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; font-src 'self'; img-src 'self' blob: data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'", ...(secure ? { 'strict-transport-security': 'max-age=31536000' } : {}) };
+    'content-security-policy': `default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; font-src 'self'; img-src 'self' blob: data:; connect-src 'self'${relay ? ' ' + relay.replace(/^http/, 'ws') : ''}; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`, ...(secure ? { 'strict-transport-security': 'max-age=31536000' } : {}) };
   const send = (res, status, data, extra = {}) => { const buf = Buffer.from(JSON.stringify(data)); res.writeHead(status, { ...headers, 'content-type': 'application/json; charset=utf-8', 'content-length': buf.length, ...extra }); res.end(buf); };
   function session(req) {
     const raw = String(req.headers.cookie || '').split(';').map(x => x.trim()).find(x => x.startsWith(cookieName + '='))?.slice(cookieName.length + 1) || '';
@@ -85,6 +88,11 @@ export function createMobileHub({ stateFile, stateStore = null, origin, browserO
       if (req.headers.host !== configured.host) throw new Fault('INVALID_HOST', 421);
       const url = new URL(req.url, origin), path = url.pathname;
       gateway.check(req, path);
+      if (req.method === 'POST' && path === '/connector/browser-authorize') return send(res, 200, browserTickets.authorize(await body(req, 1024)));
+      if (req.method === 'POST' && path === '/connector/browser-ticket') {
+        const d = device(req); fields(await body(req, 1024), []);
+        return send(res, 200, browserTickets.issue({ kind: 'agent', deviceId: d.id, credentialHash: d.credentialHash }));
+      }
       if (req.method === 'GET' && path === '/health') return send(res, 200, { ok: true, service: 'ox-factory-mobile-hub', version: VERSION });
       if (req.method === 'GET' && path === '/api/auth-info') return send(res, 200, { mode: state.sharedLogin ? 'password' : 'pairing' });
       if (req.method === 'GET' && Object.hasOwn(assets, path)) {
@@ -202,6 +210,11 @@ export function createMobileHub({ stateFile, stateStore = null, origin, browserO
       }
       const s = session(req);
       if (req.method !== 'GET' && (req.headers.origin !== browserOrigin || req.headers['x-ox-csrf'] !== s.csrf)) throw new Fault('CSRF_REJECTED', 403);
+      if (req.method === 'POST' && path === '/api/browser-ticket') {
+        const b = await body(req, 1024); fields(b, ['deviceId']); id(b.deviceId);
+        const d = state.devices[b.deviceId]; if (!canSee(s, d)) throw new Fault('DEVICE_SCOPE_DENIED', 403);
+        return send(res, 200, browserTickets.issue({ kind: 'phone', deviceId: d.id, principalId: s.principalId, sessionId: s.id }));
+      }
       if (req.method === 'GET' && path === '/api/me') return send(res, 200, { id: s.id, name: s.name, principalId: s.principalId, role: s.role, devices: s.devices, csrf: s.csrf, expiresAt: s.expiresAt, secure });
       if (req.method === 'GET' && path === '/api/push') return send(res, 200, { available: !!pushDriver, publicKey: pushDriver?.publicKey || null, subscribed: !!state.pushSubscriptions[s.id] });
       if (req.method === 'POST' && path === '/api/push/subscribe') {

@@ -15,6 +15,18 @@ const deploymentPending = $('meta[name="ox-backend"]')?.content === 'pending';
 const passwordLogin = $('meta[name="ox-login"]')?.content === 'password';
 const maxImageMiB = Math.max(1, Math.min(10, Number($('meta[name="ox-max-image-mib"]')?.content) || 10));
 let me = null, state = { devices: [], commands: [] }, tab = 'home', selected = get('ox-device'), openedWorker = '', detail = null;
+let computerBrowser = null, browserMountEpoch = 0, browserMountedFor = '';
+function closeComputerBrowser() { browserMountEpoch++; computerBrowser?.destroy(); computerBrowser = null; browserMountedFor = ''; }
+async function renderComputerBrowser() {
+  const d = device(), key = JSON.stringify([me?.id, selected]);
+  if (computerBrowser && browserMountedFor === key) return;
+  if (!d || !me) { $('#content').innerHTML = '<p class="muted">登录并选择一台工厂电脑后，即可查看已授权的 Chrome。</p>'; return; }
+  closeComputerBrowser(); const epoch = browserMountEpoch; browserMountedFor = key;
+  $('#content').innerHTML = '<p class="muted">正在打开电脑 Chrome…</p>';
+  const { mountBrowser } = await import('./browser.js');
+  if (epoch !== browserMountEpoch || tab !== 'browser' || selected !== d.id) return;
+  computerBrowser = mountBrowser({ host: $('#content'), api, device: d, back: () => route('home'), toast });
+}
 let online = navigator.onLine, polling = false, installPrompt = null, backendIssue = '', pushSubscribed = false;
 let pending = UI.pendingState(UI.json(sessionStore, 'ox-pending', {}));
 let outgoing = UI.outgoingState(UI.json(sessionStore, 'ox-outgoing', {}));
@@ -53,6 +65,7 @@ function saveOutgoing() {
   if (!set('ox-outgoing', JSON.stringify(outgoing))) toast('浏览器无法保存发送状态，请在确认送达前保持本页打开');
 }
 function clearPrivateBrowserState() {
+  closeComputerBrowser();
   try { sessionStore.clear(); } catch {}
   UI.remove(localStore, 'ox-directory-cache'); pending = {}; state = { devices: [], commands: [] }; detail = null; openedWorker = ''; selected = ''; lastStateAt = 0;
   outgoing = {}; for (const items of deliveryFiles.values()) for (const item of items) URL.revokeObjectURL(item.url);
@@ -98,7 +111,7 @@ function connection() {
   if ($('#chat-connection')) $('#chat-connection').textContent = !online ? '网络离线' : backendIssue ? '中转未就绪' : !d?.online || stale ? '工厂离线' : '在线';
   syncDetailReadIndicator();
 }
-function showLogin() { if (document.body) document.body.dataset.view = 'login'; $('#login').hidden = false; $('#workspace').hidden = true; $('#nav').hidden = true; connection(); }
+function showLogin() { closeComputerBrowser(); if (document.body) document.body.dataset.view = 'login'; $('#login').hidden = false; $('#workspace').hidden = true; $('#nav').hidden = true; connection(); }
 function showWorkspace() {
   if (me) for (const [id, r] of Object.entries(outgoing)) {
     if (r.sessionId !== me.id) { delete outgoing[id]; delete pending[id]; }
@@ -166,6 +179,7 @@ async function runCommand(action, body, { retry = null, deviceId = selected, onP
   onProgress('工厂已确认接收'); return command.result.data;
 }
 function route(nextTab, worker = '', assign = false, push = true, persistDraft = true, project = '') {
+  closeComputerBrowser();
   historyReadItem = null;
   if (persistDraft) saveDraft(); cleanupAttachments(); closeModal(); settingsEpoch++; tab = nextTab; openedWorker = worker; detail = null; timelineSignature = ''; chatQuery = ''; chatFilter = ''; chatLimit = 20; readingOnly = false;
   const cached = worker && detailCache.get(JSON.stringify([me?.id, selected, worker]));
@@ -179,7 +193,8 @@ function route(nextTab, worker = '', assign = false, push = true, persistDraft =
 function render() {
   if (document.body) document.body.dataset.view = openedWorker ? 'chat' : tab;
   $('#nav').querySelectorAll('button[data-tab]').forEach(b => { const active = b.dataset.tab === (openedWorker ? 'workers' : tab); b.classList.toggle('active', active); b.setAttribute('aria-current', active ? 'page' : 'false'); });
-  if (openedWorker) renderWorker();
+  if (tab === 'browser') void renderComputerBrowser();
+  else if (openedWorker) renderWorker();
   else if (tab === 'home') renderHome(); else if (tab === 'projects') openedProject ? renderProjectDetail() : renderProjects(); else if (tab === 'workers') renderWorkers(); else if (tab === 'tasks') renderTasks(); else if (tab === 'activity') renderActivity(); else if (tab === 'usage') renderUsage(); else void settings();
   connection();
 }
@@ -188,7 +203,7 @@ function renderHome() {
   const nPending = new Set([...Object.values(pending).filter(p => p.envelope.deviceId === selected).map(p => p.envelope.id), ...outgoingForDevice().filter(r => !['confirmed', 'failed'].includes(r.phase)).map(r => r.envelope.id)]).size;
   const recentWorkers = UI.workerList(ws, { favorites, recent, deviceId: selected }).slice(0, 4), jobs = UI.newest(s.jobs).slice(0, 4);
   const hour = new Date().getHours(), greeting = hour < 6 ? '夜深了，辛苦了。' : hour < 12 ? '早上好，开个好头。' : hour < 18 ? '下午好，继续向前。' : '晚上好，看看进展。';
-  $('#content').innerHTML = `<section class="hero"><span class="eyebrow">FACTORY AT A GLANCE · ${esc(new Date().toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'short' }))}</span><h2>${greeting}</h2><p>${device()?.online ? `${ws.length} 位员工在这里，下一件事交给工厂。` : '工厂暂时离线。先查看最近状态，恢复后再安排任务。'}</p><span class="hero-deco" aria-hidden="true">牛</span></section><div class="stats"><button class="stat" data-tab="workers"><b>${ws.length}</b><span>工厂员工</span></button><button class="stat highlight" data-tab="activity" data-activity-filter="running"><b>${working}</b><span>正在执行</span></button><button class="stat" data-tab="tasks"><b>${counts.todo + counts.doing + counts.review + counts.other}</b><span>未完成任务</span></button><button class="stat" data-tab="activity" data-activity-filter="failed"><b>${(s.jobs || []).filter(j => j.status === 'failed').length}</b><span>失败待关注</span></button></div><div class="quick-actions"><button data-tab="workers">${icon('send')}找员工派活 ${icon('arrow')}</button><button data-new-task data-write>${icon('plus')}新建看板任务 ${icon('arrow')}</button></div>${nPending ? `<div class="notice-card"><div><b>${nPending} 个操作待确认</b><p>不要重复发送，先查看原请求。</p></div><button data-tab="activity" data-activity-filter="receipts">去查看</button></div>` : ''}<div class="overview-grid"><section><div class="section-head"><h3>常用与最近员工</h3><button class="text-button" data-tab="workers">全部员工 ${icon('arrow')}</button></div><div class="mini-list">${recentWorkers.map(w => `<button class="mini-row" data-worker="${esc(w.id)}"><span class="avatar small">${esc(w.name?.slice(0, 1))}</span><span class="grow"><span>${esc(w.name)} ${favorite(w.id) ? '★' : ''}</span><span class="muted">${esc(w.role || '员工')} · ${esc(w.backend)}</span></span>${status(device()?.online ? w.status : 'offline')}${icon('arrow')}</button>`).join('') || empty('还没有员工目录', '工厂电脑接入后，员工会自动出现。', 'workers')}</div></section><section><div class="section-head"><h3>最近进展</h3><button class="text-button" data-tab="activity">全部动态 ${icon('arrow')}</button></div><div class="mini-list">${jobs.map(j => `<button class="mini-row" data-job="${esc(j.id)}"><span class="grow"><span class="clamp">${esc(j.task || '员工对话')}</span><span class="muted">${esc(j.worker)} · ${UI.relative(j.updatedAt || j.createdAt)}</span></span>${status(j.status)}</button>`).join('') || empty('进展会出现在这里', '任务接管、执行和回传都以原工厂为准。')}</div></section></div>`;
+  $('#content').innerHTML = `<section class="hero"><span class="eyebrow">FACTORY AT A GLANCE · ${esc(new Date().toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'short' }))}</span><h2>${greeting}</h2><p>${device()?.online ? `${ws.length} 位员工在这里，下一件事交给工厂。` : '工厂暂时离线。先查看最近状态，恢复后再安排任务。'}</p><span class="hero-deco" aria-hidden="true">牛</span></section><div class="stats"><button class="stat" data-tab="workers"><b>${ws.length}</b><span>工厂员工</span></button><button class="stat highlight" data-tab="activity" data-activity-filter="running"><b>${working}</b><span>正在执行</span></button><button class="stat" data-tab="tasks"><b>${counts.todo + counts.doing + counts.review + counts.other}</b><span>未完成任务</span></button><button class="stat" data-tab="activity" data-activity-filter="failed"><b>${(s.jobs || []).filter(j => j.status === 'failed').length}</b><span>失败待关注</span></button></div><div class="quick-actions"><button data-tab="browser">电脑 Chrome</button><button data-tab="workers">${icon('send')}找员工派活 ${icon('arrow')}</button><button data-new-task data-write>${icon('plus')}新建看板任务 ${icon('arrow')}</button></div>${nPending ? `<div class="notice-card"><div><b>${nPending} 个操作待确认</b><p>不要重复发送，先查看原请求。</p></div><button data-tab="activity" data-activity-filter="receipts">去查看</button></div>` : ''}<div class="overview-grid"><section><div class="section-head"><h3>常用与最近员工</h3><button class="text-button" data-tab="workers">全部员工 ${icon('arrow')}</button></div><div class="mini-list">${recentWorkers.map(w => `<button class="mini-row" data-worker="${esc(w.id)}"><span class="avatar small">${esc(w.name?.slice(0, 1))}</span><span class="grow"><span>${esc(w.name)} ${favorite(w.id) ? '★' : ''}</span><span class="muted">${esc(w.role || '员工')} · ${esc(w.backend)}</span></span>${status(device()?.online ? w.status : 'offline')}${icon('arrow')}</button>`).join('') || empty('还没有员工目录', '工厂电脑接入后，员工会自动出现。', 'workers')}</div></section><section><div class="section-head"><h3>最近进展</h3><button class="text-button" data-tab="activity">全部动态 ${icon('arrow')}</button></div><div class="mini-list">${jobs.map(j => `<button class="mini-row" data-job="${esc(j.id)}"><span class="grow"><span class="clamp">${esc(j.task || '员工对话')}</span><span class="muted">${esc(j.worker)} · ${UI.relative(j.updatedAt || j.createdAt)}</span></span>${status(j.status)}</button>`).join('') || empty('进展会出现在这里', '任务接管、执行和回传都以原工厂为准。')}</div></section></div>`;
 }
 function workerCard(w) {
   const latest = UI.newest(snap().jobs).find(j => j.worker === w.id);
@@ -839,7 +854,7 @@ $('#show-password').onclick = () => { const input = $('#pair-code'), visible = i
 window.addEventListener('offline', () => { online = false; connection(); });
 window.addEventListener('online', async () => { online = true; if (!me) { try { me = await api('/api/me'); showWorkspace(); } catch { showLogin(); return; } } await refresh({ force: true }); if (openedWorker) await refreshDetail(); });
 window.addEventListener('beforeinstallprompt', event => { event.preventDefault(); installPrompt = event; if ($('#install')) $('#install').hidden = false; });
-window.addEventListener('popstate', event => { if (!me) return; const target = event.state; if (!target?.ox) return route('home', '', false, false); saveDraft(); if (state.devices.some(d => d.id === target.deviceId)) selected = target.deviceId; route(['home', 'projects', 'workers', 'tasks', 'activity', 'usage', 'settings'].includes(target.tab) ? target.tab : 'home', target.worker || '', !!target.assign, false, false, target.project || ''); renderDevicePicker(); });
+window.addEventListener('popstate', event => { if (!me) return; const target = event.state; if (!target?.ox) return route('home', '', false, false); saveDraft(); if (state.devices.some(d => d.id === target.deviceId)) selected = target.deviceId; route(['home', 'projects', 'workers', 'tasks', 'activity', 'usage', 'settings', 'browser'].includes(target.tab) ? target.tab : 'home', target.worker || '', !!target.assign, false, false, target.project || ''); renderDevicePicker(); });
 window.addEventListener('beforeunload', event => { if (Object.values(outgoing).some(r => ['preparing', 'submitting'].includes(r.phase))) { event.preventDefault(); event.returnValue = ''; } });
 document.addEventListener('visibilitychange', () => { if (!document.hidden) { refresh(); refreshDetail(); } });
 for (const node of document.querySelectorAll('[data-icon]')) node.innerHTML = icon(node.dataset.icon);

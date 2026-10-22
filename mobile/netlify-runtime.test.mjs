@@ -13,7 +13,7 @@ const origin = 'https://fixture.netlify.app', siteId = '11111111-2222-3333-4444-
 const password = 'fixture-only-password-32-characters', deviceSecret = 'x'.repeat(43), principalId = 'owner_fixture', deviceId = 'factory_fixture';
 const passwordRecord = createPasswordRecord(password);
 const context = { site: { id: siteId, url: origin }, deploy: { context: 'production', published: true }, ip: '192.0.2.123' };
-function fixture() {
+function fixture(options = {}) {
   let value = initialState({ principalId, deviceId, deviceName: 'isolated simulation', deviceSecret, pairingCode: 'fixture-only-pairing', adminSecret: 'fixture-only-admin' });
   value.sharedLogin = passwordRecord;
   let revision = 1, conflicts = 0, time = Date.now(), reads = 0, writes = 0;
@@ -26,7 +26,7 @@ function fixture() {
       value = structuredClone(data); return { modified: true, etag: String(++revision) };
     },
   };
-  const handler = createNetlifyHubHandler({ store, origin, siteId, now: () => time });
+  const handler = createNetlifyHubHandler({ store, origin, siteId, now: () => time, ...options });
   async function request(path, body, headers = {}, ctx = context) {
     return handler(new Request(origin + path, { method: body === undefined ? 'GET' : 'POST', headers: { origin, 'content-type': 'application/json', ...headers }, body: body === undefined ? undefined : JSON.stringify(body) }), ctx);
   }
@@ -146,7 +146,7 @@ test('cloud bundle keeps runtime code outside public and contains no local Hub s
   t.after(() => rmSync(parent, { recursive: true, force: true }));
   const report = prepareNetlifyHub({ output, origin, siteId });
   assert.equal(report.stateIncluded, false); assert.equal(report.mode, 'persistent-netlify-hub');
-  assert.deepEqual(readdirSync(join(output, 'public')).sort(), ['_headers', 'app.js', 'cache.js', 'icon.svg', 'index.html', 'manifest.webmanifest', 'markdown.js', 'style.css', 'sw.js', 'ui.js', 'vendor']);
+  assert.deepEqual(readdirSync(join(output, 'public')).sort(), ['_headers', 'app.js', 'browser-geometry.js', 'browser.js', 'cache.js', 'icon.svg', 'index.html', 'manifest.webmanifest', 'markdown.js', 'style.css', 'sw.js', 'ui.js', 'vendor']);
   assert.match(readFileSync(join(output, 'runtime', 'hub.mjs'), 'utf8'), /from '\.\/web-assets\.mjs'/);
   assert.match(readFileSync(join(output, 'runtime', 'web-assets.mjs'), 'utf8'), /vendor\/markdown-engine\.js/);
   assert.ok(readFileSync(join(output, 'public', 'vendor', 'fonts', 'KaTeX_Size4-Regular.woff2')).length > 100);
@@ -155,4 +155,25 @@ test('cloud bundle keeps runtime code outside public and contains no local Hub s
   assert.ok(!config.includes('[[redirects]]')); assert.ok(config.includes('directory = "functions"'));
   const html = readFileSync(join(output, 'public', 'index.html'), 'utf8');
   assert.ok(html.includes('ox-login')); assert.ok(!html.includes('content="pending"'));
+});
+
+test('browser ticket issuance/binding is CAS protected and follows CSRF, scope, credential and session revocation', async () => {
+  const f = fixture({browserRelay:'https://relay.example.com'}); await f.sync(); const auth=await f.login();
+  assert.equal((await f.request('/api/browser-ticket',{deviceId})).status,401);
+  assert.equal((await f.request('/api/browser-ticket',{deviceId},{cookie:auth.cookie})).status,403);
+  assert.equal((await f.request('/api/browser-ticket',{deviceId},{...auth,origin:'https://evil.example'})).status,403);
+  assert.equal((await f.request('/api/browser-ticket',{deviceId:'another_device'},auth)).status,403);
+  assert.equal((await f.request('/connector/browser-ticket',{}, {authorization:'Bearer wrong'})).status,401);
+  f.conflict(2);
+  const issued=await f.request('/api/browser-ticket',{deviceId},auth); assert.equal(issued.status,200);
+  const ticket=(await issued.json()).ticket, body={ticket,connectionId:randomUUID()};
+  assert.equal(JSON.stringify(f.state).includes(ticket),false);
+  f.conflict(2); const bound=await f.request('/connector/browser-authorize',body);assert.equal(bound.status,200);
+  const writes=f.writes;assert.equal((await f.request('/connector/browser-authorize',body)).status,200);assert.equal(f.writes,writes);
+  assert.equal((await f.request('/connector/browser-authorize',{...body,connectionId:randomUUID()})).status,401);
+  assert.equal((await f.request('/api/logout',{},auth)).status,200);
+  assert.equal((await f.request('/connector/browser-authorize',body)).status,401);
+  const a=await f.request('/connector/browser-ticket',{}, {authorization:'Bearer '+deviceSecret});assert.equal(a.status,200);
+  const agentBody={ticket:(await a.json()).ticket,connectionId:randomUUID()};assert.equal((await f.request('/connector/browser-authorize',agentBody)).status,200);
+  f.state.devices[deviceId].revokedAt='revoked';assert.equal((await f.request('/connector/browser-authorize',agentBody)).status,401);
 });

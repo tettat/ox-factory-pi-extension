@@ -1,6 +1,6 @@
 importScripts('/vendor/precache.js');
-const CACHE = 'ox-mobile-shell-v14';
-const SHELL = ['/', '/app.js', '/ui.js', '/cache.js', '/markdown.js', '/style.css', '/manifest.webmanifest', '/icon.svg', ...self.OX_MARKUP_ASSETS];
+const CACHE = 'ox-mobile-shell-v16';
+const SHELL = ['/', '/app.js', '/ui.js', '/cache.js', '/browser.js', '/browser-geometry.js', '/markdown.js', '/style.css', '/manifest.webmanifest', '/icon.svg', ...self.OX_MARKUP_ASSETS];
 self.addEventListener('install', event => event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)).then(() => self.skipWaiting())));
 self.addEventListener('activate', event => event.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(k => k.startsWith('ox-mobile-shell-') && k !== CACHE).map(k => caches.delete(k)))).then(() => self.clients.claim())));
 self.addEventListener('fetch', event => {

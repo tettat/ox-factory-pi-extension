@@ -1,0 +1,20 @@
+name = "ox-browser-relay"
+main = "worker.mjs"
+compatibility_date = "2026-10-01"
+workers_dev = true
+
+[vars]
+# Configure these two exact origins for your own installation before deployment.
+HUB_ORIGIN = "https://hub.example.com"
+PHONE_ORIGIN = "https://hub.example.com"
+
+[[durable_objects.bindings]]
+name = "BROWSER_ROOMS"
+class_name = "BrowserRelay"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["BrowserRelay"]
+
+[observability]
+enabled = false

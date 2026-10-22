@@ -112,3 +112,7 @@ node mobile/release.mjs output/mobile-release
 Tests use temporary synthetic factories. DOM tests use the declared root `jsdom` dev dependency, not another project checkout. Two POSIX executable-fixture tests are explicitly skipped on Windows.
 
 The release command creates a code-only Hub/Connector bundle with a SHA-256 manifest, **not** a replacement for installing the full factory. It uses this repository's module layout and excludes runtime identities, private operating notes and local QA scripts.
+
+## 手机接管电脑 Chrome（0.6）
+
+已授权的手机可以查看登记过的 Chrome 实例、窗口与标签页，缩放/平移画面，并点击、滚动、输入中文。只处理独立 profile 的调试 Chrome，不接管普通浏览器。安装、员工启动命令、Cloudflare/自托管中继及安全边界见 [BROWSER.md](BROWSER.md)。

@@ -4,6 +4,8 @@ export const WEB_ASSETS = [
   "app.js",
   "ui.js",
   "cache.js",
+  "browser.js",
+  "browser-geometry.js",
   "markdown.js",
   "style.css",
   "sw.js",

@@ -30,7 +30,7 @@ async function capture(hub, request, bytes, clientIp) {
   });
 }
 
-export function createNetlifyHubHandler({ store, origin, siteId, maxAttempts = 5, now = Date.now }) {
+export function createNetlifyHubHandler({ store, origin, siteId, maxAttempts = 5, now = Date.now, browserRelay = '' }) {
   httpsOrigin(origin);
   if (!/^[a-f0-9-]{36}$/.test(siteId)) throw new Error('A pinned Netlify site ID is required');
   return async (request, context) => {
@@ -57,7 +57,7 @@ export function createNetlifyHubHandler({ store, origin, siteId, maxAttempts = 5
         if (!entry.etag || entry.data?.version !== 1) return errorResponse(503, 'HUB_STATE_INVALID');
         let dirty = false;
         const state = structuredClone(entry.data);
-        const hub = createMobileHub({ origin, now, nextPollMs: 3000, maxLeasedCommands: 1,
+        const hub = createMobileHub({ origin, now, browserRelay, nextPollMs: 3000, maxLeasedCommands: 1,
           stateStore: { read: () => state, write: () => { dirty = true; } } });
         const response = await capture(hub, request, bytes, context.ip);
         hub.server.removeAllListeners(); // No socket was opened by this adapter.

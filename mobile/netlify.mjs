@@ -8,7 +8,8 @@ import { WEB_ASSETS } from './web-assets.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url)), root = resolve(here, '..');
 const assets = WEB_ASSETS;
-export function netlifyConfig(hubOrigin = '') {
+export function netlifyConfig(hubOrigin = '', browserRelay = '') {
+  if (browserRelay) httpsOrigin(browserRelay);
   if (hubOrigin) httpsOrigin(hubOrigin);
   return `[build]
   publish = "public"
@@ -28,7 +29,7 @@ ${hubOrigin ? '  signed = "OX_PROXY_SIGNING_KEY"\n' : ''}
     X-Frame-Options = "DENY"
     X-Robots-Tag = "noindex, nofollow"
     Permissions-Policy = "camera=(), microphone=(), geolocation=()"
-    Content-Security-Policy = "default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; font-src 'self'; img-src 'self' blob: data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+    Content-Security-Policy = "default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; font-src 'self'; img-src 'self' blob: data:; connect-src 'self'${browserRelay ? ' ' + browserRelay.replace(/^https:/, 'wss:') : ''}; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
 
 [[headers]]
   for = "/sw.js"
@@ -43,11 +44,11 @@ ${hubOrigin ? '  signed = "OX_PROXY_SIGNING_KEY"\n' : ''}
 `;
 }
 
-export function prepareNetlify({ output, hubOrigin = '' }) {
+export function prepareNetlify({ output, hubOrigin = '', browserRelay = '' }) {
   const destination = resolve(output), allowed = join(root, 'output');
   if (!destination.startsWith(allowed + '/') && !destination.startsWith(allowed + '\\')) throw new Error('Choose a new deployment directory under workspace/output');
   if (existsSync(destination)) throw new Error('Deployment directory already exists; use a new version');
-  const config = netlifyConfig(hubOrigin); // validate before writing
+  const config = netlifyConfig(hubOrigin, browserRelay); // validate before writing
   mkdirSync(dirname(destination), { recursive: true });
   const parent = realpathSync(dirname(destination));
   if (parent !== allowed && !parent.startsWith(allowed + '/') && !parent.startsWith(allowed + '\\')) throw new Error('Deployment parent escapes workspace/output');
@@ -63,7 +64,7 @@ export function prepareNetlify({ output, hubOrigin = '' }) {
   X-Frame-Options: DENY
   X-Robots-Tag: noindex, nofollow
   Permissions-Policy: camera=(), microphone=(), geolocation=()
-  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; font-src 'self'; img-src 'self' blob: data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'
+  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; font-src 'self'; img-src 'self' blob: data:; connect-src 'self'${browserRelay ? ' ' + browserRelay.replace(/^https:/, 'wss:') : ''}; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'
 /sw.js
   Service-Worker-Allowed: /
   Cache-Control: no-cache, no-store, must-revalidate

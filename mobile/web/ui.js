@@ -1,6 +1,6 @@
 import { renderMarkdown } from './markdown.js';
 // Pure presentation helpers. No network, credentials, DOM writes or raw HTML input.
-export const VERSION = '0.5.1';
+export const VERSION = '0.6.0';
 export const labels = { idle: '空闲', busy: '忙碌', running: '执行中', queued: '排队中', pending: '等待接管', processing: '接管中', accepted: '已接管', reported: '已回传', done: '完成', completed: '完成', succeeded: '完成', failed: '失败', cancelled: '已取消', offline: '离线', vacation: '休假', TODO: '待开始' };
 export const roles = { owner: '所有者', operator: '操作员', viewer: '只读' };
 export const actions = { 'talk.send': '员工对话', 'task.assign': '派发任务', 'task.create': '创建看板任务', 'task.update': '更新看板任务', 'image.upload': '上传图片' };
@@ -119,6 +119,7 @@ const paths = {
   usage: '<path d="M4 20V10h4v10m3 0V4h4v16m3 0v-7h4v7M2 21h21"/>',
   projects: '<path d="M3 7V5a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/><path d="M3 9h18M8 14h8m-8 3h5"/>',
   expand: '<path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/>',
+  browser: '<rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4M2 7h20"/>',
 };
 export function icon(name) { return `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name] || paths.activity}</svg>`; }
 export function readIndicator(phase, label) {
