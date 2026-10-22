@@ -16,6 +16,7 @@ const labels = {
   STALE_BROWSER_FRAME: '画面位置已变化，已取消这次操作，正在刷新', BROWSER_VIEW_CHANGED: '标签页已切换，请重新选择', BROWSER_FRAME_TOO_LARGE: '画面较大，请改用省流画质', BROWSER_BUSY: '已有操作在处理，请稍候', BROWSER_SLOW_DOWN: '操作较快，稍后再试',
   CHROME_TIMEOUT: 'Chrome 暂未返回画面，正在重试', BROWSER_INSTANCE_CHANGED: 'Chrome 已重新启动，请在电脑重新登记', BROWSER_OPERATION_FAILED: '本次操作未确认，请查看新画面后再决定是否重试',
   BROWSER_NAVIGATION_FAILED: '网页未能打开，请检查网址或电脑网络后重试', BROWSER_TAB_LIMIT: '这个浏览器的标签页太多，请先在电脑关闭一些', INVALID_BROWSER_URL: '请输入有效的网页地址',
+  INVALID_BROWSER_ACTION: '这台电脑的浏览器组件需要更新；可先取消“在新标签页打开”，在当前页打开网址',
 };
 export function mountBrowser({ host, api, device, back, toast }) {
   const root = document.createElement('section'); root.className = 'browser-root'; host.replaceChildren(root);
@@ -123,7 +124,9 @@ export function mountBrowser({ host, api, device, back, toast }) {
     if (spatial ? !editable() : !commandReady()) { toast(spatial ? '请先点“开始操作”，并等待新画面' : '浏览器尚未就绪，请稍候'); return false; }
     const target = selected, sourceFrame = frame?.frame; frameEpoch++; busy = true; currentAction = action; clearTimeout(timer); if (!spatial) paused = false; status();
     try {
-      const result = await request(action, { ...(spatial ? { frame: sourceFrame } : {}), ...extra });
+      // Older agents still require a frame even for navigation. Include it when
+      // available without making newer agents wait for a screenshot again.
+      const result = await request(action, { ...(sourceFrame ? { frame: sourceFrame } : {}), ...extra });
       if (!destroyed && selected === target && result.openedTab) { choose(target.instance, result.openedTab.id, { tab: { ...result.openedTab, controllable: true }, keepMode: true }); void refreshList(); }
       return true;
     }
