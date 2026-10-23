@@ -16,5 +16,13 @@ class_name = "BrowserRelay"
 tag = "v1"
 new_sqlite_classes = ["BrowserRelay"]
 
+[[durable_objects.bindings]]
+name = "DESKTOP_ROOMS"
+class_name = "DesktopRelay"
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["DesktopRelay"]
+
 [observability]
 enabled = false

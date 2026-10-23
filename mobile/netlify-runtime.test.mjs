@@ -146,7 +146,7 @@ test('cloud bundle keeps runtime code outside public and contains no local Hub s
   t.after(() => rmSync(parent, { recursive: true, force: true }));
   const report = prepareNetlifyHub({ output, origin, siteId });
   assert.equal(report.stateIncluded, false); assert.equal(report.mode, 'persistent-netlify-hub');
-  assert.deepEqual(readdirSync(join(output, 'public')).sort(), ['_headers', 'app.js', 'browser-geometry.js', 'browser.js', 'cache.js', 'icon.svg', 'index.html', 'manifest.webmanifest', 'markdown.js', 'style.css', 'sw.js', 'ui.js', 'vendor']);
+  assert.deepEqual(readdirSync(join(output, 'public')).sort(), ['_headers', 'app.js', 'browser-geometry.js', 'browser.js', 'cache.js', 'desktop-channel.js', 'desktop.js', 'icon.svg', 'index.html', 'manifest.webmanifest', 'markdown.js', 'style.css', 'sw.js', 'ui.js', 'vendor']);
   assert.match(readFileSync(join(output, 'runtime', 'hub.mjs'), 'utf8'), /from '\.\/web-assets\.mjs'/);
   assert.match(readFileSync(join(output, 'runtime', 'web-assets.mjs'), 'utf8'), /vendor\/markdown-engine\.js/);
   assert.ok(readFileSync(join(output, 'public', 'vendor', 'fonts', 'KaTeX_Size4-Regular.woff2')).length > 100);
@@ -176,4 +176,26 @@ test('browser ticket issuance/binding is CAS protected and follows CSRF, scope, 
   const a=await f.request('/connector/browser-ticket',{}, {authorization:'Bearer '+deviceSecret});assert.equal(a.status,200);
   const agentBody={ticket:(await a.json()).ticket,connectionId:randomUUID()};assert.equal((await f.request('/connector/browser-authorize',agentBody)).status,200);
   f.state.devices[deviceId].revokedAt='revoked';assert.equal((await f.request('/connector/browser-authorize',agentBody)).status,401);
+});
+
+test('desktop tickets preserve CAS, CSRF and scope; browser tickets cannot authorize desktop access', async () => {
+  const f=fixture({browserRelay:'https://relay.example.com'});await f.sync();const auth=await f.login(),b={deviceId,mode:'control'};
+  assert.equal((await f.request('/api/desktop-ticket',b)).status,401);
+  assert.equal((await f.request('/api/desktop-ticket',b,{cookie:auth.cookie})).status,403);
+  assert.equal((await f.request('/api/desktop-ticket',b,{...auth,origin:'https://evil.example'})).status,403);
+  assert.equal((await f.request('/api/desktop-ticket',{...b,deviceId:'other_device'},auth)).status,403);
+  assert.equal((await f.request('/api/desktop-ticket',{...b,mode:'admin'},auth)).status,400);
+  assert.equal((await f.request('/connector/desktop-ticket',{}, {authorization:'Bearer wrong'})).status,401);
+  f.conflict(2);const issued=await f.request('/api/desktop-ticket',b,auth);assert.equal(issued.status,200);
+  const ticket=(await issued.json()).ticket,body={ticket,connectionId:randomUUID()};assert.equal(JSON.stringify(f.state).includes(ticket),false);
+  f.conflict(2);const bound=await f.request('/connector/desktop-authorize',body);assert.equal(bound.status,200);assert.equal((await bound.json()).audience,'desktop');
+  assert.equal((await f.request('/connector/browser-authorize',body)).status,401);
+  const writes=f.writes;assert.equal((await f.request('/connector/desktop-authorize',body)).status,200);assert.equal(f.writes,writes);
+  assert.equal((await f.request('/connector/desktop-authorize',{...body,connectionId:randomUUID()})).status,401);
+  Object.values(f.state.sessions)[0].role='viewer';assert.equal((await f.request('/api/desktop-ticket',b,auth)).status,403);assert.equal((await f.request('/connector/desktop-authorize',body)).status,401);
+  const view=await f.request('/api/desktop-ticket',{...b,mode:'view'},auth);assert.equal(view.status,200);
+  const viewBody={ticket:(await view.json()).ticket,connectionId:randomUUID()};assert.equal((await f.request('/connector/desktop-authorize',viewBody)).status,200);
+  await f.request('/api/logout',{},auth);assert.equal((await f.request('/connector/desktop-authorize',viewBody)).status,401);
+  const a=await f.request('/connector/desktop-ticket',{}, {authorization:'Bearer '+deviceSecret});assert.equal(a.status,200);const agentBody={ticket:(await a.json()).ticket,connectionId:randomUUID()};assert.equal((await f.request('/connector/desktop-authorize',agentBody)).status,200);
+  f.state.devices[deviceId].revokedAt='revoked';assert.equal((await f.request('/connector/desktop-authorize',agentBody)).status,401);
 });

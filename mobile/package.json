@@ -1,6 +1,6 @@
 {
   "name": "ox-factory-mobile",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -8,7 +8,7 @@
   },
   "scripts": {
     "test": "node --test *.test.mjs",
-    "check": "node --check hub.mjs && node --check connector.mjs && node --check cli.mjs && node --check doctor.mjs && node --check runtime-health.mjs && node --check netlify-runtime.mjs && node --check netlify-hub.mjs && node --check web/app.js && node --check web/ui.js && node --check factory-adapter.mjs && node --check read-state.mjs && node --check protocol.mjs && node --check web/cache.js && node --check web/markdown.js && node --check web-assets.mjs && node --check browser-cli.mjs && node --check browser-agent.mjs && node --check browser-cdp.mjs && node --check browser-relay-node.mjs && node --check web/browser.js",
+    "check": "node --check hub.mjs && node --check connector.mjs && node --check cli.mjs && node --check doctor.mjs && node --check runtime-health.mjs && node --check netlify-runtime.mjs && node --check netlify-hub.mjs && node --check web/app.js && node --check web/ui.js && node --check factory-adapter.mjs && node --check read-state.mjs && node --check protocol.mjs && node --check web/cache.js && node --check web/markdown.js && node --check web-assets.mjs && node --check browser-cli.mjs && node --check browser-agent.mjs && node --check browser-cdp.mjs && node --check browser-relay-node.mjs && node --check web/browser.js && node --check desktop-cli.mjs && node --check desktop-agent.mjs && node --check desktop-rfb.mjs && node --check desktop-relay-core.mjs && node --check web/desktop.js && node --check web/desktop-channel.js",
     "build:markup": "node build-markup.mjs"
   },
   "dependencies": {
@@ -17,6 +17,7 @@
     "ws": "8.22.0"
   },
   "devDependencies": {
+    "@novnc/novnc": "1.7.0",
     "esbuild": "0.28.2",
     "katex": "0.19.0",
     "markdown-it": "15.0.3"

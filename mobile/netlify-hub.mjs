@@ -17,7 +17,7 @@ export function prepareNetlifyHub({ output, origin, siteId, browserRelay = '' })
   const index = join(dir, 'public', 'index.html');
   writeFileSync(index, readFileSync(index, 'utf8').replace('<head>', '<head><meta name="ox-login" content="password"><meta name="ox-max-image-mib" content="2">'));
   mkdirSync(join(dir, 'runtime')); mkdirSync(join(dir, 'functions'));
-  for (const file of ['browser-auth.mjs', 'web-assets.mjs', 'netlify-runtime.mjs', 'hub.mjs', 'protocol.mjs', 'store.mjs', 'push.mjs', 'netlify-proxy.mjs', 'password.mjs']) copyFileSync(join(here, file), join(dir, 'runtime', file));
+  for (const file of ['desktop-auth.mjs', 'browser-auth.mjs', 'web-assets.mjs', 'netlify-runtime.mjs', 'hub.mjs', 'protocol.mjs', 'store.mjs', 'push.mjs', 'netlify-proxy.mjs', 'password.mjs']) copyFileSync(join(here, file), join(dir, 'runtime', file));
   for (const file of ['package.json', 'package-lock.json']) copyFileSync(join(here, file), join(dir, file));
   writeFileSync(join(dir, 'functions', 'mobile-hub.mjs'), `import { getStore } from '@netlify/blobs';\nimport { createNetlifyHubHandler, HUB_STORE_NAME } from ${JSON.stringify('../runtime/netlify-runtime.mjs')};\nexport default async (request, context) => {\n  const store = getStore({ name: HUB_STORE_NAME, consistency: 'strong' });\n  return createNetlifyHubHandler({ store, origin: ${JSON.stringify(origin)}, siteId: ${JSON.stringify(siteId)}, browserRelay: ${JSON.stringify(browserRelay)} })(request, context);\n};\nexport const config = { path: ['/health', '/api/*', '/connector/*'], rateLimit: { action: 'rate_limit', aggregateBy: ['ip'], windowSize: 60, windowLimit: 300 } };\n`);
   const manifest = { createdAt: new Date().toISOString(), mode: 'persistent-netlify-hub', origin, siteId,

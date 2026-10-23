@@ -116,3 +116,8 @@ The release command creates a code-only Hub/Connector bundle with a SHA-256 mani
 ## 手机接管电脑 Chrome（0.6）
 
 已授权的手机可以查看登记过的 Chrome 实例、窗口与标签页，缩放/平移画面，并点击、滚动、输入中文。只处理独立 profile 的调试 Chrome，不接管普通浏览器。安装、员工启动命令、Cloudflare/自托管中继及安全边界见 [BROWSER.md](BROWSER.md)。
+
+## 手机远程桌面
+
+手机版新增 **电脑 → 远程桌面**，使用现有 Hub 认证控制本机正常桌面。
+独立启用、不影响原工厂或 Chrome；部署、授权、撤销与限制见 [DESKTOP.md](DESKTOP.md)。

@@ -1,5 +1,6 @@
 import { WEB_ASSETS } from './web-assets.mjs';
 import { createBrowserTickets, relayOrigin } from './browser-auth.mjs';
+import { createDesktopTickets } from './desktop-auth.mjs';
 import { createServer } from 'node:http';
 import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -42,6 +43,7 @@ export function createMobileHub({ stateFile, stateStore = null, origin, browserO
   const persist = () => stateStore ? stateStore.write(state) : writeJson(stateFile, state);
   const relay = relayOrigin(browserRelay, allowInsecureLoopback);
   const browserTickets = createBrowserTickets({ state, persist, now, relay });
+  const desktopTickets = createDesktopTickets({ state, persist, now, relay });
   const audit = (type, data = {}) => { state.audit.push({ time: at(), type, ...data }); state.audit = state.audit.slice(-1000); };
   const cookie = raw => `${cookieName}=${raw}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${raw ? 30 * 86400 : 0}${secure ? '; Secure' : ''}`;
   const headers = { 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer', 'x-frame-options': 'DENY', 'permissions-policy': 'camera=(), microphone=(), geolocation=()',
@@ -88,6 +90,11 @@ export function createMobileHub({ stateFile, stateStore = null, origin, browserO
       if (req.headers.host !== configured.host) throw new Fault('INVALID_HOST', 421);
       const url = new URL(req.url, origin), path = url.pathname;
       gateway.check(req, path);
+      if (req.method === 'POST' && path === '/connector/desktop-authorize') return send(res, 200, desktopTickets.authorize(await body(req, 1024)));
+      if (req.method === 'POST' && path === '/connector/desktop-ticket') {
+        const d = device(req); fields(await body(req, 1024), []);
+        return send(res, 200, desktopTickets.issue({ kind: 'agent', deviceId: d.id, credentialHash: d.credentialHash }));
+      }
       if (req.method === 'POST' && path === '/connector/browser-authorize') return send(res, 200, browserTickets.authorize(await body(req, 1024)));
       if (req.method === 'POST' && path === '/connector/browser-ticket') {
         const d = device(req); fields(await body(req, 1024), []);
@@ -210,6 +217,13 @@ export function createMobileHub({ stateFile, stateStore = null, origin, browserO
       }
       const s = session(req);
       if (req.method !== 'GET' && (req.headers.origin !== browserOrigin || req.headers['x-ox-csrf'] !== s.csrf)) throw new Fault('CSRF_REJECTED', 403);
+      if (req.method === 'POST' && path === '/api/desktop-ticket') {
+        const b = await body(req, 1024); fields(b, ['deviceId', 'mode']); id(b.deviceId);
+        const d = state.devices[b.deviceId]; if (!canSee(s, d)) throw new Fault('DEVICE_SCOPE_DENIED', 403);
+        if (!['view', 'control'].includes(b.mode)) throw new Fault('INVALID_DESKTOP_MODE');
+        if (b.mode === 'control' && (s.role === 'viewer' || d.snapshot?.grants?.[s.principalId] === 'viewer')) throw new Fault('ROLE_DENIED', 403);
+        return send(res, 200, desktopTickets.issue({ kind:'phone', deviceId:d.id, principalId:s.principalId, sessionId:s.id, mode:b.mode }));
+      }
       if (req.method === 'POST' && path === '/api/browser-ticket') {
         const b = await body(req, 1024); fields(b, ['deviceId']); id(b.deviceId);
         const d = state.devices[b.deviceId]; if (!canSee(s, d)) throw new Fault('DEVICE_SCOPE_DENIED', 403);

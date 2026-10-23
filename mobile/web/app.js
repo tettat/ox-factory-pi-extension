@@ -15,17 +15,20 @@ const deploymentPending = $('meta[name="ox-backend"]')?.content === 'pending';
 const passwordLogin = $('meta[name="ox-login"]')?.content === 'password';
 const maxImageMiB = Math.max(1, Math.min(10, Number($('meta[name="ox-max-image-mib"]')?.content) || 10));
 let me = null, state = { devices: [], commands: [] }, tab = 'home', selected = get('ox-device'), openedWorker = '', detail = null;
-let computerBrowser = null, browserMountEpoch = 0, browserMountedFor = '';
+let computerBrowser = null, browserMountEpoch = 0, browserMountedFor = '', computerMode = 'chrome';
 function closeComputerBrowser() { browserMountEpoch++; computerBrowser?.destroy(); computerBrowser = null; browserMountedFor = ''; }
 async function renderComputerBrowser() {
-  const d = device(), key = JSON.stringify([me?.id, selected]);
-  if (computerBrowser && browserMountedFor === key) return;
+  const d = device(), key = JSON.stringify([me?.id, selected, computerMode]);
+  if (browserMountedFor === key) return;
   if (!d || !me) { $('#content').innerHTML = '<p class="muted">登录并选择一台工厂电脑后，即可查看已授权的 Chrome。</p>'; return; }
   closeComputerBrowser(); const epoch = browserMountEpoch; browserMountedFor = key;
-  $('#content').innerHTML = '<p class="muted">正在打开电脑 Chrome…</p>';
-  const { mountBrowser } = await import('./browser.js');
-  if (epoch !== browserMountEpoch || tab !== 'browser' || selected !== d.id) return;
-  computerBrowser = mountBrowser({ host: $('#content'), api, device: d, back: () => route('home'), toast });
+  $('#content').innerHTML = `<div class="computer-modes" aria-label="电脑连接方式"><button data-computer-mode="chrome" aria-pressed="${computerMode === 'chrome'}">Chrome</button><button data-computer-mode="desktop" aria-pressed="${computerMode === 'desktop'}">远程桌面</button></div><div id="computer-panel"><p class="muted">正在打开…</p></div>`;
+  $('#content').querySelectorAll('[data-computer-mode]').forEach(b => b.addEventListener('click', () => { computerMode = b.dataset.computerMode; void renderComputerBrowser(); }));
+  try {
+    const module = computerMode === 'desktop' ? await import('./desktop.js') : await import('./browser.js');
+    if (epoch !== browserMountEpoch || tab !== 'browser' || selected !== d.id) return;
+    computerBrowser = (module.mountDesktop || module.mountBrowser)({ host: $('#computer-panel'), api, device: d, back: () => route('home'), toast });
+  } catch { if (epoch === browserMountEpoch) { browserMountedFor = ''; $('#computer-panel').textContent = '组件未能加载，请检查网络后重试'; } }
 }
 let online = navigator.onLine, polling = false, installPrompt = null, backendIssue = '', pushSubscribed = false;
 let pending = UI.pendingState(UI.json(sessionStore, 'ox-pending', {}));

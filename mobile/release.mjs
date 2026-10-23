@@ -25,7 +25,7 @@ function add(name) {
     add(dep);
   }
 }
-for (const name of ['browser-cli.mjs', 'browser-relay-node.mjs', 'browser-relay/worker.mjs', 'browser-relay/wrangler.toml', 'BROWSER.md', 'cli.mjs', 'factory-adapter.mjs', 'release.mjs', 'netlify.mjs', 'netlify-hub.mjs', 'netlify-runtime.mjs', 'package.json', 'package-lock.json', 'README.md', 'SECURITY.md', 'NETLIFY.md']) add('mobile/' + name);
+for (const name of ['desktop-cli.mjs', 'DESKTOP.md', 'browser-cli.mjs', 'browser-relay-node.mjs', 'browser-relay/worker.mjs', 'browser-relay/wrangler.toml', 'BROWSER.md', 'cli.mjs', 'factory-adapter.mjs', 'release.mjs', 'netlify.mjs', 'netlify-hub.mjs', 'netlify-runtime.mjs', 'package.json', 'package-lock.json', 'README.md', 'SECURITY.md', 'NETLIFY.md']) add('mobile/' + name);
 for (const asset of WEB_ASSETS) add('mobile/web/' + asset);
 for (const name of ['Caddyfile.example', 'ox-mobile-hub.service', 'WINDOWS-SERVICE.md']) add('mobile/deploy/' + name);
 const manifest = [];
