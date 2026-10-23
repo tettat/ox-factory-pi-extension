@@ -1,6 +1,19 @@
 import { esc } from './ui.js';
 import { DesktopChannel } from './desktop-channel.js';
 const errors={DESKTOP_LOCAL_DENIED:'电脑尚未授权此账号控制桌面',DESKTOP_VNC_OFFLINE:'电脑桌面服务暂未就绪',DESKTOP_UNAVAILABLE:'桌面连接中断，请重新连接',DESKTOP_RELAY_UNAVAILABLE:'此 Hub 尚未配置桌面中继',ROLE_DENIED:'当前账号只能查看桌面'};
+export function desktopDisconnectMessage({code,phase,cause}={}){
+  if(code===4409)return '桌面已在另一页面连接，请先断开';
+  if(code===4401)return '授权已结束，请重新登录或连接';
+  if(code===4410)return '电脑的桌面连接已中断，请重连（D4410）';
+  if(code===4411)return '授权服务暂未响应，请重连（D4411）';
+  if(code===4408||cause==='heartbeat')return '桌面连接响应超时，请重连（D4408）';
+  if(cause==='connect')return phase==='relay'?'连接中继超时，请重试（D4500）':'电脑桌面未响应，请重试（D4501）';
+  if(cause==='frame')return '桌面画面加载失败，请重试（D4502）';
+  if(code===4400||cause==='protocol')return '桌面连接数据异常，请重试（D4400）';
+  if(cause==='input')return '操作通道暂时拥塞，请重连（D4503）';
+  if(code===1006)return phase==='relay'?'无法建立中继连接，请重试（D1006）':'中继连接中断，请重试（D1006）';
+  return '连接已断开';
+}
 export function desktopTextKeys(text){return [...text].filter(c=>c!=='\r').map(c=>c==='\n'?0xff0d:c==='\t'?0xff09:0x01000000|c.codePointAt(0));}
 export function desktopViewport(w,h,fw,fh,zoom=1){
   const base=Math.min(w/fw,h/fh),scale=base*zoom,iw=fw*scale,ih=fh*scale,width=Math.max(w,iw),height=Math.max(h,ih);
@@ -8,7 +21,7 @@ export function desktopViewport(w,h,fw,fh,zoom=1){
 }
 export function mountDesktop({host,api,device,toast}){
   const root=document.createElement('section');root.className='desktop-root';host.replaceChildren(root);
-  root.innerHTML=`<div class="desktop-card"><span class="desktop-eyebrow">REMOTE DESKTOP</span><div class="desktop-emblem" aria-hidden="true">▱</div><h2>你的电脑，就在手边</h2><p>${esc(device.name)}</p><p class="muted">查看当前桌面，操作普通浏览器和应用。<br>使用工厂认证，仅限本机明确授权的账号。</p><button class="primary" data-d="connect">连接桌面</button><p class="desktop-note" data-note role="status">进入后默认仅查看，不会误触电脑。</p><details><summary>使用说明与隐私</summary><p>电脑需开机并登录桌面。连接时会共享当前主屏幕；退出、锁定手机或切到后台即断开，不重发输入。剪贴板与文件传输关闭。</p><p>首次需在电脑配置独立的 Desktop Agent。它不替换工厂或 Chrome 控制。当前版本不保证锁屏、UAC 提权窗口可操作。</p><a href="https://github.com/novnc/noVNC/tree/v1.7.0" target="_blank" rel="noopener noreferrer">noVNC 1.7.0 源码</a> · <a href="/vendor/DESKTOP-LICENSES.txt" target="_blank" rel="noopener noreferrer">开源许可</a></details></div>
+  root.innerHTML=`<div class="desktop-card"><span class="desktop-eyebrow">REMOTE DESKTOP</span><div class="desktop-emblem" aria-hidden="true">▱</div><h2>你的电脑，就在手边</h2><p>${esc(device.name)}</p><p class="muted">查看当前桌面，操作普通浏览器和应用。<br>使用工厂认证，仅限本机明确授权的账号。</p><button class="primary" data-d="connect">连接桌面</button><p class="desktop-note" data-note role="status">进入后默认仅查看，不会误触电脑。</p><details><summary>使用说明与隐私</summary><p>电脑需开机并登录桌面。连接时会共享当前主屏幕；退出、锁定手机或切到后台即断开。剪贴板与文件传输关闭。</p><p>首次需在电脑配置独立的 Desktop Agent。它不替换工厂或 Chrome 控制。当前版本不保证锁屏、UAC 提权窗口可操作。</p><a href="https://github.com/novnc/noVNC/tree/v1.7.0" target="_blank" rel="noopener noreferrer">noVNC 1.7.0 源码</a> · <a href="/vendor/DESKTOP-LICENSES.txt" target="_blank" rel="noopener noreferrer">开源许可</a></details></div>
   <section class="desktop-stage" hidden aria-label="远程电脑桌面"><header class="desktop-top"><button data-d="leave" aria-label="断开并返回">‹</button><div><b>${esc(device.name)}</b><small data-status role="status">正在连接</small></div><button data-d="control" aria-pressed="false">开始控制</button><button data-d="full" aria-label="全屏">⛶</button></header>
   <div class="desktop-workspace"><div class="desktop-scroll"><div class="desktop-canvas"></div></div><div class="desktop-pan" aria-label="拖动平移，双指缩放"></div><div class="desktop-cover"><span data-cover>正在连接桌面…</span><button data-d="retry" hidden>重新连接</button></div></div>
   <div class="desktop-info"><span data-hint>仅查看 · 拖动平移，双指缩放</span><span data-zoom>100%</span></div>
@@ -46,7 +59,7 @@ export function mountDesktop({host,api,device,toast}){
   function showFailure(text){connected=false;loading=false;mode='view';moving=true;cover.hidden=false;$('[data-cover]').textContent=text;$('[data-d="retry"]').hidden=false;setStatus('已断开');$('[data-note]').textContent=text;update();}
   async function connect(modeRequested='view'){
     const id=++epoch;await stop();if(destroyed||id!==epoch)return;
-    stage.hidden=false;document.documentElement.classList.add('desktop-open');loading=true;mode=modeRequested;moving=mode==='view';cover.hidden=false;$('[data-cover]').textContent='正在连接桌面…';$('[data-d="retry"]').hidden=true;setStatus('连接中');update();
+    stage.hidden=false;document.documentElement.classList.add('desktop-open');loading=true;mode=modeRequested;moving=mode==='view';cover.hidden=false;$('[data-cover]').textContent='正在连接中继…';$('[data-d="retry"]').hidden=true;setStatus('连接中');update();
     try{
       engine ||= await import('./vendor/desktop-engine.js');
       if(id!==epoch||destroyed)return;
@@ -57,15 +70,16 @@ export function mountDesktop({host,api,device,toast}){
       let failure='';
       const ch=new DesktopChannel(url,ticket.ticket,{control:m=>{
         if(id!==epoch||destroyed)return;
-        if(m.type==='ready'&&!m.agentOnline){failure='这台电脑尚未开启远程桌面';$('[data-cover]').textContent=failure;}
-        if(m.type==='stream-ready'){framebuffer={w:m.width,h:m.height};size();}
+        if(m.type==='ready'){$('[data-cover]').textContent=m.agentOnline?'等待电脑桌面…':'正在等待电脑的桌面服务…';}
+        if(m.type==='agent'&&m.online){failure='';$('[data-cover]').textContent='等待电脑桌面…';}
+        if(m.type==='stream-ready'){framebuffer={w:m.width,h:m.height};$('[data-cover]').textContent='正在加载画面…';size();}
         if(m.type==='error')failure=errors[m.code]||'电脑桌面暂不可用';
-      },ended:e=>{if(id===epoch&&!destroyed)showFailure(failure || (e.code===4409?'桌面已在另一页面连接，请先断开':e.code===4401?'授权已结束，请重新登录或连接':'连接已断开；输入不会重发'));}});
+      },ended:e=>{if(id===epoch&&!destroyed)showFailure(failure || desktopDisconnectMessage(e));}});
       channel=ch;canvas.replaceChildren();size();
       const current=new engine.RFB(canvas,ch,{shared:true});rfb=current;
       current.viewOnly=mode!=='control';current.resizeSession=false;current.scaleViewport=true;current.clipViewport=false;current.focusOnClick=false;current.background='#111f1a';
       current.addEventListener('connect',()=>{if(id!==epoch)return;connected=true;loading=false;cover.hidden=true;setStatus(mode==='control'?'正在控制 · 加密连接':'仅查看 · 加密连接');update();size();});
-      current.addEventListener('disconnect',()=>{if(id===epoch&&!destroyed){ch.close();showFailure(failure||'连接已断开；输入不会重发');}});
+      current.addEventListener('disconnect',()=>{if(id===epoch&&!destroyed){ch.close();showFailure(failure||desktopDisconnectMessage(ch.closeInfo));}});
       current.addEventListener('credentialsrequired',()=>ch.close());
     }catch(e){if(id===epoch&&!destroyed)showFailure(errors[e.message]||e.message);}
   }

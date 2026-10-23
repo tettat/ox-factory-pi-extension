@@ -7,9 +7,9 @@ import { openVnc } from './desktop-rfb.mjs';
 
 export async function runDesktopAgent({configFile,stateDir,signal,onStatus=()=>{}}){
   const unlock=lockProcess(join(stateDir,'agent.lock'));
-  let lastError=null;
+  let lastError=null,lastRelayClose=null;
   const diagnostic=e=>{lastError=/^DESKTOP_[A-Z0-9_-]+$/.test(String(e))?e:'DESKTOP_CONNECTION_ERROR';};
-  const status=value=>{writeJson(join(stateDir,'health.json'),{pid:process.pid,status:value,lastError,observedAt:Date.now()});onStatus(value);};
+  const status=value=>{writeJson(join(stateDir,'health.json'),{pid:process.pid,status:value,lastError,lastRelayClose,observedAt:Date.now()});onStatus(value);};
   const config=()=>readJson(configFile,null);
   let socket, stream=null, pendingPeer=null, delay=1000;
   const drop=()=>{pendingPeer=null;const old=stream;stream=null;old?.vnc?.close();};
@@ -25,7 +25,7 @@ export async function runDesktopAgent({configFile,stateDir,signal,onStatus=()=>{
         const l=config();if(!l?.enabled)throw Error();
         const c=readJson(l.connectorConfig,null);validateHubUrl(c.hub,c.allowInsecureLoopback);
         const r=await fetch(c.hub+'/connector/desktop-ticket',{method:'POST',headers:{authorization:'Bearer '+c.credential,'content-type':'application/json'},body:'{}',redirect:'error',signal:AbortSignal.timeout(12000)});
-        if(!r.ok)throw Error();
+        if(!r.ok)throw Error('DESKTOP_TICKET_HTTP_'+r.status);
         const t=await r.json(),u=new URL(t.relay);validateHubUrl(u.origin,c.allowInsecureLoopback);u.protocol=u.protocol==='https:'?'wss:':'ws:';u.pathname='/desktop';
         socket=new WebSocket(u,[DESKTOP_PROTOCOL,'t.'+t.ticket],{maxPayload:65572,handshakeTimeout:15000,perMessageDeflate:false});
         const ws=socket;let last=Date.now(),ready=false;
@@ -70,14 +70,14 @@ export async function runDesktopAgent({configFile,stateDir,signal,onStatus=()=>{
               if(ws.readyState===1){send({type:'ping'});if(ready)status(stream?'sharing':'connected');}
             }catch{drop();ws.terminate();}
           },5000);
-          ws.once('close',()=>{clearInterval(heartbeat);signal?.removeEventListener('abort',abort);drop();resolve();});
-          ws.on('error',()=>status('reconnecting'));
+          ws.once('close',code=>{clearInterval(heartbeat);signal?.removeEventListener('abort',abort);drop();lastRelayClose={code,at:Date.now()};status('reconnecting');resolve();});
+          ws.on('error',()=>{diagnostic('DESKTOP_RELAY_CONNECTION_ERROR');status('reconnecting');});
           ws.on('message',(raw,binary)=>{
             last=Date.now();
             try{
               if(binary){if(stream && raw.subarray(0,36).toString()===stream.peer)stream.vnc.feed(raw.subarray(36));return;}
               const m=JSON.parse(raw);
-              if(m.type==='ready'){ready=true;delay=1000;status('connected');}
+              if(m.type==='ready'){ready=true;delay=1000;lastError=null;status('connected');}
               else if(m.type==='peer')void begin(m);
               else if(m.type==='leave' && m.peer===pendingPeer)drop();
               else if(m.type==='ack' && stream && m.peer===stream.peer){
@@ -88,7 +88,7 @@ export async function runDesktopAgent({configFile,stateDir,signal,onStatus=()=>{
             }catch(e){diagnostic(e.message);if(pendingPeer)fail(pendingPeer);}
           });
         });
-      }catch{status('reconnecting');}
+      }catch(e){diagnostic(e.message);status('reconnecting');}
       finally{drop();socket?.close();}
       if(signal?.aborted)break;
       await new Promise(resolve=>{const timer=setTimeout(done,delay);function done(){clearTimeout(timer);signal?.removeEventListener('abort',done);resolve();}signal?.addEventListener('abort',done,{once:true});});

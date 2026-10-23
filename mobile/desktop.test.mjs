@@ -7,12 +7,47 @@ import { createBrowserTickets } from './browser-auth.mjs';
 import { DesktopRoom, desktopTicket, authorizeDesktop } from './desktop-relay-core.mjs';
 import { ServerFilter, ClientFilter, openVnc, RFB_BANNER, vncEncrypt } from './desktop-rfb.mjs';
 import { vncIni } from './desktop-cli.mjs';
-import { desktopTextKeys, desktopViewport } from './web/desktop.js';
+import { desktopTextKeys, desktopViewport, desktopDisconnectMessage } from './web/desktop.js';
+import { DesktopChannel } from './web/desktop-channel.js';
 function auth(){
   let time=Date.now();const state={devices:{device_desktop:{id:'device_desktop',credentialHash:'original',snapshot:{grants:{owner_desktop:'owner'}}}},sessions:{cookie:{id:'session',principalId:'owner_desktop',role:'owner',devices:['*'],expiresAt:time+1e8}}};
   const config={state,persist(){},now:()=>time,relay:'https://relay.example.com'},tickets=createDesktopTickets(config);
   return {state,tickets,advance:n=>time+=n,browser:createBrowserTickets(config),issue:mode=>({ticket:tickets.issue({kind:'phone',deviceId:'device_desktop',sessionId:'session',principalId:'owner_desktop',mode}).ticket,connectionId:randomUUID()})};
 }
+function channelFixture(t){
+  const Native=globalThis.WebSocket;
+  t.mock.timers.enable({apis:['setInterval','setTimeout','Date'],now:10000});
+  globalThis.WebSocket=class{
+    constructor(){this.readyState=0;this.bufferedAmount=0;this.sent=[];}
+    open(){this.readyState=1;this.onopen?.({});}
+    message(data){this.onmessage({data:typeof data==='object'?JSON.stringify(data):data});}
+    send(b){this.sent.push(b);}
+    close(code){this.closeCode=code;this.readyState=2;}
+    finish(code=this.closeCode){this.readyState=3;this.onclose({code});}
+  };
+  const ended=[],ch=new DesktopChannel('wss://relay.example.com/desktop','fixture',{ended:e=>ended.push(e)});
+  t.after(()=>{ch.close();ch.socket.finish(1000);globalThis.WebSocket=Native;});
+  return {ch,ws:ch.socket,ended};
+}
+test('desktop connection timeouts distinguish relay establishment from an unresponsive computer',t=>{
+  const {ch,ws,ended}=channelFixture(t);ws.open();ws.message({type:'ready',agentOnline:true});
+  t.mock.timers.tick(20000);ws.finish();assert.equal(ended[0].cause,'connect');assert.equal(ended[0].phase,'desktop');
+  assert.match(desktopDisconnectMessage(ended[0]),/电脑桌面未响应.*D4501/);
+  assert.match(desktopDisconnectMessage({cause:'connect',phase:'relay'}),/中继.*D4500/);
+  assert.equal(ch.readyState,3);
+});
+test('desktop close reasons survive the viewer disconnect callback without generic overwrites',t=>{
+  const {ch,ws,ended}=channelFixture(t);const messages=[];ch.onclose=()=>{ch.close();messages.push(desktopDisconnectMessage(ch.closeInfo));};
+  ws.open();ws.finish(4401);assert.match(messages[0],/授权已结束/);assert.equal(messages[0],desktopDisconnectMessage(ended[0]));
+  assert.equal(desktopDisconnectMessage(), '连接已断开');
+  for(const code of [1006,4400,4401,4408,4409,4410])assert.doesNotMatch(desktopDisconnectMessage({code}),/重发|重新发/);
+});
+test('desktop heartbeat timeout has an explicit reason, and closing discards queued input',async t=>{
+  const {ch,ws,ended}=channelFixture(t);ws.open();ws.message({type:'stream-ready'});
+  ch.send(new Uint8Array([1,2]));ch.close();ws.finish();await Promise.resolve();assert.equal(ws.sent.length,0);assert.equal(ch.inputs.length,0);
+  const other=new DesktopChannel('wss://relay.example.com/desktop','fixture',{ended:e=>ended.push(e)});other.socket.open();other.socket.message({type:'stream-ready'});
+  t.mock.timers.tick(30000);other.socket.finish();assert.equal(ended[1].cause,'heartbeat');assert.match(desktopDisconnectMessage(ended[1]),/D4408/);
+});
 test('desktop text entry uses Unicode keysyms even for spaces/ASCII rather than the PC IME',()=>{
   assert.deepEqual(desktopTextKeys('A 中\r\n\t'),[0x01000041,0x01000020,0x01004e2d,0xff0d,0xff09]);
 });
@@ -43,6 +78,11 @@ test('desktop authorizer never follows ticket redirects and rejects browser clai
   await assert.rejects(authorizeDesktop('https://hub.example.com','ticket',randomUUID(),async(url,init)=>{assert.equal(init.redirect,'manual');return new Response('',{status:302});}),/AUTH_FAILED/);
   const id=randomUUID();await assert.rejects(authorizeDesktop('https://hub.example.com','ticket',id,async()=>Response.json({kind:'phone',deviceId:'device_desktop',connectionId:id,leaseUntil:Date.now()+30000})),/AUTH_FAILED/);
 });
+test('desktop authorizer distinguishes transient transport/provider failures from rejected credentials',async()=>{
+  for(const status of [408,429,500,503])await assert.rejects(authorizeDesktop('https://hub.example.com','ticket',randomUUID(),async()=>new Response('',{status})),e=>e.temporary===true);
+  for(const status of [301,400,401,403])await assert.rejects(authorizeDesktop('https://hub.example.com','ticket',randomUUID(),async()=>new Response('',{status})),e=>e.temporary===false);
+  await assert.rejects(authorizeDesktop('https://hub.example.com','ticket',randomUUID(),async()=>{throw Error('private upstream URL');}),e=>e.temporary===true&&!e.message.includes('private'));
+});
 function roomFixture(){
   let time=1000;const peers=[],room=new DesktopRoom({hub:'https://hub.example.com',peers:()=>peers,save(){},now:()=>time,authorize:async()=>{throw Error('revoked');}});
   function make(kind){const p={meta:{audience:'desktop',kind,deviceId:'device_desktop',connectionId:randomUUID(),principalId:'owner_desktop',role:kind==='phone'?'owner':'agent',mode:kind==='phone'?'view':null,leaseUntil:31000,expiresAt:1e6},ws:{readyState:1,output:[],send(m){this.output.push(typeof m==='string'?JSON.parse(m):Buffer.from(m));},close(code){this.readyState=3;this.code=code;}}};peers.push(p);return p;}
@@ -62,6 +102,32 @@ test('desktop relay separates peers, drops late frames and refuses silent takeov
 test('desktop relay expires revoked leases and limits oversized frames',async()=>{
   const f=roomFixture(),agent=f.make('agent'),phone=f.make('phone');f.room.connect(agent);f.room.connect(phone);f.advance(17000);await f.room.maintain();assert.equal(phone.ws.code,4401);assert.equal(agent.ws.code,4401);
   const g=roomFixture(),p=g.make('phone');g.room.connect(p);g.room.receive(p,new Uint8Array(65573));assert.equal(p.ws.code,4400);
+});
+test('dead desktop sockets cannot stay online or block reconnect just because authorization renews',async()=>{
+  const f=roomFixture(),agent=f.make('agent');f.room.connect(agent);agent.meta.leaseUntil=100000;
+  f.advance(31000);assert.equal(f.room.active('agent'),undefined);
+  const replacement=f.make('agent');replacement.meta.leaseUntil=100000;
+  assert.equal(f.room.connect(replacement),true);assert.equal(agent.ws.code,4408);assert.equal(f.room.active('agent'),replacement);
+  const phone=f.make('phone');phone.meta.leaseUntil=100000;f.room.connect(phone);
+  f.advance(20000);f.room.receive(phone,JSON.stringify({type:'ping'}));
+  f.advance(11000);await f.room.maintain();
+  assert.equal(replacement.ws.code,4408);assert.equal(phone.ws.code,4410);
+});
+test('previous-release desktop sockets use actual message activity, not renewed leases, for liveness',()=>{
+  const f=roomFixture(),old=f.make('agent');old.meta.rate={at:1000,n:1,bytes:15};old.meta.leaseUntil=100000;
+  assert.equal(f.room.active('agent'),old);f.advance(31000);assert.equal(f.room.active('agent'),undefined);
+  const next=f.make('agent');next.meta.leaseUntil=100000;assert.equal(f.room.connect(next),true);assert.equal(old.ws.code,4408);
+  const another=f.make('agent');another.meta.leaseUntil=100000;assert.equal(f.room.connect(another),false);assert.equal(another.ws.code,4409);
+});
+test('temporary authorization failure can recover inside the existing lease, never extending it locally',async()=>{
+  const f=roomFixture(),p=f.make('phone');f.room.connect(p);let attempts=0;
+  f.room.authorize=async()=>{if(++attempts===1)throw Object.assign(Error('upstream busy'),{temporary:true});return {...p.meta,leaseUntil:46000};};
+  f.advance(11000);await f.room.maintain();assert.equal(p.ws.readyState,1);assert.equal(p.meta.leaseUntil,31000);assert.equal(p.meta.authTemporary,true);
+  f.advance(5000);await f.room.maintain();assert.equal(p.ws.readyState,1);assert.equal(p.meta.leaseUntil,46000);assert.equal(p.meta.authTemporary,undefined);
+});
+test('exhausted authorization retries fail closed at the original lease deadline',async()=>{
+  const f=roomFixture(),p=f.make('phone');f.room.connect(p);f.room.authorize=async()=>{throw Object.assign(Error('timeout'),{temporary:true});};
+  f.advance(11000);await f.room.maintain();f.advance(19000);await f.room.maintain();assert.equal(p.ws.code,4411);assert.equal(p.meta.leaseUntil,31000);assert.equal(f.room.active('phone'),undefined);
 });
 const key=(n,down=true)=>{const b=Buffer.alloc(8);b[0]=4;b[1]=Number(down);b.writeUInt32BE(n,4);return b;};
 test('local RFB filter blocks view-only input independently of noVNC UI and releases held input',()=>{

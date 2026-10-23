@@ -1,6 +1,6 @@
 import { renderMarkdown } from './markdown.js';
 // Pure presentation helpers. No network, credentials, DOM writes or raw HTML input.
-export const VERSION = '0.7.0';
+export const VERSION = '0.7.1';
 export const labels = { idle: '空闲', busy: '忙碌', running: '执行中', queued: '排队中', pending: '等待接管', processing: '接管中', accepted: '已接管', reported: '已回传', done: '完成', completed: '完成', succeeded: '完成', failed: '失败', cancelled: '已取消', offline: '离线', vacation: '休假', TODO: '待开始' };
 export const roles = { owner: '所有者', operator: '操作员', viewer: '只读' };
 export const actions = { 'talk.send': '员工对话', 'task.assign': '派发任务', 'task.create': '创建看板任务', 'task.update': '更新看板任务', 'image.upload': '上传图片' };
