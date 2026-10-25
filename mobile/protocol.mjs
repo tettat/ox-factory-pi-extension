@@ -3,7 +3,7 @@ import { createHash, randomBytes } from 'node:crypto';
 export const VERSION = 1;
 export const ROLES = ['viewer', 'operator', 'owner'];
 export const ACTIONS = {
-  'worker.detail': { fields: ['worker', 'readHistory'], role: 'viewer' },
+  'worker.detail': { fields: ['worker', 'readHistory', 'preview'], role: 'viewer' },
   'job.detail': { fields: ['jobId', 'readHistory'], role: 'viewer' },
   'image.read': { fields: ['worker', 'attachmentId'], role: 'viewer' },
   'tasks.list': { fields: [], role: 'viewer' },
@@ -45,6 +45,10 @@ export function validateAction(action, body) {
   if (!Object.hasOwn(ACTIONS, action)) throw new Fault('UNKNOWN_ACTION');
   fields(body, ACTIONS[action].fields);
   const out = {};
+  if (Object.hasOwn(body, 'preview')) {
+    if (typeof body.preview !== 'boolean' || body.preview && body.readHistory) throw new Fault('INVALID_PREVIEW');
+    out.preview = body.preview;
+  }
   if (Object.hasOwn(body, 'readHistory')) {
     if (typeof body.readHistory !== 'boolean') throw new Fault('INVALID_READ_HISTORY');
     out.readHistory = body.readHistory;
@@ -97,6 +101,7 @@ export function validateAction(action, body) {
   }
   return out;
 }
+export const commandPriority = c => c.background ? 2 : ACTIONS[c.action]?.role === 'viewer' || ACTIONS[c.action]?.transient ? 1 : 0;
 export function commandDigest(action, body) { return hash(JSON.stringify([action, body])); }
 export function safeError(error) {
   if (error?.code === 'FACTORY_TASK_REVISION_CONFLICT') return 'TASK_REVISION_CONFLICT';

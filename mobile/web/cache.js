@@ -12,6 +12,9 @@ export function mergeConversation(old = {}, next = {}) {
     const entries = new Map((old[key] || []).filter(x => x?.id).map(x => [x.id, x]));
     for (const entry of next[key] || []) if (entry?.id) {
       const previous = entries.get(entry.id);
+      // A delayed disk/network snapshot must never resurrect a finished run.
+      const ended = value => ['done', 'failed', 'aborted', 'stale', 'cancelled', 'completed'].includes(value);
+      if (key === 'jobs' && previous && (ended(previous.status) && !ended(entry.status) || previous.updatedAt && entry.updatedAt && Date.parse(previous.updatedAt) > Date.parse(entry.updatedAt))) continue;
       const merged = { ...previous, ...entry };
       // Summary-only historical rows must not replace a full reply already read.
       if (previous?.reply && entry.reply === entry.summary && previous.updatedAt === entry.updatedAt) merged.reply = previous.reply;

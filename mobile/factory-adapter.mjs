@@ -95,7 +95,7 @@ export function createFactoryAdapter({ workersDir, stateDir, factoryUrl = 'http:
     let projects = [], projectsAvailable = true, projectsTruncated = false;
     try { const all = listStoredProjects(workersDir); projects = all.slice(0, 200).map(p => projectView(p)); projectsTruncated = all.length > 200; }
     catch { projectsAvailable = false; } // A broken project index must not take employee messaging offline.
-    return { protocolVersion: 1, observedAt, reachable: true, workers: ws, usageDate: localDate(now()), capabilities: ['usage.read', 'worker-activity-v1', 'project.detail', 'project.doc', 'read-sync-v1', 'read-history-v1'], projects, projectsAvailable, projectsTruncated,
+    return { protocolVersion: 1, observedAt, reachable: true, workers: ws, usageDate: localDate(now()), capabilities: ['usage.read', 'worker-activity-v1', 'project.detail', 'project.doc', 'read-sync-v1', 'read-history-v1', 'conversation-preview-v1'], projects, projectsAvailable, projectsTruncated,
       jobs: listJobs(workersDir, { limit: 100 }).filter(j => allowed.has(j.worker)).map(jobView),
       tasks: listFactoryTasks(workersDir, { limit: 200 }).map(taskView),
       requests: listWorkerTaskRequests(workersDir, { limit: 100 }).map(requestView),
@@ -154,9 +154,9 @@ export function createFactoryAdapter({ workersDir, stateDir, factoryUrl = 'http:
     if (command.action === 'worker.detail') {
       const allJobs = jobs().filter(j => j.worker === worker.id), allMessages = listMessages(workersDir, { worker: worker.id, includeSent: true, limit: body.readHistory ? 100000 : 100 });
       const historyRead = history(allJobs, allMessages, worker.id), js = allJobs.slice(-30), ms = allMessages.slice(-100);
-      const reads = capture(js, ms, worker.id);
+      const reads = body.preview ? { jobStates: new Map(), messageStates: new Map() } : capture(js, ms, worker.id);
       return {
-        worker, historyRead, jobs: js.map((j, i, all) => ({ ...jobView(j), readState: reads.jobStates.get(j.id), ...(['running', 'queued'].includes(j.status) ? { publicConversation: readPublicConversation(j) } : {}), reply: i >= all.length - 10 ? reply(j) : text(j.summary) })),
+        worker, historyRead, jobs: js.map((j, i, all) => ({ ...jobView(j), readState: reads.jobStates.get(j.id), ...(['running', 'queued'].includes(j.status) ? { publicConversation: body.preview ? readPublicConversation(j).slice(-12) : readPublicConversation(j) } : {}), reply: i >= all.length - 10 ? reply(j) : text(j.summary) })),
         talkRequests: listWebTalkRequests(workersDir, { worker: worker.id, limit: 100 }).map(requestView),
         requests: listWorkerTaskRequests(workersDir, { to: worker.id, limit: 100 }).map(requestView),
         messages: ms.map(m => ({ ...pick(m, ['id', 'from', 'to', 'createdAt', 'read']), readState: reads.messageStates.get(m.id), content: text(m.content) })),

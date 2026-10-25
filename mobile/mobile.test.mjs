@@ -359,3 +359,36 @@ test('opening phone details returns one batch for all history, including message
   assert.ok(listMessages(f.workersDir, { worker: '测试员工', limit: 100000 }).every(m => m.read));
   assert.equal((await f.request('/api/state', undefined, f.owner)).data.commands.some(c => c.action === 'read.mark'), false);
 });
+
+test('background preview is read-only, never signs read proofs, and is bounded across phones', async t => {
+  const f = await fixture(t, { maxLeasedCommands: 1 });
+  const job = createJob(f.workersDir, { worker: '测试员工', task: 'fixture', cwd: f.root });
+  appendJobEvent(job, { type: 'text', text: 'reply' }); updateJob(job, { status: 'done', fullOutput: 'reply' });
+  const background = { ...f.envelope('worker.detail', { worker: '测试员工', preview: true }), background: true };
+  assert.equal((await f.request('/api/commands', background, f.owner)).status, 202);
+  const invite = await f.request('/api/pairings', { role: 'viewer', devices: [f.deviceId] }, f.owner), other = await f.login(invite.data.code);
+  assert.equal((await f.request('/api/commands', { ...background, id: randomUUID() }, other)).status, 429);
+  const foreground = f.envelope('tasks.list', {});
+  assert.equal((await f.request('/api/commands', foreground, f.owner)).status, 202);
+  const first = await f.connector.cycle(); assert.equal(first.commands[0].id, foreground.id);
+  await f.connector.cycle(); await f.connector.cycle();
+  const result = (await f.request('/api/commands/' + background.id, undefined, f.owner)).data.command.result;
+  assert.ok(result.ok); assert.equal(result.data.historyRead, null);
+  assert.equal(result.data.jobs[0].readState, undefined); assert.equal(result.data.jobs[0].reply, 'reply');
+  assert.throws(() => validateAction('worker.detail', { worker: '测试员工', preview: true, readHistory: true }));
+  assert.equal((await f.request('/api/commands', { ...f.envelope('talk.send', { worker: '测试员工', message: 'must reject' }), background: true }, f.owner)).status, 400);
+  assert.equal((await f.request('/api/commands', { ...f.envelope('worker.detail', { worker: '测试员工', readHistory: true }), background: true }, f.owner)).status, 400);
+});
+
+test('writes leapfrog queued speculative reads; expired receipt cleanup cannot alter another device', async t => {
+  const f = await fixture(t, { maxLeasedCommands: 1 });
+  const background = { ...f.envelope('worker.detail', { worker: '测试员工', preview: true }), background: true };
+  await f.request('/api/commands', background, f.owner);
+  const send = f.envelope('talk.send', { worker: '测试员工', message: 'isolated priority fixture' });
+  await f.request('/api/commands', send, f.owner);
+  assert.equal((await f.connector.cycle()).commands[0].id, send.id);
+  const orphan = { id: randomUUID(), digest: 'old', deliveryToken: 'old', ok: true };
+  const res = await f.request('/connector/sync', { version: 1, results: [orphan] }, null, { authorization: 'Bearer ' + f.secret });
+  assert.ok(res.data.acknowledgements.includes(orphan.id));
+  assert.equal(f.h.state.commands[background.id].result, undefined);
+});

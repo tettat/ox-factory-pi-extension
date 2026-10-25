@@ -5,7 +5,7 @@ import { createServer } from 'node:http';
 import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { ACTIONS, VERSION, Fault, at, fields, hash, id, roleAllows, string, token, validateAction, commandDigest, ROLES } from './protocol.mjs';
+import { ACTIONS, VERSION, Fault, at, fields, hash, id, roleAllows, string, token, validateAction, commandDigest, ROLES, commandPriority } from './protocol.mjs';
 import { readJson, writeJson } from './store.mjs';
 import { createPushCoordinator, validateSubscription } from './push.mjs';
 import { browserGateway } from './netlify-proxy.mjs';
@@ -158,7 +158,10 @@ export function createMobileHub({ stateFile, stateStore = null, origin, browserO
         for (const r of b.results) {
           fields(r, ['id', 'deliveryToken', 'digest', 'ok', 'data', 'error']);
           const c = state.commands[r.id];
-          if (!c || c.deviceId !== d.id || c.deliveryToken !== r.deliveryToken || c.digest !== r.digest || typeof r.ok !== 'boolean') continue;
+          // An expired/pruned command has no consumer; retire only this device's
+          // orphan receipt so it cannot occupy the first outbox batch forever.
+          if (!c) { if (typeof r.id === 'string' && /^[a-zA-Z0-9_-]{8,100}$/.test(r.id)) acknowledgements.push(r.id); continue; }
+          if (c.deviceId !== d.id || c.deliveryToken !== r.deliveryToken || c.digest !== r.digest || typeof r.ok !== 'boolean') continue;
           if (c.state === 'delivering') {
             c.state = r.ok ? 'done' : 'failed'; c.finishedAt = at();
             c.result = r.ok ? { ok: true, data: r.data } : { ok: false, error: /^[A-Z0-9_]{1,100}$/.test(r.error) ? r.error : 'FACTORY_OPERATION_FAILED' };
@@ -169,7 +172,7 @@ export function createMobileHub({ stateFile, stateStore = null, origin, browserO
         }
         if (finishStale()) dirty = true;
         const commands = [];
-        for (const c of Object.values(state.commands)) {
+        for (const c of Object.values(state.commands).sort((a, b) => commandPriority(a) - commandPriority(b) || String(a.createdAt).localeCompare(String(b.createdAt)))) {
           if (commands.length >= maxLeasedCommands) break;
           if (d.snapshot?.reachable && activeCommand(c, d) && (c.state === 'queued' || (c.state === 'delivering' && now() - c.leasedAt > 10000))) {
             c.state = 'delivering'; c.leasedAt = now(); dirty = true;
@@ -255,9 +258,10 @@ export function createMobileHub({ stateFile, stateStore = null, origin, browserO
         return send(res, 200, { generatedAt: at(), devices, commands: Object.values(state.commands).filter(c => c.sessionId === s.id && ACTIONS[c.action].role !== 'viewer' && !ACTIONS[c.action].transient && canSee(s, state.devices[c.deviceId])).slice(-80).map(publicCommand) });
       }
       if (req.method === 'POST' && path === '/api/commands') {
-        const b = await body(req); fields(b, ['id', 'deviceId', 'action', 'body', 'createdAt']);
+        const b = await body(req); fields(b, ['id', 'deviceId', 'action', 'body', 'createdAt', 'background']);
         id(b.id); id(b.deviceId);
         const payload = validateAction(b.action, b.body), digest = commandDigest(b.action, payload);
+        if (b.background !== undefined && (typeof b.background !== 'boolean' || b.action !== 'worker.detail' || b.background && payload.readHistory)) throw new Fault('INVALID_BACKGROUND_READ');
         if (!roleAllows(s.role, ACTIONS[b.action].role)) throw new Fault('ROLE_DENIED', 403);
         const d = state.devices[b.deviceId];
         if (!canSee(s, d) || !roleAllows(d.snapshot.grants[s.principalId], ACTIONS[b.action].role)) throw new Fault('DEVICE_SCOPE_DENIED', 403);
@@ -269,8 +273,11 @@ export function createMobileHub({ stateFile, stateStore = null, origin, browserO
         if (now() - d.lastSeenAt >= 20000 || !d.snapshot?.reachable) throw new Fault('DEVICE_OFFLINE', 503);
         if (!Number.isFinite(b.createdAt) || Math.abs(now() - b.createdAt) > 600000) throw new Fault('REQUEST_CLOCK_OR_EXPIRY', 409);
         if (Object.values(state.commands).filter(c => c.sessionId === s.id && ['queued', 'delivering'].includes(c.state)).length >= 10) throw new Fault('TOO_MANY_PENDING', 429);
+        // One speculative read per factory across ALL phones. Sends and explicit
+        // reads use the normal queue and take priority at the next lease.
+        if (b.background && Object.values(state.commands).some(c => c.deviceId === d.id && c.background && ['queued', 'delivering'].includes(c.state) && activeCommand(c, d))) throw new Fault('BACKGROUND_BUSY', 429);
         if (Object.keys(state.commands).length >= 10000) throw new Fault('HUB_RETENTION_LIMIT', 503);
-        const c = { id: b.id, deviceId: d.id, principalId: s.principalId, sessionId: s.id, role: s.role, action: b.action, body: payload, digest,
+        const c = { id: b.id, deviceId: d.id, principalId: s.principalId, sessionId: s.id, role: s.role, action: b.action, body: payload, digest, ...(b.background ? { background: true } : {}),
           createdAt: at(), expiresAt: now() + 120000, deliveryToken: token(), state: 'queued' };
         state.commands[c.id] = c; audit('command.accepted', { id: c.id, action: c.action, deviceId: d.id, sessionId: s.id }); persist();
         return send(res, 202, { command: publicCommand(c) });

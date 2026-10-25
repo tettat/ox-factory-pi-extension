@@ -24,3 +24,12 @@ test('restricted storage reports a failure rather than pretending the conversati
   await assert.rejects(cache.load('k'), /LOCAL_CACHE_UNAVAILABLE/);
   await assert.rejects(cache.clear(), /LOCAL_CACHE_UNAVAILABLE/);
 });
+
+test('late running snapshots cannot overwrite a completed reply or newer job revision', () => {
+  const old = { jobs: [{ id: 'j', status: 'done', reply: 'final', updatedAt: '2026-10-26' }] };
+  for (const updatedAt of ['2026-10-25', '2026-10-27', undefined]) {
+    const merged = mergeConversation(old, { jobs: [{ id: 'j', status: 'running', reply: 'process', updatedAt }] });
+    assert.equal(merged.jobs[0].status, 'done'); assert.equal(merged.jobs[0].reply, 'final');
+  }
+  assert.equal(mergeConversation(old, { jobs: [{ id: 'j', status: 'done', reply: 'old', updatedAt: '2026-10-25' }] }).jobs[0].reply, 'final');
+});

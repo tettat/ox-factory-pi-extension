@@ -389,14 +389,14 @@ function prefetchContext() {
   const c = context();
   c.disk = new Map(); c.calls = [];
   c.readConversation = async (action, body, options) => {
-    c.calls.push({ action, worker: body.worker, deviceId: options.deviceId });
+    c.calls.push({ action, worker: body.worker, deviceId: options.deviceId, body, background: options.background });
     return action === 'read.mark' ? { acknowledged: ['history-a'] } : {
       messages: [{ id: 'reply-' + body.worker, content: 'new content' }],
-      historyRead: { unread: true, token: 'fixture-proof', revision: 'history-a' },
+      historyRead: options.background ? null : { unread: true, token: 'fixture-proof', revision: 'history-a' },
     };
   };
   vm.runInContext(`me = { id: 'prefetch-session', principalId: 'owner' }; selected = 'device-a'; openedWorker = '';
-    state = { devices: [{ id: 'device-a', online: true, role: 'owner', snapshot: { capabilities: ['read-history-v1'], workers: [{ id: 'worker-a', status: 'idle', unreadCount: 1 }] } }], commands: [] };
+    state = { devices: [{ id: 'device-a', online: true, role: 'owner', snapshot: { capabilities: ['read-history-v1', 'conversation-preview-v1'], workers: [{ id: 'worker-a', status: 'idle', unreadCount: 1 }] } }], commands: [] };
     renderTimeline = () => {}; cacheUnavailable = () => {};
     conversationCache.load = async key => disk.get(key) || null;
     conversationCache.save = async (key, data, metadata) => { disk.set(key, { data: Cache.cleanConversation(data), ...metadata, updatedAt: Date.now() }); };
@@ -423,13 +423,15 @@ test('opening a prefetched conversation displays cached content and only then ac
   assert.equal(c.calls.length, 1);
   await vm.runInContext("openedWorker = 'worker-a'; refreshDetail({ ifStale: true })", c); await settlePrefetch();
   assert.equal(vm.runInContext('detail.messages[0].content', c), 'new content');
-  assert.deepEqual(c.calls.map(x => x.action), ['worker.detail', 'read.mark']);
+  assert.deepEqual(c.calls.map(x => x.action), ['worker.detail', 'worker.detail', 'read.mark']);
 });
 
-test('backgrounded pages prefetch all devices without acknowledging even the open conversation', async () => {
+test('backgrounded pages warm devices serially and never acknowledge unopened conversations', async () => {
   const c = prefetchContext();
-  vm.runInContext("document.hidden = true; openedWorker = 'worker-a'; state.devices.push({ ...state.devices[0], id: 'device-b' }); prefetchConversations();", c);
+  vm.runInContext("document.hidden = true; state.devices.push({ ...state.devices[0], id: 'device-b' }); prefetchConversations();", c);
   await settlePrefetch();
+  assert.equal(c.calls.length, 1);
+  vm.runInContext('prefetchNextAt = 0; prefetchConversations();', c); await settlePrefetch();
   assert.deepEqual(c.calls.map(x => x.action), ['worker.detail', 'worker.detail']);
   assert.deepEqual(c.calls.map(x => x.deviceId), ['device-a', 'device-b']);
   assert.equal(c.disk.size, 2);
@@ -439,11 +441,11 @@ test('background concurrency is bounded and opening an in-flight prefetch shares
   const c = prefetchContext(), finish = [];
   c.readConversation = (action, body, options) => { c.calls.push({ action, ...body, deviceId: options.deviceId }); return new Promise(resolve => finish.push(resolve)); };
   vm.runInContext("runCommand = readConversation; state.devices[0].snapshot.workers = Array.from({ length: 5 }, (_, i) => ({ id: 'w' + i, unreadCount: 1 })); prefetchConversations();", c);
-  await settlePrefetch(); assert.equal(c.calls.length, 2);
+  await settlePrefetch(); assert.equal(c.calls.length, 1);
   vm.runInContext("openedWorker = 'w0';", c); const opened = vm.runInContext('refreshDetail()', c);
-  assert.equal(c.calls.length, 2);
+  assert.equal(c.calls.length, 1);
   vm.runInContext('state.devices[0].snapshot.workers = [];', c);
-  finish[0]({ messages: [{ id: 'm', content: 'first prefetched result' }] }); finish[1]({});
+  finish[0]({ messages: [{ id: 'm', content: 'first prefetched result' }] });
   await opened; await settlePrefetch();
   assert.equal(vm.runInContext('detail.messages[0].content', c), 'first prefetched result');
   assert.equal(vm.runInContext('prefetchTasks.size', c), 0);
@@ -455,6 +457,8 @@ test('a new revision arriving during prefetch is fetched afterwards instead of b
   vm.runInContext('runCommand = readConversation; prefetchConversations();', c); await settlePrefetch();
   vm.runInContext("state.devices[0].snapshot.workers[0].lastInteractionAt = '2026-10-25';", c);
   finish({ messages: [{ id: 'old', content: 'first revision' }] }); await settlePrefetch();
+  assert.equal(c.calls.length, 1);
+  vm.runInContext('prefetchNextAt = 0; prefetchConversations();', c); await settlePrefetch();
   assert.equal(c.calls.length, 2); assert.equal(c.disk.values().next().value.data.messages.length, 2);
 });
 
@@ -467,12 +471,12 @@ test('disk revisions survive a page reload and unchanged snapshots do not downlo
   assert.equal(next.calls.length, 1);
 });
 
-test('background read failures are quiet, retain cache, and back off without blocking other conversations', async () => {
+test('background read failures are quiet, retain cache, and cool down before retrying', async () => {
   const c = prefetchContext(); c.readConversation = async () => { c.calls.push('failed'); throw Error('offline fixture'); };
   vm.runInContext("runCommand = readConversation; $('#toast').textContent = 'unchanged'; prefetchConversations();", c); await settlePrefetch();
   vm.runInContext('prefetchConversations();', c); await settlePrefetch();
   assert.equal(c.calls.length, 1); assert.equal(vm.runInContext("$('#toast').textContent", c), 'unchanged');
-  vm.runInContext('for (const value of prefetchRecords.values()) { value.retryAt = 0; value.attemptAt = 0; } prefetchConversations();', c); await settlePrefetch();
+  vm.runInContext('for (const value of prefetchRecords.values()) { value.retryAt = 0; value.attemptAt = 0; } prefetchNextAt = 0; prefetchConversations();', c); await settlePrefetch();
   assert.equal(c.calls.length, 2);
 });
 
@@ -514,4 +518,23 @@ test('outgoing deliveries get priority over speculative conversation reads', asy
   assert.equal(c.calls.length, 0);
   vm.runInContext('deliveryTasks.clear(); prefetchConversations();', c); await settlePrefetch();
   assert.equal(c.calls.length, 1);
+});
+
+test('speculative reads use preview without history proofs and yield completely to an open chat', async () => {
+  const c = prefetchContext();
+  vm.runInContext("openedWorker = 'worker-a'; prefetchConversations();", c); await settlePrefetch();
+  assert.equal(c.calls.length, 0);
+  vm.runInContext("openedWorker = ''; prefetchConversations();", c); await settlePrefetch();
+  assert.equal(c.calls.length, 1); assert.equal(c.calls[0].body.preview, true);
+  assert.equal(c.calls[0].background, true); assert.equal(c.calls[0].body.readHistory, undefined);
+  vm.runInContext("state.devices[0].snapshot.workers.push({ id: 'worker-b', unreadCount: 1 }); prefetchConversations();", c); await settlePrefetch();
+  assert.equal(c.calls.length, 1, 'The next employee must wait for the global cooldown');
+});
+
+test('stale running content cannot show the success check when the directory already reports completion', () => {
+  const c = readingContext();
+  vm.runInContext("detail = { jobs: [{ id: 'j', status: 'running', updatedAt: '2026-01-01' }] }; lastDetailAt = Date.now(); state.devices[0].snapshot = { jobs: [{ id: 'j', worker: 'worker-a', status: 'done', updatedAt: '2026-01-02' }] }; syncDetailReadIndicator();", c);
+  assert.equal(readPhase(c), 'loading');
+  vm.runInContext("detail.jobs[0] = { id: 'j', status: 'done', updatedAt: '2026-01-02', reply: 'final' }; syncDetailReadIndicator();", c);
+  assert.equal(readPhase(c), 'ready');
 });

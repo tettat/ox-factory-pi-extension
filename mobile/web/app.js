@@ -37,6 +37,7 @@ let outgoing = UI.outgoingState(UI.json(sessionStore, 'ox-outgoing', {}));
 const deliveryTasks = new Map(), deliveryFiles = new Map(), detailCache = new Map(), detailReads = new Set(), usageCache = new Map(), usageReads = new Set();
 const detailErrors = new Map();
 const detailFlights = new Map(), prefetchTasks = new Set(), prefetchRecords = new Map(), hydratedConversations = new Set();
+let prefetchNextAt = 0;
 const readFlights = new Set(), readFailures = new Map(), readOverrides = new Map();
 const conversationCache = Cache.createConversationCache(); let cacheEpoch = 0, cacheWarned = false;
 const cacheKey = (worker = openedWorker, deviceId = selected, principal = me?.principalId) => principal ? Cache.conversationKey(principal, deviceId, worker) : '';
@@ -76,7 +77,7 @@ function clearPrivateBrowserState() {
   outgoing = {}; for (const items of deliveryFiles.values()) for (const item of items) URL.revokeObjectURL(item.url);
   deliveryFiles.clear(); detailCache.clear(); detailErrors.clear(); usageCache.clear();
   cacheEpoch++; historyReadItem = null; readFailures.clear(); readOverrides.clear();
-  prefetchRecords.clear(); hydratedConversations.clear();
+  prefetchRecords.clear(); hydratedConversations.clear(); prefetchNextAt = 0;
   projectCache.clear(); projectErrors.clear(); openedProject = ''; taskScope = null;
   settingsEpoch++; copiedText.clear(); draftMemory.clear(); notified.clear(); notificationBaseline = false; cleanupAttachments(); closeModal();
 }
@@ -160,7 +161,7 @@ async function refresh({ force = false } = {}) {
   } catch (error) { connection(); if (force) toast(error.message); }
   finally { polling = false; connection(); }
 }
-async function runCommand(action, body, { retry = null, deviceId = selected, onProgress = () => {}, isCurrent = () => true } = {}) {
+async function runCommand(action, body, { retry = null, deviceId = selected, onProgress = () => {}, isCurrent = () => true, background = false } = {}) {
   const session = me;
   const guard = () => { if (me !== session || !isCurrent()) throw Object.assign(Error('手机会话已切换，原操作不再继续'), { code: 'SESSION_CHANGED' }); };
   guard();
@@ -171,15 +172,16 @@ async function runCommand(action, body, { retry = null, deviceId = selected, onP
   if (!envelope) {
     const inFlight = Object.values(pending).find(p => p.envelope.deviceId === targetId && p.envelope.action === action && p.envelope.body.worker === body.worker);
     if (inFlight && ACTION_WRITE(action)) throw Error('上一条同类操作尚待确认，请先到动态页查看原请求');
-    envelope = { id: crypto.randomUUID(), deviceId: targetId, action, body, createdAt: Date.now() };
+    envelope = { id: crypto.randomUUID(), deviceId: targetId, action, body, createdAt: Date.now(), ...(background && action === 'worker.detail' ? { background: true } : {}) };
   }
   if (ACTION_WRITE(action) && action !== 'image.upload') { pending[envelope.id] = { signature, envelope }; savePending(); }
   onProgress('正在发送到中转…'); let response;
   try { response = await api('/api/commands', envelope); }
   catch (error) { if (error.code && !['INTERNAL_ERROR', 'HUB_UNAVAILABLE'].includes(error.code)) { delete pending[envelope.id]; savePending(); } throw error; }
   guard(); let command = response.command; onProgress('中转已接收，等待工厂确认…');
-  for (let i = 0; !['done', 'failed'].includes(command.state) && i < 25; i++) {
-    await new Promise(resolve => setTimeout(resolve, 800));
+  const deadline = Date.now() + 90000;
+  for (let i = 0; !['done', 'failed'].includes(command.state) && i < (background ? 45 : 25) && Date.now() < deadline; i++) {
+    await new Promise(resolve => setTimeout(resolve, background ? 2000 : 800));
     guard();
     command = (await api(`/api/commands/${encodeURIComponent(envelope.id)}`)).command;
     guard();
@@ -548,11 +550,12 @@ function syncDetailReadIndicator() {
   const node = $('#chat-read-status'); if (!node || !openedWorker) return;
   const key = JSON.stringify([me?.id, selected, openedWorker]), loading = detailReads.has(key), error = detailErrors.get(key);
   const paused = !online || !device()?.online || Boolean(backendIssue);
-  const phase = loading ? 'loading' : error ? 'error' : paused ? 'paused' : lastDetailAt ? 'ready' : 'idle';
+  const behind = detail && Prefetch.detailBehindSnapshot(detail, device(), openedWorker);
+  const phase = loading ? 'loading' : error ? 'error' : paused ? 'paused' : behind ? 'loading' : lastDetailAt ? 'ready' : 'idle';
   const label = loading ? (detail ? '正在同步最新对话，可继续阅读已有内容' : '正在读取对话')
     : error ? `本次同步未完成${detail ? '，当前保留上次内容' : ''}：${error}`
     : paused ? '连接暂不可用，当前内容尚未重新同步'
-    : lastDetailAt ? `对话读取完成，${UI.relative(lastDetailAt)}更新` : '尚未读取对话';
+    : behind ? '已发现更新，当前仍是旧内容，正在补取最新回复' : lastDetailAt ? `对话读取完成，${UI.relative(lastDetailAt)}更新` : '尚未读取对话';
   const html = UI.readIndicator(phase, label);
   if (node.innerHTML !== html) node.innerHTML = html;
   node.dataset.state = phase;
@@ -581,7 +584,9 @@ async function refreshDetail({ worker = openedWorker, deviceId = selected, backg
   const valid = () => session === me && generation === cacheEpoch && state.devices.some(d => d.id === currentDevice);
   const revision = Prefetch.conversationRevision(target, target.snapshot?.workers?.find(w => w.id === worker) || { id: worker });
   const cached = detailCache.get(key);
-  if (ifStale && cached?.revision === revision && Date.now() - cached.at < 5000) {
+  const needsHistory = !background && target.role !== 'viewer' && target.snapshot?.capabilities?.includes('read-history-v1');
+  const freshFor = UI.busy(target.snapshot?.workers?.find(w => w.id === worker)?.status) ? 5000 : 60000;
+  if (ifStale && cached?.revision === revision && Date.now() - cached.at < freshFor && !Prefetch.detailBehindSnapshot(cached.detail, target, worker) && (!needsHistory || cached.detail.historyRead)) {
     displayConversation(worker, deviceId, cached.detail, cached.at); syncDetailReadIndicator(); return true;
   }
   if (detailReads.has(key)) { syncDetailReadIndicator(); return detailFlights.get(key) || false; }
@@ -589,14 +594,14 @@ async function refreshDetail({ worker = openedWorker, deviceId = selected, backg
   prefetchRecords.set(key, { ...prefetchRecords.get(key), attemptAt: Date.now() });
   const flight = (async () => {
     try {
-      let result = await runCommand('worker.detail', { worker: current, ...(target.snapshot?.capabilities?.includes('read-history-v1') ? { readHistory: true } : {}) }, { deviceId: currentDevice, isCurrent: valid });
+      let result = await runCommand('worker.detail', { worker: current, ...(background ? (target.snapshot?.capabilities?.includes('conversation-preview-v1') ? { preview: true } : {}) : target.snapshot?.capabilities?.includes('read-history-v1') ? { readHistory: true } : {}) }, { deviceId: currentDevice, isCurrent: valid, background });
       if (!valid()) return false;
       result = Cache.mergeConversation(detailCache.get(key)?.detail, result);
-      const at = Date.now();
-      cacheConversation(key, { detail: result, at, revision });
-      prefetchRecords.set(key, { revision, at });
+      const at = Date.now(), fresh = !Prefetch.detailBehindSnapshot(result, target, current), fetchedRevision = fresh ? revision : '';
+      cacheConversation(key, { detail: result, at, revision: fetchedRevision });
+      prefetchRecords.set(key, { revision: fetchedRevision, at, ...(!fresh ? { retryAt: at + 10000 } : {}) });
       const diskKey = cacheKey(current, currentDevice, session.principalId);
-      if (diskKey) void conversationCache.save(diskKey, result, { revision, fetchedAt: at }).catch(cacheUnavailable);
+      if (diskKey) void conversationCache.save(diskKey, result, { revision: fetchedRevision, fetchedAt: at }).catch(cacheUnavailable);
       displayConversation(current, currentDevice, result, at);
       return true;
     } catch (error) {
@@ -616,10 +621,12 @@ async function refreshDetail({ worker = openedWorker, deviceId = selected, backg
   detailFlights.set(key, flight); return flight;
 }
 function prefetchConversations() {
-  if (!me || !online || backendIssue || deliveryTasks.size) return;
+  // Only spare capacity: foreground chat/sends must never queue behind warming.
+  if (!me || !online || backendIssue || deliveryTasks.size || openedWorker || prefetchNextAt > Date.now()) return;
   const session = me, generation = cacheEpoch;
-  for (const candidate of Prefetch.conversationCandidates(state.devices, { selected, openedWorker, favorites, recent })) {
-    if (prefetchTasks.size >= 2) break;
+  const tracked = [...prefetchRecords.keys()].map(key => JSON.stringify(JSON.parse(key).slice(1)));
+  for (const candidate of Prefetch.conversationCandidates(state.devices, { selected, openedWorker, favorites, recent, tracked })) {
+    if (prefetchTasks.size >= 1) break;
     const key = readScope(candidate.worker, candidate.deviceId);
     if (prefetchTasks.has(key) || detailReads.has(key) || !Prefetch.prefetchDue(prefetchRecords.get(key), candidate)) continue;
     prefetchTasks.add(key);
@@ -627,7 +634,9 @@ function prefetchConversations() {
       try {
         if (!hydratedConversations.has(key)) await restoreConversation(candidate.worker, candidate.deviceId);
         if (session !== me || generation !== cacheEpoch || !Prefetch.prefetchDue(prefetchRecords.get(key), candidate)) return;
-        await refreshDetail({ worker: candidate.worker, deviceId: candidate.deviceId, background: true });
+        prefetchNextAt = Date.now() + 15000;
+        const ok = await refreshDetail({ worker: candidate.worker, deviceId: candidate.deviceId, background: true });
+        prefetchNextAt = Date.now() + (ok ? 15000 : 60000);
       } finally { prefetchTasks.delete(key); prefetchConversations(); }
     })();
   }
@@ -688,7 +697,7 @@ function renderTimeline({ prepend = false } = {}) {
   }
   for (const j of detail?.jobs || []) {
     if (j.status === 'running' && j.publicConversation?.length) {
-      for (const b of j.publicConversation) entries.push({ id: 'live:' + b.id, live: true, kind: b.type === 'steer' ? 'request' : 'reply', human: b.type === 'steer', name: b.type === 'steer' ? '你 · steer 已记录' : (detail.worker?.name || openedWorker) + ' · 实时交流', time: b.time || j.createdAt, text: b.text, jobId: j.id });
+      for (const b of j.publicConversation) entries.push({ id: 'live:' + b.id, live: true, kind: b.type === 'steer' ? 'request' : 'reply', human: b.type === 'steer', name: b.type === 'steer' ? '你 · steer 已记录' : (detail.worker?.name || openedWorker) + ' · 过程消息', time: b.time || j.createdAt, text: b.text, jobId: j.id });
     } else if (j.reply || j.error || UI.busy(j.status)) entries.push({ id: 'job:' + j.id, kind: 'reply', name: detail.worker?.name || openedWorker, time: j.updatedAt || j.createdAt, state: j.status, text: j.reply || j.error || '员工正在处理，稍后自动更新…', jobId: j.id });
   }
   for (const m of detail?.messages || []) entries.push({ id: 'message:' + m.id, kind: 'message', name: `站内信 · ${m.from} → ${m.to}`, time: m.createdAt, text: m.content || '' });
@@ -787,7 +796,7 @@ async function diagnose() {
 async function settings() {
   if (tab !== 'settings' || openedWorker) return;
   const epoch = ++settingsEpoch;
-  $('#content').innerHTML = `<div class="section-head"><div><span class="eyebrow">YOUR SPACE</span><h2>连接与偏好</h2></div><span class="badge">v${UI.VERSION}</span></div><div class="settings-grid"><div><section class="setting-group"><div class="profile-row"><div class="avatar">${icon('shield')}</div><div class="grow"><h3>${esc(me?.name || '离线浏览')}</h3><p class="muted">${esc(UI.roles[me?.role] || '仅查看本机目录')} · ${me?.secure ? 'HTTPS 加密连接' : '本机测试 / 离线'}</p></div></div><div class="setting-row"><p class="muted">凭证到期：${time(me?.expiresAt)}</p><div class="actions"><button id="diagnose">${icon('activity')}连接诊断</button><button id="logout" class="danger">退出登录</button></div></div></section><section class="setting-group"><h3>显示与体验</h3><div class="setting-row setting-pair"><label>主题<select id="theme">${[['system', '跟随系统'], ['light', '浅色'], ['dark', '深色']].map(([v, n]) => option(v, n, pref('ox-theme', 'system'))).join('')}</select></label><label>字号<select id="text-size">${option('normal', '标准', pref('ox-text', 'normal'))}${option('large', '大字号', pref('ox-text', 'normal'))}</select></label></div><div class="setting-row"><label>自动同步<select id="refresh-mode">${option('balanced', '标准：目录约 3 秒 / 对话约 4 秒', pref('ox-refresh', 'balanced'))}${option('saving', '省流量：目录约 15 秒 / 对话约 30 秒', pref('ox-refresh', 'balanced'))}</select></label><p class="muted">切到后台会暂停页面轮询，返回时同步；发送时仍即时查询回执。</p></div><div class="setting-row"><div class="actions"><button id="install" ${installPrompt ? '' : 'hidden'}>安装到主屏幕</button><button id="check-update">检查界面更新</button></div><p class="muted">iPhone：Safari 分享 → 添加到主屏幕。Android：浏览器菜单 → 安装应用。</p></div></section><section class="setting-group"><h3>通知</h3><div class="setting-row"><div class="actions"><button id="notifications">启用通知</button><button id="disable-notifications">关闭后台通知</button></div><p id="push-status" class="muted">正在检查推送配置…</p><p class="muted">是否支持后台通知取决于浏览器与 Hub 配置。通知可能延迟，执行结果以原工厂为准。</p></div></section><section class="setting-group"><h3>本机数据</h3><div class="setting-row"><b>聊天记录保存在这台手机</b><p class="muted">已加载的文字会话会持续保存，进入先显示本地内容、后台更新，不自动过期。不会缓存凭证、原始执行日志或图片文件；请勿在共用设备保留敏感聊天。</p><p id="conversation-cache-status" class="muted">正在统计缓存…</p><button id="clear-conversations">清除聊天缓存</button></div><div class="setting-row"><label><input id="cache" type="checkbox" ${pref('ox-cache-enabled') === 'yes' ? 'checked' : ''}>离线保留设备和员工目录</label><p class="muted">可选保存目录；聊天正文使用独立的本机数据库。</p></div><div class="setting-row"><p class="muted">输入草稿、待确认操作仅保留在当前标签页。图片不保存为草稿，离线不会自动提交。</p><div class="actions"><button id="clear-drafts">清除本页草稿</button><button id="clear-directory">清除离线目录</button></div></div></section></div><div id="access"><div class="setting-group">${empty(me?.role === 'owner' ? '正在读取安全设置' : '当前凭证无需管理其他设备', '手机与工厂授权由原有权限控制。', 'shield')}</div></div></div><p class="version-note">牛马工厂 · 随身工作台 ${UI.VERSION}<br>页面更新不会重启原工厂服务</p>`;
+  $('#content').innerHTML = `<div class="section-head"><div><span class="eyebrow">YOUR SPACE</span><h2>连接与偏好</h2></div><span class="badge">v${UI.VERSION}</span></div><div class="settings-grid"><div><section class="setting-group"><div class="profile-row"><div class="avatar">${icon('shield')}</div><div class="grow"><h3>${esc(me?.name || '离线浏览')}</h3><p class="muted">${esc(UI.roles[me?.role] || '仅查看本机目录')} · ${me?.secure ? 'HTTPS 加密连接' : '本机测试 / 离线'}</p></div></div><div class="setting-row"><p class="muted">凭证到期：${time(me?.expiresAt)}</p><div class="actions"><button id="diagnose">${icon('activity')}连接诊断</button><button id="logout" class="danger">退出登录</button></div></div></section><section class="setting-group"><h3>显示与体验</h3><div class="setting-row setting-pair"><label>主题<select id="theme">${[['system', '跟随系统'], ['light', '浅色'], ['dark', '深色']].map(([v, n]) => option(v, n, pref('ox-theme', 'system'))).join('')}</select></label><label>字号<select id="text-size">${option('normal', '标准', pref('ox-text', 'normal'))}${option('large', '大字号', pref('ox-text', 'normal'))}</select></label></div><div class="setting-row"><label>自动同步<select id="refresh-mode">${option('balanced', '标准：目录约 3 秒 / 对话约 4 秒', pref('ox-refresh', 'balanced'))}${option('saving', '省流量：目录约 15 秒 / 对话约 30 秒', pref('ox-refresh', 'balanced'))}</select></label><p class="muted">后台获准运行时低频检查，回到前台补拉；当前对话和发送优先。</p></div><div class="setting-row"><div class="actions"><button id="install" ${installPrompt ? '' : 'hidden'}>安装到主屏幕</button><button id="check-update">检查界面更新</button></div><p class="muted">iPhone：Safari 分享 → 添加到主屏幕。Android：浏览器菜单 → 安装应用。</p></div></section><section class="setting-group"><h3>通知</h3><div class="setting-row"><div class="actions"><button id="notifications">启用通知</button><button id="disable-notifications">关闭后台通知</button></div><p id="push-status" class="muted">正在检查推送配置…</p><p class="muted">是否支持后台通知取决于浏览器与 Hub 配置。通知可能延迟，执行结果以原工厂为准。</p></div></section><section class="setting-group"><h3>本机数据</h3><div class="setting-row"><b>聊天记录保存在这台手机</b><p class="muted">已加载的文字会话会持续保存，进入先显示本地内容、后台更新，不自动过期。不会缓存凭证、原始执行日志或图片文件；请勿在共用设备保留敏感聊天。</p><p id="conversation-cache-status" class="muted">正在统计缓存…</p><button id="clear-conversations">清除聊天缓存</button></div><div class="setting-row"><label><input id="cache" type="checkbox" ${pref('ox-cache-enabled') === 'yes' ? 'checked' : ''}>离线保留设备和员工目录</label><p class="muted">可选保存目录；聊天正文使用独立的本机数据库。</p></div><div class="setting-row"><p class="muted">输入草稿、待确认操作仅保留在当前标签页。图片不保存为草稿，离线不会自动提交。</p><div class="actions"><button id="clear-drafts">清除本页草稿</button><button id="clear-directory">清除离线目录</button></div></div></section></div><div id="access"><div class="setting-group">${empty(me?.role === 'owner' ? '正在读取安全设置' : '当前凭证无需管理其他设备', '手机与工厂授权由原有权限控制。', 'shield')}</div></div></div><p class="version-note">牛马工厂 · 随身工作台 ${UI.VERSION}<br>页面更新不会重启原工厂服务</p>`;
   $('#theme').onchange = e => { savePreference('ox-theme', e.target.value); applyPreferences(); };
   $('#text-size').onchange = e => { savePreference('ox-text', e.target.value); applyPreferences(); };
   $('#refresh-mode').onchange = e => { savePreference('ox-refresh', e.target.value); toast('同步频率已更新'); };
