@@ -146,7 +146,7 @@ test('cloud bundle keeps runtime code outside public and contains no local Hub s
   t.after(() => rmSync(parent, { recursive: true, force: true }));
   const report = prepareNetlifyHub({ output, origin, siteId });
   assert.equal(report.stateIncluded, false); assert.equal(report.mode, 'persistent-netlify-hub');
-  assert.deepEqual(readdirSync(join(output, 'public')).sort(), ['_headers', 'app.js', 'browser-geometry.js', 'browser.js', 'cache.js', 'desktop-channel.js', 'desktop.js', 'icon.svg', 'index.html', 'manifest.webmanifest', 'markdown.js', 'style.css', 'sw.js', 'ui.js', 'vendor']);
+  assert.deepEqual(readdirSync(join(output, 'public')).sort(), ['_headers', 'app.js', 'browser-geometry.js', 'browser.js', 'cache.js', 'desktop-channel.js', 'desktop.js', 'icon.svg', 'index.html', 'manifest.webmanifest', 'markdown.js', 'prefetch.js', 'style.css', 'sw.js', 'ui.js', 'vendor']);
   assert.match(readFileSync(join(output, 'runtime', 'hub.mjs'), 'utf8'), /from '\.\/web-assets\.mjs'/);
   assert.match(readFileSync(join(output, 'runtime', 'web-assets.mjs'), 'utf8'), /vendor\/markdown-engine\.js/);
   assert.ok(readFileSync(join(output, 'public', 'vendor', 'fonts', 'KaTeX_Size4-Regular.woff2')).length > 100);

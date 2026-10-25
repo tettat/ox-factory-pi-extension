@@ -1,6 +1,6 @@
 importScripts('/vendor/precache.js');
-const CACHE = 'ox-mobile-shell-v21';
-const SHELL = ['/', '/app.js', '/ui.js', '/cache.js', '/browser.js', '/browser-geometry.js', '/desktop.js', '/desktop-channel.js', '/markdown.js', '/style.css', '/manifest.webmanifest', '/icon.svg', ...self.OX_MARKUP_ASSETS];
+const CACHE = 'ox-mobile-shell-v22';
+const SHELL = ['/', '/app.js', '/ui.js', '/cache.js', '/prefetch.js', '/browser.js', '/browser-geometry.js', '/desktop.js', '/desktop-channel.js', '/markdown.js', '/style.css', '/manifest.webmanifest', '/icon.svg', ...self.OX_MARKUP_ASSETS];
 self.addEventListener('install', event => event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)).then(() => self.skipWaiting())));
 self.addEventListener('activate', event => event.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(k => k.startsWith('ox-mobile-shell-') && k !== CACHE).map(k => caches.delete(k)))).then(() => self.clients.claim())));
 self.addEventListener('fetch', event => {
@@ -13,8 +13,10 @@ self.addEventListener('notificationclick', event => { event.notification.close()
 self.addEventListener('push', event => {
   // Payloads contain no task text, names, arbitrary URLs, or credentials.
   let payload = {}; try { payload = event.data?.json() || {}; } catch {}
-  event.waitUntil(self.registration.showNotification(payload.title === '工厂任务未成功' ? payload.title : '工厂有新结果', {
+  event.waitUntil(Promise.all([self.registration.showNotification(payload.title === '工厂任务未成功' ? payload.title : '工厂有新结果', {
     body: '打开随身工作台查看最新状态和结果。', icon: '/icon.svg', badge: '/icon.svg',
     tag: /^ox-[a-f0-9]{29}$/.test(payload.tag) ? payload.tag : 'ox-factory-result',
-  }));
+  }), self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(windows => {
+    for (const client of windows) client.postMessage({ type: 'ox-content-changed' });
+  })]));
 });

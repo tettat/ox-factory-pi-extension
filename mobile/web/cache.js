@@ -23,7 +23,7 @@ export function mergeConversation(old = {}, next = {}) {
 }
 export function conversationKey(principal, device, worker) { return JSON.stringify([principal, device, worker]); }
 export function createConversationCache(indexedDB = globalThis.indexedDB) {
-  let opening;
+  let opening, generation = 0;
   function open() {
     if (!indexedDB) return Promise.reject(Error('LOCAL_CACHE_UNAVAILABLE'));
     if (!opening) opening = new Promise((resolve, reject) => {
@@ -36,8 +36,9 @@ export function createConversationCache(indexedDB = globalThis.indexedDB) {
     });
     return opening;
   }
-  async function transact(mode, action) {
+  async function transact(mode, action, valid = () => true) {
     const db = await open();
+    if (!valid()) return;
     return new Promise((resolve, reject) => {
       const tx = db.transaction('conversations', mode); let result;
       tx.oncomplete = () => resolve(result);
@@ -47,15 +48,20 @@ export function createConversationCache(indexedDB = globalThis.indexedDB) {
   }
   return {
     load: key => transact('readonly', (store, done) => { const r = store.get(key); r.onsuccess = () => done(r.result || null); }),
-    save: (key, data) => transact('readwrite', (store, done) => {
-      const r = store.get(key);
-      r.onsuccess = () => {
-        const value = cleanConversation(mergeConversation(r.result?.data, data));
-        const record = { key, data: value, updatedAt: Date.now(), bytes: new TextEncoder().encode(JSON.stringify(value)).length };
-        store.put(record); done(record);
-      };
-    }),
-    clear: () => transact('readwrite', store => { store.clear(); }),
+    save: (key, data, metadata = {}) => {
+      const epoch = generation;
+      return transact('readwrite', (store, done) => {
+        const r = store.get(key);
+        r.onsuccess = () => {
+          if (epoch !== generation) return;
+          const value = cleanConversation(mergeConversation(r.result?.data, data));
+          const record = { key, data: value, updatedAt: Date.now(), bytes: new TextEncoder().encode(JSON.stringify(value)).length,
+            ...(typeof metadata.revision === 'string' ? { revision: metadata.revision, fetchedAt: metadata.fetchedAt || Date.now() } : {}) };
+          store.put(record); done(record);
+        };
+      }, () => epoch === generation);
+    },
+    clear: () => { generation++; return transact('readwrite', store => { store.clear(); }); },
     stats: () => transact('readonly', (store, done) => {
       let conversations = 0, messages = 0, bytes = 0; const r = store.openCursor();
       r.onsuccess = () => { const c = r.result; if (!c) { done({ conversations, messages, bytes }); return; }

@@ -90,7 +90,7 @@ test('Netlify deployment is public-asset-only and fails closed while Hub is miss
   t.after(() => { assert.ok(resolve(root).startsWith(allowed + '/netlify-package-test-') || resolve(root).startsWith(allowed + '\\netlify-package-test-')); rmSync(root, { recursive: true, force: true }); });
   const output = join(root, 'package'), report = prepareNetlify({ output });
   assert.equal(report.mode, 'frontend-only-backend-not-configured');
-  assert.deepEqual(readdirSync(join(output, 'public')).sort(), ['_headers', '_redirects', 'app.js', 'backend-unavailable.json', 'browser-geometry.js', 'browser.js', 'cache.js', 'desktop-channel.js', 'desktop.js', 'icon.svg', 'index.html', 'manifest.webmanifest', 'markdown.js', 'style.css', 'sw.js', 'ui.js', 'vendor']);
+  assert.deepEqual(readdirSync(join(output, 'public')).sort(), ['_headers', '_redirects', 'app.js', 'backend-unavailable.json', 'browser-geometry.js', 'browser.js', 'cache.js', 'desktop-channel.js', 'desktop.js', 'icon.svg', 'index.html', 'manifest.webmanifest', 'markdown.js', 'prefetch.js', 'style.css', 'sw.js', 'ui.js', 'vendor']);
   assert.deepEqual(readJson(join(output, 'public/backend-unavailable.json')), { error: 'HUB_NOT_CONFIGURED' });
   assert.match(readFileSync(join(output, 'public/index.html'), 'utf8'), /name="ox-backend" content="pending"/);
   assert.match(readFileSync(join(output, 'public/_headers'), 'utf8'), /Cache-Control: no-store/);

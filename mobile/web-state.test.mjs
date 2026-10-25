@@ -6,13 +6,14 @@ import { readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import * as UI from './web/ui.js';
 import * as Cache from './web/cache.js';
+import * as Prefetch from './web/prefetch.js';
 const fullSource = readFileSync(new URL('./web/app.js', import.meta.url), 'utf8');
-const source = fullSource.slice(0, fullSource.indexOf("\ndocument.addEventListener('click'")).replace("import * as UI from './ui.js';", '').replace("import * as Cache from './cache.js';", '');
+const source = fullSource.slice(0, fullSource.indexOf("\ndocument.addEventListener('click'")).replace("import * as UI from './ui.js';", '').replace("import * as Cache from './cache.js';", '').replace("import * as Prefetch from './prefetch.js';", '');
 function context({ deploymentPending = false, storageDenied = false } = {}) {
   const nodes = new Map(), values = new Map();
   const storage = { getItem: k => values.get(k) || null, setItem: (k, v) => values.set(k, v), removeItem: k => values.delete(k) };
   const node = () => ({ innerHTML: '', value: '', dataset: {}, open: false, setAttribute() {}, contains: () => false, querySelectorAll: () => [], classList: { toggle() {}, add() {}, remove() {} }, showModal() { this.open = true; }, close() { this.open = false; } });
-  const context = vm.createContext({ UI, Cache, URL, window: {}, navigator: { onLine: true }, document: { querySelectorAll: () => [], querySelector: s => { if (!nodes.has(s)) nodes.set(s, s === 'meta[name="ox-backend"]' && deploymentPending ? { content: 'pending' } : node()); return nodes.get(s); } }, sessionStorage: storage, localStorage: storage, crypto: { randomUUID }, AbortSignal, setTimeout, clearTimeout, fetch: async () => { throw Error('unexpected fetch'); } });
+  const context = vm.createContext({ UI, Cache, Prefetch, URL, window: {}, navigator: { onLine: true }, document: { querySelectorAll: () => [], querySelector: s => { if (!nodes.has(s)) nodes.set(s, s === 'meta[name="ox-backend"]' && deploymentPending ? { content: 'pending' } : node()); return nodes.get(s); } }, sessionStorage: storage, localStorage: storage, crypto: { randomUUID }, AbortSignal, setTimeout, clearTimeout, fetch: async () => { throw Error('unexpected fetch'); } });
   if (storageDenied) vm.runInContext("Object.defineProperty(globalThis, 'sessionStorage', { get() { throw Error('denied'); } }); Object.defineProperty(globalThis, 'localStorage', { get() { throw Error('denied'); } });", context);
   vm.runInContext(source, context);
   vm.runInContext("state = { devices: [{ id: 'device-a', online: true }, { id: 'device-b', online: true }], commands: [] }; selected = 'device-b';", context);
@@ -94,9 +95,9 @@ test('cached conversation keeps a real loading indicator until its full read com
   const loading = vm.runInContext('refreshDetail()', c);
   assert.equal(readPhase(c), 'loading');
   assert.equal(vm.runInContext('detail.marker', c), 'cached');
-  await vm.runInContext('refreshDetail()', c);
+  const alsoLoading = vm.runInContext('refreshDetail()', c);
   assert.equal(calls, 1); assert.equal(readPhase(c), 'loading');
-  finish({ marker: 'fresh' }); await loading;
+  finish({ marker: 'fresh' }); await Promise.all([loading, alsoLoading]);
   assert.equal(readPhase(c), 'ready');
   assert.equal(vm.runInContext('detail.marker', c), 'fresh');
   assert.doesNotMatch(vm.runInContext("$('#chat-read-status').innerHTML", c), /read-spinner/);
@@ -382,4 +383,135 @@ test('logout prevents an in-flight project detail from restoring private data',a
  vm.runInContext("me={id:'project-session'};selected='device-a';openedProject='entity:one';tab='projects';state.devices[0].snapshot={projects:[{id:'one',name:'One'}],capabilities:['project.detail']};renderProjectDetail=()=>{};runCommand=()=>deferred;",c);
  const reading=vm.runInContext('loadProject()',c);vm.runInContext('clearPrivateBrowserState();me=null;',c);finish({project:{id:'one'}});await reading;
  assert.equal(vm.runInContext('projectCache.size',c),0);assert.equal(vm.runInContext('openedProject',c),'');
+});
+
+function prefetchContext() {
+  const c = context();
+  c.disk = new Map(); c.calls = [];
+  c.readConversation = async (action, body, options) => {
+    c.calls.push({ action, worker: body.worker, deviceId: options.deviceId });
+    return action === 'read.mark' ? { acknowledged: ['history-a'] } : {
+      messages: [{ id: 'reply-' + body.worker, content: 'new content' }],
+      historyRead: { unread: true, token: 'fixture-proof', revision: 'history-a' },
+    };
+  };
+  vm.runInContext(`me = { id: 'prefetch-session', principalId: 'owner' }; selected = 'device-a'; openedWorker = '';
+    state = { devices: [{ id: 'device-a', online: true, role: 'owner', snapshot: { capabilities: ['read-history-v1'], workers: [{ id: 'worker-a', status: 'idle', unreadCount: 1 }] } }], commands: [] };
+    renderTimeline = () => {}; cacheUnavailable = () => {};
+    conversationCache.load = async key => disk.get(key) || null;
+    conversationCache.save = async (key, data, metadata) => { disk.set(key, { data: Cache.cleanConversation(data), ...metadata, updatedAt: Date.now() }); };
+    runCommand = readConversation;`, c);
+  return c;
+}
+const settlePrefetch = async () => { for (let i = 0; i < 8; i++) await new Promise(r => setImmediate(r)); };
+
+test('snapshot refresh prefetches unopened unread conversations and saves them without marking read', async () => {
+  const c = prefetchContext();
+  c.fetch = async () => ({ ok: true, json: async () => vm.runInContext('state', c) });
+  vm.runInContext('renderDevicePicker = () => {}; render = () => {};', c);
+  await vm.runInContext('refresh()', c); await settlePrefetch();
+  assert.deepEqual(c.calls.map(x => x.action), ['worker.detail']);
+  assert.equal(vm.runInContext('detail', c), null);
+  assert.equal(vm.runInContext('state.devices[0].snapshot.workers[0].unreadCount', c), 1);
+  assert.equal(c.disk.size, 1); assert.doesNotMatch(JSON.stringify([...c.disk.values()]), /fixture-proof/);
+  vm.runInContext('prefetchConversations(); prefetchConversations();', c); await settlePrefetch();
+  assert.equal(c.calls.length, 1);
+});
+
+test('opening a prefetched conversation displays cached content and only then acknowledges history', async () => {
+  const c = prefetchContext(); vm.runInContext('prefetchConversations()', c); await settlePrefetch();
+  assert.equal(c.calls.length, 1);
+  await vm.runInContext("openedWorker = 'worker-a'; refreshDetail({ ifStale: true })", c); await settlePrefetch();
+  assert.equal(vm.runInContext('detail.messages[0].content', c), 'new content');
+  assert.deepEqual(c.calls.map(x => x.action), ['worker.detail', 'read.mark']);
+});
+
+test('backgrounded pages prefetch all devices without acknowledging even the open conversation', async () => {
+  const c = prefetchContext();
+  vm.runInContext("document.hidden = true; openedWorker = 'worker-a'; state.devices.push({ ...state.devices[0], id: 'device-b' }); prefetchConversations();", c);
+  await settlePrefetch();
+  assert.deepEqual(c.calls.map(x => x.action), ['worker.detail', 'worker.detail']);
+  assert.deepEqual(c.calls.map(x => x.deviceId), ['device-a', 'device-b']);
+  assert.equal(c.disk.size, 2);
+});
+
+test('background concurrency is bounded and opening an in-flight prefetch shares its request', async () => {
+  const c = prefetchContext(), finish = [];
+  c.readConversation = (action, body, options) => { c.calls.push({ action, ...body, deviceId: options.deviceId }); return new Promise(resolve => finish.push(resolve)); };
+  vm.runInContext("runCommand = readConversation; state.devices[0].snapshot.workers = Array.from({ length: 5 }, (_, i) => ({ id: 'w' + i, unreadCount: 1 })); prefetchConversations();", c);
+  await settlePrefetch(); assert.equal(c.calls.length, 2);
+  vm.runInContext("openedWorker = 'w0';", c); const opened = vm.runInContext('refreshDetail()', c);
+  assert.equal(c.calls.length, 2);
+  vm.runInContext('state.devices[0].snapshot.workers = [];', c);
+  finish[0]({ messages: [{ id: 'm', content: 'first prefetched result' }] }); finish[1]({});
+  await opened; await settlePrefetch();
+  assert.equal(vm.runInContext('detail.messages[0].content', c), 'first prefetched result');
+  assert.equal(vm.runInContext('prefetchTasks.size', c), 0);
+});
+
+test('a new revision arriving during prefetch is fetched afterwards instead of being falsely marked current', async () => {
+  const c = prefetchContext(); let finish;
+  c.readConversation = async (...args) => { c.calls.push(args[0]); if (c.calls.length === 1) return new Promise(r => { finish = r; }); return { messages: [{ id: 'new', content: 'second revision' }] }; };
+  vm.runInContext('runCommand = readConversation; prefetchConversations();', c); await settlePrefetch();
+  vm.runInContext("state.devices[0].snapshot.workers[0].lastInteractionAt = '2026-10-25';", c);
+  finish({ messages: [{ id: 'old', content: 'first revision' }] }); await settlePrefetch();
+  assert.equal(c.calls.length, 2); assert.equal(c.disk.values().next().value.data.messages.length, 2);
+});
+
+test('disk revisions survive a page reload and unchanged snapshots do not download the same conversations', async () => {
+  const first = prefetchContext(); vm.runInContext('prefetchConversations()', first); await settlePrefetch();
+  const next = prefetchContext(); next.disk = first.disk;
+  vm.runInContext('prefetchConversations()', next); await settlePrefetch();
+  assert.equal(next.calls.length, 0); assert.equal(vm.runInContext('detailCache.size', next), 1);
+  vm.runInContext('state.devices[0].snapshot.workers[0].unreadCount++; prefetchConversations();', next); await settlePrefetch();
+  assert.equal(next.calls.length, 1);
+});
+
+test('background read failures are quiet, retain cache, and back off without blocking other conversations', async () => {
+  const c = prefetchContext(); c.readConversation = async () => { c.calls.push('failed'); throw Error('offline fixture'); };
+  vm.runInContext("runCommand = readConversation; $('#toast').textContent = 'unchanged'; prefetchConversations();", c); await settlePrefetch();
+  vm.runInContext('prefetchConversations();', c); await settlePrefetch();
+  assert.equal(c.calls.length, 1); assert.equal(vm.runInContext("$('#toast').textContent", c), 'unchanged');
+  vm.runInContext('for (const value of prefetchRecords.values()) { value.retryAt = 0; value.attemptAt = 0; } prefetchConversations();', c); await settlePrefetch();
+  assert.equal(c.calls.length, 2);
+});
+
+test('logout, clear-cache and removed device discard late prefetch results', async () => {
+  for (const action of ['clearPrivateBrowserState(); me = null;', 'cacheEpoch++;', 'state.devices = [];']) {
+    const c = prefetchContext(); let finish;
+    c.readConversation = () => new Promise(r => { finish = r; });
+    vm.runInContext('runCommand = readConversation; prefetchConversations();', c); await settlePrefetch();
+    vm.runInContext(action + ' online = false;', c); finish({ messages: [{ id: 'old', content: 'must not return' }] }); await settlePrefetch();
+    assert.equal(c.disk.size, 0); assert.equal(vm.runInContext('detailCache.size', c), 0);
+  }
+});
+
+test('private command polling stops after session changes instead of using a new login', async () => {
+  const c = context(); let requests = 0;
+  vm.runInContext("me = { id: 'old' };", c);
+  c.fetch = async () => { requests++; return { ok: true, json: async () => ({ command: { state: 'queued' } }) }; };
+  c.setTimeout = callback => { vm.runInContext("me = { id: 'new' };", c); queueMicrotask(callback); };
+  await assert.rejects(vm.runInContext("runCommand('worker.detail', { worker: 'w' })", c), /手机会话已切换/);
+  assert.equal(requests, 1);
+});
+
+test('hidden-page polling is slower, not disabled, and foreground immediately resumes active reads', () => {
+  const c = prefetchContext(); let clock = 100000, tick;
+  c.Date = class extends Date { static now() { return clock; } };
+  c.setInterval = callback => { tick = callback; };
+  vm.runInContext("globalThis.polls = 0; globalThis.details = 0; refresh = () => { polls++; }; refreshDetail = () => { details++; }; document.hidden = true;", c);
+  vm.runInContext(fullSource.slice(fullSource.indexOf('let lastPollAttempt = 0')), c);
+  tick(); assert.equal(c.polls, 1); assert.equal(c.details, 0);
+  clock += 3000; tick(); assert.equal(c.polls, 1);
+  clock += 27000; tick(); assert.equal(c.polls, 2);
+  vm.runInContext('document.hidden = false;', c); clock += 3000; tick();
+  assert.equal(c.polls, 3); assert.equal(c.details, 1);
+});
+
+test('outgoing deliveries get priority over speculative conversation reads', async () => {
+  const c = prefetchContext();
+  vm.runInContext("deliveryTasks.set('sending', Promise.resolve()); prefetchConversations();", c); await settlePrefetch();
+  assert.equal(c.calls.length, 0);
+  vm.runInContext('deliveryTasks.clear(); prefetchConversations();', c); await settlePrefetch();
+  assert.equal(c.calls.length, 1);
 });

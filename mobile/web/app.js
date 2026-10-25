@@ -1,5 +1,6 @@
 import * as UI from './ui.js';
 import * as Cache from './cache.js';
+import * as Prefetch from './prefetch.js';
 const $ = selector => document.querySelector(selector);
 let sessionStore, localStore;
 try { sessionStore = sessionStorage; } catch {}
@@ -35,6 +36,7 @@ let pending = UI.pendingState(UI.json(sessionStore, 'ox-pending', {}));
 let outgoing = UI.outgoingState(UI.json(sessionStore, 'ox-outgoing', {}));
 const deliveryTasks = new Map(), deliveryFiles = new Map(), detailCache = new Map(), detailReads = new Set(), usageCache = new Map(), usageReads = new Set();
 const detailErrors = new Map();
+const detailFlights = new Map(), prefetchTasks = new Set(), prefetchRecords = new Map(), hydratedConversations = new Set();
 const readFlights = new Set(), readFailures = new Map(), readOverrides = new Map();
 const conversationCache = Cache.createConversationCache(); let cacheEpoch = 0, cacheWarned = false;
 const cacheKey = (worker = openedWorker, deviceId = selected, principal = me?.principalId) => principal ? Cache.conversationKey(principal, deviceId, worker) : '';
@@ -74,6 +76,7 @@ function clearPrivateBrowserState() {
   outgoing = {}; for (const items of deliveryFiles.values()) for (const item of items) URL.revokeObjectURL(item.url);
   deliveryFiles.clear(); detailCache.clear(); detailErrors.clear(); usageCache.clear();
   cacheEpoch++; historyReadItem = null; readFailures.clear(); readOverrides.clear();
+  prefetchRecords.clear(); hydratedConversations.clear();
   projectCache.clear(); projectErrors.clear(); openedProject = ''; taskScope = null;
   settingsEpoch++; copiedText.clear(); draftMemory.clear(); notified.clear(); notificationBaseline = false; cleanupAttachments(); closeModal();
 }
@@ -151,12 +154,16 @@ async function refresh({ force = false } = {}) {
     if (pref('ox-cache-enabled') === 'yes') UI.write(localStore, 'ox-directory-cache', JSON.stringify({ devices: state.devices.map(d => ({ id: d.id, name: d.name, online: false, lastSeenAt: d.lastSeenAt, role: 'viewer', snapshot: { workers: d.snapshot?.workers || [] } })), commands: [] }));
     renderDevicePicker();
     const editing = document.activeElement?.matches?.('input,textarea,select') && $('#content').contains?.(document.activeElement);
-    if ((viewDirty || force) && !openedWorker && tab !== 'settings' && !$('#dialog').open && !editing) { render(); viewDirty = false; }
+    if (!document.hidden && (viewDirty || force) && !openedWorker && tab !== 'settings' && !$('#dialog').open && !editing) { render(); viewDirty = false; }
+    prefetchConversations();
     return next;
   } catch (error) { connection(); if (force) toast(error.message); }
   finally { polling = false; connection(); }
 }
-async function runCommand(action, body, { retry = null, deviceId = selected, onProgress = () => {} } = {}) {
+async function runCommand(action, body, { retry = null, deviceId = selected, onProgress = () => {}, isCurrent = () => true } = {}) {
+  const session = me;
+  const guard = () => { if (me !== session || !isCurrent()) throw Object.assign(Error('手机会话已切换，原操作不再继续'), { code: 'SESSION_CHANGED' }); };
+  guard();
   const targetId = retry?.deviceId || deviceId;
   if (!online || backendIssue || !state.devices.find(d => d.id === targetId)?.online) throw Error('设备或网络离线，没有提交操作');
   const signature = JSON.stringify([targetId, action, body]);
@@ -170,10 +177,12 @@ async function runCommand(action, body, { retry = null, deviceId = selected, onP
   onProgress('正在发送到中转…'); let response;
   try { response = await api('/api/commands', envelope); }
   catch (error) { if (error.code && !['INTERNAL_ERROR', 'HUB_UNAVAILABLE'].includes(error.code)) { delete pending[envelope.id]; savePending(); } throw error; }
-  let command = response.command; onProgress('中转已接收，等待工厂确认…');
+  guard(); let command = response.command; onProgress('中转已接收，等待工厂确认…');
   for (let i = 0; !['done', 'failed'].includes(command.state) && i < 25; i++) {
     await new Promise(resolve => setTimeout(resolve, 800));
+    guard();
     command = (await api(`/api/commands/${encodeURIComponent(envelope.id)}`)).command;
+    guard();
     if (command.state === 'delivering') onProgress('正在送达工厂，保留同一请求编号…');
   }
   if (!['done', 'failed'].includes(command.state)) throw Error('中转已接收，工厂尚未确认。请到动态页查询原请求，不要重复提交');
@@ -190,7 +199,7 @@ function route(nextTab, worker = '', assign = false, push = true, persistDraft =
   openedProject = nextTab === 'projects' ? project : ''; projectPane = 'overview';
   if (push) history.pushState({ ox: true, tab, worker, assign, deviceId: selected, project: openedProject }, '', location.pathname);
   if (worker) { recent[keyFor(worker)] = Date.now(); set('ox-recent', JSON.stringify(recent)); composeKind = assign ? 'task.assign' : 'talk.send'; }
-  render(); if (worker) { void restoreConversation(); void refreshDetail(); }
+  render(); if (worker) { void restoreConversation(); void refreshDetail({ ifStale: true }); }
   window.scrollTo?.({ top: 0, behavior: 'instant' });
 }
 function render() {
@@ -551,46 +560,95 @@ function syncDetailReadIndicator() {
   const refreshButton = $('#chat-refresh');
   if (refreshButton) { refreshButton.disabled = loading || paused; refreshButton.classList.toggle('spin', loading); }
 }
-async function refreshDetail() {
-  if (!openedWorker || !online || !device()?.online || backendIssue) { syncDetailReadIndicator(); return; }
-  const current = openedWorker, currentDevice = selected, session = me, key = JSON.stringify([session?.id, currentDevice, current]), generation = cacheEpoch;
-  if (detailReads.has(key)) { syncDetailReadIndicator(); return; }
-  detailReads.add(key); detailErrors.delete(key); syncDetailReadIndicator();
-  try {
-    let result = await runCommand('worker.detail', { worker: current, ...(snap().capabilities?.includes('read-history-v1') ? { readHistory: true } : {}) }, { deviceId: currentDevice });
-    if (session !== me || generation !== cacheEpoch) return;
-    if (!detailCache.has(key) && detailCache.size >= 6) detailCache.delete(detailCache.keys().next().value);
-    result = Cache.mergeConversation(detailCache.get(key)?.detail, result);
-    detailCache.set(key, { detail: result, at: Date.now() });
-    if (generation === cacheEpoch && cacheKey(current, currentDevice, session?.principalId)) void conversationCache.save(cacheKey(current, currentDevice, session.principalId), result).catch(cacheUnavailable);
-    if (openedWorker === current && selected === currentDevice) { detail = result; lastDetailAt = Date.now(); historyReadItem = { read: result.historyRead, worker: current, deviceId: currentDevice }; renderTimeline(); syncHistoryRead(); }
+function cacheConversation(key, value) {
+  // Disk retains history; RAM only keeps a small hot set, including the open chat.
+  detailCache.delete(key); detailCache.set(key, value);
+  while (detailCache.size > 12) {
+    const oldest = [...detailCache.keys()].find(k => k !== key && k !== readScope());
+    if (!oldest) break; detailCache.delete(oldest);
   }
-  catch (error) {
-    if (session === me) {
+}
+function displayConversation(worker, deviceId, value, at) {
+  if (openedWorker !== worker || selected !== deviceId) return;
+  detail = value; lastDetailAt = at;
+  historyReadItem = { read: value.historyRead, worker, deviceId };
+  if (!document.hidden) { renderTimeline(); syncHistoryRead(); }
+}
+async function refreshDetail({ worker = openedWorker, deviceId = selected, background = false, ifStale = false } = {}) {
+  const target = state.devices.find(d => d.id === deviceId);
+  if (!me || !worker || !online || !target?.online || backendIssue) { syncDetailReadIndicator(); return false; }
+  const current = worker, currentDevice = deviceId, session = me, key = readScope(worker, deviceId), generation = cacheEpoch;
+  const valid = () => session === me && generation === cacheEpoch && state.devices.some(d => d.id === currentDevice);
+  const revision = Prefetch.conversationRevision(target, target.snapshot?.workers?.find(w => w.id === worker) || { id: worker });
+  const cached = detailCache.get(key);
+  if (ifStale && cached?.revision === revision && Date.now() - cached.at < 5000) {
+    displayConversation(worker, deviceId, cached.detail, cached.at); syncDetailReadIndicator(); return true;
+  }
+  if (detailReads.has(key)) { syncDetailReadIndicator(); return detailFlights.get(key) || false; }
+  detailReads.add(key); detailErrors.delete(key); syncDetailReadIndicator();
+  prefetchRecords.set(key, { ...prefetchRecords.get(key), attemptAt: Date.now() });
+  const flight = (async () => {
+    try {
+      let result = await runCommand('worker.detail', { worker: current, ...(target.snapshot?.capabilities?.includes('read-history-v1') ? { readHistory: true } : {}) }, { deviceId: currentDevice, isCurrent: valid });
+      if (!valid()) return false;
+      result = Cache.mergeConversation(detailCache.get(key)?.detail, result);
+      const at = Date.now();
+      cacheConversation(key, { detail: result, at, revision });
+      prefetchRecords.set(key, { revision, at });
+      const diskKey = cacheKey(current, currentDevice, session.principalId);
+      if (diskKey) void conversationCache.save(diskKey, result, { revision, fetchedAt: at }).catch(cacheUnavailable);
+      displayConversation(current, currentDevice, result, at);
+      return true;
+    } catch (error) {
+      if (!valid()) return false;
+      const failures = (prefetchRecords.get(key)?.failures || 0) + 1;
+      prefetchRecords.set(key, { ...prefetchRecords.get(key), failures, retryAt: Date.now() + Math.min(120000, 5000 * 2 ** Math.min(failures, 5)) });
       if (detailErrors.size >= 20) detailErrors.delete(detailErrors.keys().next().value);
       detailErrors.set(key, error.message);
-    }
-    if (session === me && openedWorker === current && selected === currentDevice && !detail && $('#timeline')) {
-      const hasOutgoing = outgoingForDevice().some(r => r.envelope.body.worker === current);
-      if (hasOutgoing) { renderTimeline(); toast(`最近消息暂未读到：${error.message}；发送记录仍在动态页`); }
-      else $('#timeline').innerHTML = empty('暂时无法读取', error.message);
-    }
+      if (!background && openedWorker === current && selected === currentDevice && !detail && $('#timeline')) {
+        const hasOutgoing = outgoingForDevice().some(r => r.envelope.body.worker === current);
+        if (hasOutgoing) { renderTimeline(); toast(`最近消息暂未读到：${error.message}；发送记录仍在动态页`); }
+        else $('#timeline').innerHTML = empty('暂时无法读取', error.message);
+      }
+      return false;
+    } finally { detailReads.delete(key); detailFlights.delete(key); if (session === me) syncDetailReadIndicator(); }
+  })();
+  detailFlights.set(key, flight); return flight;
+}
+function prefetchConversations() {
+  if (!me || !online || backendIssue || deliveryTasks.size) return;
+  const session = me, generation = cacheEpoch;
+  for (const candidate of Prefetch.conversationCandidates(state.devices, { selected, openedWorker, favorites, recent })) {
+    if (prefetchTasks.size >= 2) break;
+    const key = readScope(candidate.worker, candidate.deviceId);
+    if (prefetchTasks.has(key) || detailReads.has(key) || !Prefetch.prefetchDue(prefetchRecords.get(key), candidate)) continue;
+    prefetchTasks.add(key);
+    void (async () => {
+      try {
+        if (!hydratedConversations.has(key)) await restoreConversation(candidate.worker, candidate.deviceId);
+        if (session !== me || generation !== cacheEpoch || !Prefetch.prefetchDue(prefetchRecords.get(key), candidate)) return;
+        await refreshDetail({ worker: candidate.worker, deviceId: candidate.deviceId, background: true });
+      } finally { prefetchTasks.delete(key); prefetchConversations(); }
+    })();
   }
-  finally { detailReads.delete(key); if (session === me) syncDetailReadIndicator(); }
 }
 function remember(key, value) { copiedText.set(key, String(value || '')); if (copiedText.size > 250) copiedText.delete(copiedText.keys().next().value); return esc(key); }
 function cacheUnavailable() { if (!cacheWarned) { cacheWarned = true; toast('浏览器未能保存聊天缓存；当前内容仍可阅读，请检查存储空间或无痕模式'); } }
-async function restoreConversation() {
-  const session = me, worker = openedWorker, target = selected, key = cacheKey(), generation = cacheEpoch;
+async function restoreConversation(worker = openedWorker, target = selected) {
+  const session = me, key = cacheKey(worker, target), generation = cacheEpoch;
   if (!key || !worker) return;
   try {
     const saved = await conversationCache.load(key);
-    if (!saved || session !== me || generation !== cacheEpoch) return;
+    if (session !== me || generation !== cacheEpoch || !state.devices.some(d => d.id === target)) return;
+    hydratedConversations.add(JSON.stringify([session.id, target, worker]));
+    if (!saved) return;
     const memoryKey = JSON.stringify([session.id, target, worker]), current = detailCache.get(memoryKey);
     const value = current ? Cache.mergeConversation(saved.data, current.detail) : saved.data;
-    detailCache.set(memoryKey, { detail: value, at: current?.at || saved.updatedAt });
-    if (openedWorker === worker && selected === target) { detail = value; lastDetailAt = current?.at || saved.updatedAt; renderTimeline(); syncDetailReadIndicator(); }
-  } catch { cacheUnavailable(); }
+    const at = current?.at || saved.fetchedAt || saved.updatedAt, revision = current?.revision || saved.revision;
+    cacheConversation(memoryKey, { detail: value, at, revision });
+    if (revision && !prefetchRecords.has(memoryKey)) prefetchRecords.set(memoryKey, { revision, at });
+    displayConversation(worker, target, value, at); syncDetailReadIndicator();
+  } catch { if (session === me && generation === cacheEpoch) { hydratedConversations.add(JSON.stringify([session.id, target, worker])); cacheUnavailable(); } }
 }
 function syncHistoryRead() {
   const item = $('#dialog')?.open ? modalReadItem : historyReadItem;
@@ -741,7 +799,7 @@ async function settings() {
   api('/api/push').then(p => { pushSubscribed = p.subscribed; if (epoch === settingsEpoch && $('#push-status')) $('#push-status').textContent = p.subscribed ? '此手机已订阅后台完成通知' : p.available ? 'Hub 已配置推送，点击启用并允许通知' : 'Hub 未配置后台推送；目前仅页面打开时提醒'; }).catch(() => { if (epoch === settingsEpoch && $('#push-status')) $('#push-status').textContent = '通知状态暂不可用'; });
   $('#cache').onchange = e => { UI.write(localStore, 'ox-cache-enabled', e.target.checked ? 'yes' : 'no'); if (!e.target.checked) UI.remove(localStore, 'ox-directory-cache'); else refresh(); };
   conversationCache.stats().then(s => { if (epoch === settingsEpoch && $('#conversation-cache-status')) $('#conversation-cache-status').textContent = `${s.conversations} 个会话 · ${s.messages} 条记录 · ${(s.bytes / 1024 / 1024).toFixed(2)} MB`; }).catch(() => { if (epoch === settingsEpoch && $('#conversation-cache-status')) $('#conversation-cache-status').textContent = '本机存储暂不可用'; });
-  $('#clear-conversations').onclick = async () => { if (!confirm('只清除这台手机保存的聊天缓存？电脑上的消息、已读状态和任务都不会被删除。')) return; cacheEpoch++; detailCache.clear(); detail = null; try { await conversationCache.clear(); cacheWarned = false; toast('本机聊天缓存已清除，电脑上的消息仍在'); if (epoch === settingsEpoch) void settings(); } catch { toast('缓存清除失败，请检查浏览器存储权限'); } };
+  $('#clear-conversations').onclick = async () => { if (!confirm('只清除这台手机保存的聊天缓存？电脑上的消息、已读状态和任务都不会被删除，新消息仍会自动缓存。')) return; cacheEpoch++; detailCache.clear(); hydratedConversations.clear(); detail = null; try { await conversationCache.clear(); cacheWarned = false; toast('本机聊天缓存已清除，电脑上的消息仍在'); if (epoch === settingsEpoch) void settings(); } catch { toast('缓存清除失败，请检查浏览器存储权限'); } };
   $('#clear-directory').onclick = () => { UI.remove(localStore, 'ox-directory-cache'); UI.write(localStore, 'ox-cache-enabled', 'no'); $('#cache').checked = false; toast('离线目录已清除，实时工厂数据未改变'); };
   $('#clear-drafts').onclick = () => { if (!confirm('清除当前标签页保存的文字草稿？不会清除待确认请求，也不会取消已派发任务。')) return; draftMemory.clear(); try { for (let i = sessionStore.length - 1; i >= 0; i--) { const key = sessionStore.key(i); if (key.startsWith('ox-draft:') || key.startsWith('ox-draft-v2:')) sessionStore.removeItem(key); } toast('文字草稿已清除'); } catch { toast('浏览器不允许访问本机存储'); } };
   $('#logout').onclick = async () => { if (!confirm('退出会撤销此手机凭证，并清除本页草稿和目录缓存。聊天缓存仍保存在这台手机，可在本机数据中清除；已被工厂接收的任务不会停止。确定退出？')) return; try { await api('/api/logout', {}); clearPrivateBrowserState(); me = null; showLogin(); } catch (e) { toast(e.message); } };
@@ -859,7 +917,11 @@ window.addEventListener('online', async () => { online = true; if (!me) { try { 
 window.addEventListener('beforeinstallprompt', event => { event.preventDefault(); installPrompt = event; if ($('#install')) $('#install').hidden = false; });
 window.addEventListener('popstate', event => { if (!me) return; const target = event.state; if (!target?.ox) return route('home', '', false, false); saveDraft(); if (state.devices.some(d => d.id === target.deviceId)) selected = target.deviceId; route(['home', 'projects', 'workers', 'tasks', 'activity', 'usage', 'settings', 'browser'].includes(target.tab) ? target.tab : 'home', target.worker || '', !!target.assign, false, false, target.project || ''); renderDevicePicker(); });
 window.addEventListener('beforeunload', event => { if (Object.values(outgoing).some(r => ['preparing', 'submitting'].includes(r.phase))) { event.preventDefault(); event.returnValue = ''; } });
-document.addEventListener('visibilitychange', () => { if (!document.hidden) { refresh(); refreshDetail(); } });
+function resumeConversations() { void refresh(); if (!document.hidden) void refreshDetail({ ifStale: true }); }
+document.addEventListener('visibilitychange', resumeConversations);
+document.addEventListener('resume', resumeConversations);
+window.addEventListener('pageshow', resumeConversations);
+navigator.serviceWorker?.addEventListener('message', event => { if (event.data?.type === 'ox-content-changed') resumeConversations(); });
 for (const node of document.querySelectorAll('[data-icon]')) node.innerHTML = icon(node.dataset.icon);
 applyPreferences();
 if ('ResizeObserver' in window) new ResizeObserver(() => document.documentElement.style.setProperty('--header-offset', $('.app-header').getBoundingClientRect().height + 'px')).observe($('.app-header'));
@@ -882,10 +944,11 @@ catch {
 history.replaceState({ ox: true, tab, deviceId: selected }, '', location.pathname);
 let lastPollAttempt = 0, lastDetailAttempt = 0;
 setInterval(() => {
-  if (document.hidden) return;
   syncHistoryRead();
   const now = Date.now(), saving = pref('ox-refresh') === 'saving';
-  if (now - lastPollAttempt >= (saving ? 15000 : 3000)) { lastPollAttempt = now; void refresh(); }
-  if (now - lastDetailAttempt >= (saving ? 30000 : 4000)) { lastDetailAttempt = now; void refreshDetail(); }
+  // Best effort while the OS lets this page run. No silent push or keepalive
+  // tricks: a frozen PWA catches up on resume/pageshow instead.
+  if (now - lastPollAttempt >= (document.hidden ? (saving ? 60000 : 30000) : saving ? 15000 : 3000)) { lastPollAttempt = now; void refresh(); }
+  if (!document.hidden && now - lastDetailAttempt >= (saving ? 30000 : 4000)) { lastDetailAttempt = now; void refreshDetail({ ifStale: true }); }
   connection();
 }, 1000);

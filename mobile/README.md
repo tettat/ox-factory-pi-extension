@@ -52,6 +52,7 @@ Open the existing Hub HTTPS URL and use its configured login or a fresh owner in
 - Device/employee directories, conversations, steering/queued messages, assignments and receipts.
 - Shared desktop/mobile read state: employee unread badges and a single history acknowledgement when opening a conversation, using the selected factory's existing read ledger. No read-state labels inside messages or unread counters on the overview.
 - Persistent local conversation text, cache-first reopening and an explicit clear-cache control; animated compose options with reduced-motion support.
+- [Automatic conversation prefetch](PREFETCH.md) across online factories, with unread-first scheduling and best-effort background catch-up; prefetch does not mark messages read.
 - Shared project views and task boards, token summaries, attachments, reading mode and in-page nonblocking submission.
 - Scoped roles, one-time enrollment, revocation, reconnect and deduplication; optional Web Push.
 - No arbitrary shell, file browser, workspace switching or direct model app-server access.
