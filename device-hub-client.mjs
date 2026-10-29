@@ -2,6 +2,9 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { randomUUID } from "node:crypto";
 import { hostname, networkInterfaces, platform, release } from "node:os";
 import { join, resolve } from "node:path";
+import { hasPcConnector, readPcDirectory } from './mobile/pc-connector.mjs';
+export { readPcDirectory };
+export const readNetlifyDirectory = readPcDirectory; // Compatibility export; provider-neutral now.
 
 const hubStateCache = new Map();
 const readJson = (file, fallback = {}) => { try { return JSON.parse(readFileSync(file, "utf8")); } catch { return fallback; } };
@@ -39,12 +42,14 @@ export function saveHubConnection(workersDir, input = {}) {
 }
 
 export function cachedHubState(workersDir, { maxAgeMs = 30_000 } = {}) {
+  if (hasPcConnector(workersDir)) return readPcDirectory(workersDir, { maxAgeMs });
   const cached = hubStateCache.get(resolve(workersDir));
   if (!cached) return null;
   return Date.now() - cached.at <= maxAgeMs ? cached.value : null;
 }
 
 export async function fetchHubState(workersDir, timeoutMs = 1500) {
+  if (hasPcConnector(workersDir)) return readPcDirectory(workersDir);
   const connection = hubConnection(workersDir);
   if (!connection) return null;
   try {
@@ -59,6 +64,7 @@ export async function fetchHubState(workersDir, timeoutMs = 1500) {
 }
 
 export async function syncLocalFactory(workersDir, localWorkers, { timeoutMs = 1500 } = {}) {
+  if (hasPcConnector(workersDir)) return false; // The selected Connector owns cloud snapshots.
   const connection = hubConnection(workersDir);
   if (!connection) return false;
   const root = resolve(workersDir, "..", "..");
@@ -91,6 +97,7 @@ export function mergeHubWorkers(localWorkers, hubResult) {
       remote.push({
         name: remoteWorkerName(device.id, id), workerId: id, displayName: worker.displayName || id,
         status: device.online ? (worker.status || "idle") : "offline", role: worker.role || null, backend: worker.backend || null,
+        model: worker.model || null, thinking: worker.thinking || null,
         avatar: /^(data:image\/|https?:\/\/)/i.test(worker.avatar || "") ? worker.avatar : null,
         remote: true, deviceId: device.id, deviceName: device.name || device.id, deviceOnline: Boolean(device.online),
         nameCollision: localNames.has(id), unreadCount: 0, jobCount: 0, responsibilities: [], lastInteractionAt: device.lastSeenAt || null,

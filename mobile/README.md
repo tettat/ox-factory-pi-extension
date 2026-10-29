@@ -1,5 +1,7 @@
 # Mobile Hub and Connector
 
+For PC-to-PC access through an existing Cloudflare/HTTPS Hub, see [PC-CONNECT.md](PC-CONNECT.md): enrollment, shared PC Connector selection, directional trust and verification. Do not copy another computer's credentials or initialize a second Hub.
+
 The PWA lets an authorized phone or browser operate multiple local Ox Factory installations. Each factory computer runs its own outbound Connector. Adding a computer does not require another Hub, inbound port forwarding, or copying an existing computer's credentials.
 
 ```

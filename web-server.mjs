@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { peerRequest, pcConnectorStatus, isLocalPeerRequest } from './device-peer-client.mjs';
 import { readPublicConversation } from './public-conversation.mjs';
 import { estimateApiCost, readApiPrices, summarizeApiCosts } from "./api-cost.mjs";
 // 牛马工厂本地 Web 协作驾驶舱
@@ -830,6 +831,16 @@ export function buildRouter({ workersDir, eventBroker = null }) {
       res.end();
       return;
     }
+    if (pathname.startsWith('/api/device-peer/')) {
+      if (!isLocalPeerRequest(req, { mutation: method !== 'GET' })) return errorResponse(res, 403, '设备调用仅限本机同源页面');
+      try {
+        if (method === 'GET' && pathname === '/api/device-peer/status') return jsonResponse(res, 200, pcConnectorStatus(workersDir));
+        if (method === 'GET' && pathname === '/api/device-peer/directory') return jsonResponse(res, 200, await peerRequest(workersDir, 'directory', {}));
+        if (method === 'POST' && pathname === '/api/device-peer/command') return jsonResponse(res, 202, await peerRequest(workersDir, 'peer-command', await readJsonBody(req)));
+        if (method === 'GET' && pathname.startsWith('/api/device-peer/result/')) return jsonResponse(res, 200, await peerRequest(workersDir, 'peer-result', { id: decodeURIComponent(pathname.slice('/api/device-peer/result/'.length)) }));
+      } catch (err) { return errorResponse(res, err.status || 503, err.code || 'HUB_UNAVAILABLE'); }
+      return notFound(res, '设备调用接口不存在');
+    }
     // POST /api/talk-attachments 接受单张图片原始二进制。
     if (method === "POST" && pathname === "/api/talk-attachments") {
       try {
@@ -1298,7 +1309,7 @@ async function handleWorkerDetail(workersDir, res, name, url = null) {
       status: device.online ? (worker.status || "idle") : "offline",
       role: worker.role || null, backend: worker.backend || null,
       avatar: /^(data:image\/|https?:\/\/)/i.test(worker.avatar || "") ? worker.avatar : null,
-      remote: true, deviceId: device.id, deviceName: device.name || device.id,
+      remote: true, peerRelayAvailable: true, deviceId: device.id, deviceName: device.name || device.id,
       deviceOnline: Boolean(device.online), responsibilities: [], jobs: [], inbox: [],
       talkRequests: [], pendingTalkRequests: [], jobCount: 0, unreadCount: 0,
     });

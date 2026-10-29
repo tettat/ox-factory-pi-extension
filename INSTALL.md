@@ -4,6 +4,8 @@
 
 新电脑先安装并运行本机工厂，再按照 [Mobile Connector 接入说明](mobile/README.md) 操作：在手机生成一次性接入码，在新电脑执行 `enroll`，启动 Connector，再运行 `doctor`。
 
+PC 接入已有 Cloudflare Hub、选择 Connector、双向授权与验收，见 [PC 跨设备接入指南](mobile/PC-CONNECT.md)。只改手机网址不会自动切换旧 PC 的调用出口。
+
 不需要重新部署 Hub，也不要复制其他电脑的 `.pi`、模型登录信息或 Connector 配置。Mobile 要求 Node 22.12+。仓库内的 Connector 与工厂模块使用同一版本和目录布局。
 
 开发验收先在仓库根目录执行 `npm ci --ignore-scripts`，再执行 `npm ci --ignore-scripts --prefix mobile` 和 `npm run verify`。只运行 Connector 时仅需要 Mobile 的生产依赖。

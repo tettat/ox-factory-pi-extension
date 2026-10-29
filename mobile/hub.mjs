@@ -1,3 +1,5 @@
+import { buildDeviceDirectory } from './device-directory.mjs';
+import { PEER_ACTIONS, trustKey, peerAccess } from './device-trust.mjs';
 import { WEB_ASSETS } from './web-assets.mjs';
 import { createBrowserTickets, relayOrigin } from './browser-auth.mjs';
 import { createDesktopTickets } from './desktop-auth.mjs';
@@ -40,6 +42,7 @@ export function createMobileHub({ stateFile, stateStore = null, origin, browserO
   const state = stateStore ? stateStore.read() : readJson(stateFile, null);
   if (!state || state.version !== VERSION) throw new Error('Initialize a separate mobile Hub state first');
   state.enrollments ||= {};
+  state.deviceTrusts ||= {};
   const persist = () => stateStore ? stateStore.write(state) : writeJson(stateFile, state);
   const relay = relayOrigin(browserRelay, allowInsecureLoopback);
   const browserTickets = createBrowserTickets({ state, persist, now, relay });
@@ -66,6 +69,9 @@ export function createMobileHub({ stateFile, stateStore = null, origin, browserO
   const push = createPushCoordinator({ state, driver: pushDriver, persist, now, canSee });
   function activeCommand(c, d) {
     if (!d || d.revokedAt) return false;
+    if (c?.sourceDeviceId) {
+      try { peerAccess(state, c.sourceDeviceId, d.id, c.action); return c.deviceId === d.id && c.expiresAt > now(); } catch { return false; }
+    }
     const s = c && Object.values(state.sessions).find(x => x.id === c.sessionId);
     return c && c.deviceId === d.id && s && !s.revokedAt && s.expiresAt > now() && c.expiresAt > now() && canSee(s, d) && roleAllows(s.role, ACTIONS[c.action]?.role) && roleAllows(d.snapshot?.grants?.[s.principalId], ACTIONS[c.action]?.role);
   }
@@ -130,6 +136,35 @@ export function createMobileHub({ stateFile, stateStore = null, origin, browserO
       if (path.startsWith('/connector/')) {
         if (req.method !== 'POST') throw new Fault('METHOD_NOT_ALLOWED', 405);
         const d = device(req), b = await body(req);
+        if (path === '/connector/directory') {
+          fields(b, []); return send(res, 200, { directory: buildDeviceDirectory(state, d, now()) });
+        }
+        if (path === '/connector/peer-command') {
+          fields(b, ['id', 'deviceId', 'action', 'body', 'createdAt']); id(b.id); id(b.deviceId);
+          const payload = validateAction(b.action, b.body), digest = commandDigest(b.action, payload);
+          const { target } = peerAccess(state, d.id, b.deviceId, b.action);
+          const existing = state.commands[b.id];
+          if (existing) {
+            if (existing.sourceDeviceId !== d.id || existing.deviceId !== target.id || existing.digest !== digest) throw new Fault('IDEMPOTENCY_CONFLICT', 409);
+            return send(res, 200, { command: publicCommand(existing) });
+          }
+          if (!Number.isFinite(b.createdAt) || Math.abs(now() - b.createdAt) > 600000) throw new Fault('REQUEST_CLOCK_OR_EXPIRY', 409);
+          if (!target.snapshot?.reachable || now() - target.lastSeenAt >= 20000) throw new Fault('DEVICE_OFFLINE', 503);
+          if (Object.values(state.commands).filter(c => c.sourceDeviceId === d.id && ['queued', 'delivering'].includes(c.state)).length >= 10) throw new Fault('TOO_MANY_PENDING', 429);
+          if (Object.keys(state.commands).length >= 10000) throw new Fault('HUB_RETENTION_LIMIT', 503);
+          const c = { id: b.id, deviceId: target.id, sourceDeviceId: d.id, principalId: d.ownerPrincipalId,
+            role: ACTIONS[b.action].role, action: b.action, body: payload, digest, createdAt: at(), expiresAt: now() + 120000, deliveryToken: token(), state: 'queued' };
+          state.commands[c.id] = c; audit('peer.command.accepted', { id: c.id, sourceDeviceId: d.id, deviceId: target.id, action: c.action }); persist();
+          return send(res, 202, { command: publicCommand(c) });
+        }
+        if (path === '/connector/peer-result') {
+          fields(b, ['id']); id(b.id); const c = state.commands[b.id];
+          if (!c || c.sourceDeviceId !== d.id) throw new Fault('NOT_FOUND', 404);
+          peerAccess(state, d.id, c.deviceId, c.action);
+          if (finishStale()) persist();
+          return send(res, 200, { command: publicCommand(c) });
+        }
+
         if (path === '/connector/authorize') {
           fields(b, ['id', 'deliveryToken']); const c = state.commands[b.id];
           if (!activeCommand(c, d) || c.deliveryToken !== b.deliveryToken || c.state !== 'delivering') throw new Fault('COMMAND_NOT_AUTHORIZED', 403);
@@ -181,7 +216,7 @@ export function createMobileHub({ stateFile, stateStore = null, origin, browserO
         }
         if (dirty) persist();
         void push.drain().catch(() => {});
-        return send(res, 200, { version: VERSION, acknowledgements, commands, nextPollMs: commands.length ? 1000 : nextPollMs });
+        return send(res, 200, { version: VERSION, acknowledgements, commands, directory: buildDeviceDirectory(state, d, now()), nextPollMs: commands.length ? 1000 : nextPollMs });
       }
       if (req.method === 'POST' && path === '/api/login') {
         if (req.headers.origin !== browserOrigin) throw new Fault('ORIGIN_REJECTED', 403);
@@ -288,13 +323,26 @@ export function createMobileHub({ stateFile, stateStore = null, origin, browserO
         if (finishStale()) persist();
         return send(res, 200, { command: publicCommand(c) });
       }
-      if (['/api/pairings', '/api/access', '/api/revoke', '/api/enrollments'].includes(path)) {
+      if (['/api/pairings', '/api/access', '/api/revoke', '/api/enrollments', '/api/device-trusts'].includes(path)) {
         if (s.role !== 'owner') throw new Fault('OWNER_REQUIRED', 403);
+        if (path === '/api/device-trusts' && req.method === 'GET') return send(res, 200, { trusts: Object.values(state.deviceTrusts).filter(t => [t.sourceDeviceId, t.targetDeviceId].every(i => state.devices[i]?.ownerPrincipalId === s.principalId && (s.devices.includes('*') || s.devices.includes(i)))) });
         if (path === '/api/access' && req.method === 'GET') return send(res, 200, {
           sessions: Object.values(state.sessions).filter(x => canManageSession(s, x)).map(x => ({ id: x.id, name: x.name, role: x.role, createdAt: x.createdAt, expiresAt: x.expiresAt, revokedAt: x.revokedAt })),
           devices: Object.values(state.devices).filter(d => !d.revokedAt && (canSee(s, d) || (d.ownerPrincipalId === s.principalId && s.devices.includes('*')))).map(d => ({ id: d.id, name: d.name })), audit: s.devices.includes('*') ? state.audit.slice(-80) : [],
         });
         const b = await body(req, 4096);
+        if (path === '/api/device-trusts' && req.method === 'POST') {
+          fields(b, ['sourceDeviceId', 'targetDeviceId', 'actions']); id(b.sourceDeviceId); id(b.targetDeviceId);
+          if (b.sourceDeviceId === b.targetDeviceId || !Array.isArray(b.actions) || b.actions.some(a => !PEER_ACTIONS.includes(a)) || new Set(b.actions).size !== b.actions.length) throw new Fault('INVALID_TRUST');
+          for (const i of [b.sourceDeviceId, b.targetDeviceId]) {
+            const d = state.devices[i];
+            if (!d || d.revokedAt || d.ownerPrincipalId !== s.principalId || !(s.devices.includes('*') || s.devices.includes(i))) throw new Fault('DEVICE_SCOPE_DENIED', 403);
+          }
+          const trust = { sourceDeviceId: b.sourceDeviceId, targetDeviceId: b.targetDeviceId, actions: b.actions, updatedAt: at(), revokedAt: b.actions.length ? null : at() };
+          state.deviceTrusts[trustKey(b.sourceDeviceId, b.targetDeviceId)] = trust;
+          audit('device.trust.updated', { sourceDeviceId: b.sourceDeviceId, targetDeviceId: b.targetDeviceId, actions: b.actions });
+          finishStale(); persist(); return send(res, 200, { trust });
+        }
         if (path === '/api/enrollments' && req.method === 'POST') {
           fields(b, []);
           if (!s.devices.includes('*')) throw new Fault('OWNER_FULL_SCOPE_REQUIRED', 403);

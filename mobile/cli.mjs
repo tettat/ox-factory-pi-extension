@@ -67,7 +67,7 @@ async function main() {
     const response = await fetch(o.hub + '/connector/enroll', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code, name: o.name || hostname() }), redirect: 'error', signal: AbortSignal.timeout(10000) });
     if (!response.ok) throw new Error(`Enrollment rejected: HTTP ${response.status}`);
     const enrollment = await response.json();
-    writeJson(file, { hub: o.hub, credential: enrollment.credential, workersDir, stateDir: join(dir, 'connector'), factoryUrl: o.factory || 'http://127.0.0.1:8787', allowInsecureLoopback: dev, grants: { [enrollment.principalId]: { actor: o.actor, role: 'owner' } } });
+    writeJson(file, { hub: o.hub, deviceId: enrollment.deviceId, credential: enrollment.credential, workersDir, stateDir: join(dir, 'connector'), factoryUrl: o.factory || 'http://127.0.0.1:8787', allowInsecureLoopback: dev, grants: { [enrollment.principalId]: { actor: o.actor, role: 'owner' } } });
     console.log(JSON.stringify({ enrolled: true, deviceId: enrollment.deviceId, connectorConfig: file, note: 'The explicit local actor binding remains the authorization boundary. No worker permissions modified.' })); return;
   }
   if (command === 'init' || command === 'hub-init') {

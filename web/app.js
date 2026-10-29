@@ -580,6 +580,48 @@
   // ---- API ----
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+  function buildDevicePeerPanel(worker) {
+    const output = el("pre", { class: "muted", text: "尚未读取目标工厂。" });
+    const input = el("textarea", { placeholder: "发送给该员工的内容（暂不支持跨设备附件）" });
+    let busy = false;
+    async function run(action) {
+      if (busy) return;
+      const body = { worker: worker.workerId };
+      if (action !== "worker.detail") {
+        if (!input.value.trim()) { output.textContent = "请填写内容。"; return; }
+        body.message = input.value.trim(); body.mode = "auto";
+        if (action === "task.assign") body.project = "cross-device";
+      }
+      busy = true;
+      const envelope = { id: crypto.randomUUID(), deviceId: worker.deviceId, action, body, createdAt: Date.now() };
+      let accepted = false;
+      try {
+        const r = await api("/api/device-peer/command", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(envelope) });
+        if (!r.ok) throw new Error(JSON.stringify(r.detail));
+        accepted = true; output.textContent = `已提交 ${envelope.id}，等待目标工厂回执…`;
+        for (let i = 0; i < 60; i++) {
+          await sleep(1500);
+          const result = await api(`/api/device-peer/result/${encodeURIComponent(envelope.id)}`);
+          if (!result.ok) throw new Error(JSON.stringify(result.detail));
+          const c = result.data.command;
+          if (["done", "failed"].includes(c.state)) {
+            // Receipt means the destination accepted the request, not that an employee finished working.
+            output.textContent = c.result?.ok ? JSON.stringify(c.result.data, null, 2) : `调用失败：${c.result?.error || c.state}`;
+            if (c.result?.ok && action !== "worker.detail") input.value = "";
+            return;
+          }
+        }
+        output.textContent = `回执仍待确认：${envelope.id}。不要重复发送；可在目标工厂查看。`;
+      } catch (e) { output.textContent = `${accepted ? "已提交，查询回执失败，请勿重复发送。" : "提交结果未确认；请先检查目标工厂，避免重复发送。"} ${envelope.id}：${e.message}`; }
+      finally { busy = false; }
+    }
+    return el("div", {}, [input, el("div", { class: "actions" }, [
+      el("button", { text: "读取对话与结果", onclick: () => run("worker.detail") }),
+      el("button", { text: "发送对话", onclick: () => run("talk.send") }),
+      el("button", { text: "派活", onclick: () => run("task.assign") }),
+    ]), output]);
+  }
+
   async function api(path, opts = {}) {
     const url = path.startsWith("http") ? path : path;
     try {
@@ -3352,7 +3394,8 @@
     if (d.remote) {
       target.appendChild(el("section", { class: "panel" }, [
         sectionHead("远端员工", `所在设备：${d.deviceName || d.deviceId || "未知设备"}`),
-        el("p", { class: "muted", text: d.deviceOnline ? "设备在线。跨设备对话/派活路由将在下一步接入。" : "设备当前离线。" }),
+        el("p", { class: "muted", text: d.deviceOnline ? "设备在线。请在手机端“连接与偏好 → 可信工厂设备”授权本机到该设备。" : "设备当前离线。" }),
+        d.peerRelayAvailable ? buildDevicePeerPanel(d) : el("p", { class: "muted", text: "此工厂服务尚未加载设备调用路由。" }),
       ]));
     } else {
       target.appendChild(buildTalkPanel(name, d, d.jobs || []));

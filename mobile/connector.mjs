@@ -37,6 +37,11 @@ export function createConnector({ hub, credential, stateDir, adapter, allowInsec
     if (Buffer.byteLength(JSON.stringify(payload)) > maxSyncBodyBytes) throw new Fault('SNAPSHOT_TOO_LARGE');
     const response = await request('/connector/sync', payload);
     if (response.version !== VERSION || !Array.isArray(response.commands) || !Array.isArray(response.acknowledgements)) throw new Fault('PROTOCOL_MISMATCH');
+    // Optional field on newer Hubs. Cache only for this Connector runtime and
+    // origin; PC views must never combine directories from different Hubs.
+    if (response.directory?.version === 1 && Array.isArray(response.directory.devices)) {
+      try { writeJson(join(stateDir, 'hub-directory.json'), { ...response.directory, receivedAt: Date.now(), hub }); } catch {}
+    }
     outbox.results = outbox.results.filter(r => !response.acknowledgements.includes(r.id)); save();
     for (const command of response.commands) {
       if (outbox.results.some(r => r.id === command.id)) continue;
